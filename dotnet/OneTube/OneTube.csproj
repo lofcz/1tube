@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>OneTube</RootNamespace>
+    <PackageId>OneTube</PackageId>
+    <Version>0.1.0</Version>
+    <Description>Host Supabase-compatible Deno edge functions inside ASP.NET with zero-copy YARP proxying.</Description>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Yarp.ReverseProxy" Version="2.*" />
+  </ItemGroup>
+
+</Project>

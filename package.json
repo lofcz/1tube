@@ -1,0 +1,42 @@
+{
+  "name": "1tube",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Self-hosted Supabase Edge Functions gateway for Deno, plus an ESLint plugin for consumers",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lofcz/1tube.git"
+  },
+  "homepage": "https://github.com/lofcz/1tube",
+  "bugs": {
+    "url": "https://github.com/lofcz/1tube/issues"
+  },
+  "exports": {
+    "./eslint-plugin": "./eslint-plugin.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "eslint-plugin.js",
+    "src",
+    "deno.json",
+    "deno.lock",
+    "README.md",
+    "LICENSE",
+    ".env.example"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dev": "deno task dev",
+    "serve": "deno task serve",
+    "typecheck": "deno check src/server.ts eslint-plugin.js",
+    "check": "deno cache --allow-scripts=npm:protobufjs src/server.ts",
+    "prepublishOnly": "bun run typecheck && bun run check"
+  },
+  "dependencies": {
+    "hono": "^4"
+  }
+}
