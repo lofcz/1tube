@@ -1,3 +1,5 @@
+![NPM Version](https://img.shields.io/npm/v/1tube)
+
 # 1tube
 
 Self-hosted Supabase Edge Functions gateway. Runs your Deno edge functions locally or behind a .NET host with zero-copy YARP proxying — no cold starts, no version lock, no Supabase compute dependency.
