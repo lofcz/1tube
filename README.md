@@ -23,6 +23,8 @@ bun run dev -- --functions ../sciobot-next/supabase/functions
 
 The gateway starts on `http://localhost:3100`. Functions are available at `http://localhost:3100/functions/v1/<name>`.
 
+In dev mode, 1tube also watches the functions directory and reloads handlers in-process on filesystem changes (including newly created function folders).
+
 ### Deno npm lifecycle scripts
 
 Deno does not run npm `postinstall` / build scripts unless you allow them. `deno.lock` may still list transitive packages such as `protobufjs`; the `check` script uses `--allow-scripts=npm:protobufjs` so `bun run check` / `npm publish` (via `prepublishOnly`) stays warning-free. That script is only needed for dependency install — **1tube’s runtime graph is just Hono + JSR std**.

@@ -13,6 +13,7 @@ import type { FunctionRegistry } from "./registry.ts";
 export async function discoverAndLoad(
   functionsDir: string,
   registry: FunctionRegistry,
+  options?: { cacheBust?: string },
 ): Promise<{ loaded: string[]; skipped: string[]; errors: Array<{ name: string; error: string }> }> {
   const loaded: string[] = [];
   const skipped: string[] = [];
@@ -45,7 +46,11 @@ export async function discoverAndLoad(
     registry.setCurrentFunction(name);
 
     try {
-      await import(toFileUrl(indexPath).href);
+      const moduleUrl = toFileUrl(indexPath);
+      if (options?.cacheBust) {
+        moduleUrl.searchParams.set("v", options.cacheBust);
+      }
+      await import(moduleUrl.href);
       loaded.push(name);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

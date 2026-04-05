@@ -73,6 +73,11 @@ export class FunctionRegistry {
     return this.handlers.get(name);
   }
 
+  clear(): void {
+    this.handlers.clear();
+    this._currentName = "";
+  }
+
   list(): string[] {
     return [...this.handlers.keys()].sort();
   }

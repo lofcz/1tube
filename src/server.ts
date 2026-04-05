@@ -77,19 +77,70 @@ applyLocalDefaults();
 const registry = new FunctionRegistry();
 (globalThis as any).__edgeFunctionRegistry = registry;
 
-console.log(`[1tube] Loading functions from: ${functionsPath}`);
-const { loaded, skipped, errors } = await discoverAndLoad(functionsPath, registry);
+async function reloadFunctions(reason: string) {
+  console.log(`[1tube] Reloading functions (${reason})...`);
+  registry.clear();
+  const cacheBust = `${Date.now()}-${crypto.randomUUID()}`;
+  const { loaded, skipped, errors } = await discoverAndLoad(functionsPath, registry, { cacheBust });
 
-console.log(`[1tube] Loaded ${loaded.length} functions, skipped ${skipped.length} directories`);
-if (loaded.length > 0) {
-  console.log(`[1tube] Functions: ${loaded.join(", ")}`);
-}
-if (errors.length > 0) {
-  console.error(`[1tube] ${errors.length} function(s) failed to load (check .env for missing vars):`);
-  for (const e of errors) {
-    console.error(`  ${e.name}: ${e.error}`);
+  console.log(`[1tube] Loaded ${loaded.length} functions, skipped ${skipped.length} directories`);
+  if (loaded.length > 0) {
+    console.log(`[1tube] Functions: ${loaded.join(", ")}`);
+  }
+  if (errors.length > 0) {
+    console.error(`[1tube] ${errors.length} function(s) failed to load (check .env for missing vars):`);
+    for (const e of errors) {
+      console.error(`  ${e.name}: ${e.error}`);
+    }
   }
 }
+
+console.log(`[1tube] Loading functions from: ${functionsPath}`);
+await reloadFunctions("initial boot");
+
+let reloadTimer: number | undefined;
+let isReloading = false;
+let needsAnotherReload = false;
+
+function scheduleReload(reason: string) {
+  if (reloadTimer !== undefined) {
+    clearTimeout(reloadTimer);
+  }
+  reloadTimer = setTimeout(async () => {
+    if (isReloading) {
+      needsAnotherReload = true;
+      return;
+    }
+
+    isReloading = true;
+    try {
+      await reloadFunctions(reason);
+    } catch (err) {
+      console.error("[1tube] Reload failed:", err);
+    } finally {
+      isReloading = false;
+      if (needsAnotherReload) {
+        needsAnotherReload = false;
+        scheduleReload("batched filesystem updates");
+      }
+    }
+  }, 200);
+}
+
+async function watchFunctions() {
+  try {
+    const watcher = Deno.watchFs(functionsPath, { recursive: true });
+    console.log(`[1tube] HMR watching: ${functionsPath}`);
+    for await (const event of watcher) {
+      if (event.paths.length === 0) continue;
+      scheduleReload(`${event.kind} (${event.paths.length} path(s))`);
+    }
+  } catch (err) {
+    console.warn("[1tube] HMR watcher disabled:", err);
+  }
+}
+
+watchFunctions();
 
 // ---------------------------------------------------------------------------
 // HTTP Server
