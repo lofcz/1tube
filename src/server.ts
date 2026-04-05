@@ -17,6 +17,7 @@ import { corsMiddleware } from "./gateway/cors.ts";
 import { loggingMiddleware } from "./gateway/logging.ts";
 import { createRateLimiter } from "./gateway/rate-limit.ts";
 import { createHealthHandler, createMetricsHandler } from "./health.ts";
+import { VERSION } from "./version.ts";
 
 // ---------------------------------------------------------------------------
 // CLI args & env
@@ -73,6 +74,13 @@ function parseArgs(): { port: number; functionsPath: string; defaultTimeoutMs: n
 const { port, functionsPath, defaultTimeoutMs } = parseArgs();
 
 applyLocalDefaults();
+
+const denoVersion = `${Deno.version.deno} (V8 ${Deno.version.v8}, TS ${Deno.version.typescript})`;
+const bannerText = `  1tube v${VERSION}  ·  Deno ${denoVersion}  `;
+const bannerLine = "─".repeat(bannerText.length);
+console.log(`\x1b[36m┌${bannerLine}┐\x1b[0m`);
+console.log(`\x1b[36m│\x1b[0m  \x1b[1m1tube\x1b[0m v${VERSION}  \x1b[2m·\x1b[0m  Deno ${denoVersion}  \x1b[36m│\x1b[0m`);
+console.log(`\x1b[36m└${bannerLine}┘\x1b[0m`);
 
 const registry = new FunctionRegistry();
 (globalThis as any).__edgeFunctionRegistry = registry;
