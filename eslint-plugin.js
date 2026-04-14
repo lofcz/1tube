@@ -57,6 +57,51 @@ const plugin = {
       },
     },
 
+    "require-access-policy": {
+      meta: {
+        type: "problem",
+        docs: {
+          description:
+            "Require every serve() call to declare an access policy via the `require` option",
+        },
+        messages: {
+          missingRequire:
+            'serve() must declare an access policy. Add { require: "public" }, { require: ["authenticated"] }, or { require: ["isAdminOrHigher"] } etc.',
+        },
+        schema: [],
+      },
+      create(context) {
+        return {
+          CallExpression(node) {
+            if (
+              node.callee.type !== "Identifier" ||
+              node.callee.name !== "serve"
+            ) {
+              return;
+            }
+
+            const opts = node.arguments[1];
+
+            if (!opts || opts.type !== "ObjectExpression") {
+              context.report({ node, messageId: "missingRequire" });
+              return;
+            }
+
+            const hasRequire = opts.properties.some(
+              (p) =>
+                p.type === "Property" &&
+                p.key.type === "Identifier" &&
+                p.key.name === "require",
+            );
+
+            if (!hasRequire) {
+              context.report({ node, messageId: "missingRequire" });
+            }
+          },
+        };
+      },
+    },
+
     "no-direct-edge-url": {
       meta: {
         type: "problem",

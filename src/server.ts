@@ -20,6 +20,19 @@ import { createHealthHandler, createMetricsHandler } from "./health.ts";
 import { VERSION } from "./version.ts";
 
 // ---------------------------------------------------------------------------
+// Process-level error handlers
+// ---------------------------------------------------------------------------
+
+globalThis.addEventListener("unhandledrejection", (e) => {
+  e.preventDefault();
+  console.error("[1tube] Unhandled promise rejection:", e.reason);
+});
+
+globalThis.addEventListener("error", (e) => {
+  console.error("[1tube] Uncaught error:", e.error ?? e.message);
+});
+
+// ---------------------------------------------------------------------------
 // CLI args & env
 // ---------------------------------------------------------------------------
 
@@ -72,6 +85,7 @@ function parseArgs(): { port: number; functionsPath: string; defaultTimeoutMs: n
 // ---------------------------------------------------------------------------
 
 const { port, functionsPath, defaultTimeoutMs } = parseArgs();
+const internalKey = Deno.env.get("INTERNAL_KEY")?.trim() || undefined;
 
 applyLocalDefaults();
 
@@ -181,7 +195,16 @@ app.all("/functions/v1/:name{.+}", async (c) => {
   const originalUrl = new URL(c.req.raw.url);
   const rewrittenPath = originalUrl.pathname.replace(/^\/functions\/v1/, "") || "/";
   const rewrittenUrl = new URL(rewrittenPath + originalUrl.search, originalUrl.origin);
-  const rewrittenReq = new Request(rewrittenUrl.toString(), c.req.raw);
+
+  const abort = new AbortController();
+  const rewrittenReq = new Request(rewrittenUrl.toString(), {
+    method: c.req.raw.method,
+    headers: c.req.raw.headers,
+    body: c.req.raw.body,
+    signal: abort.signal,
+    // @ts-ignore -- Deno supports duplex on Request
+    duplex: "half",
+  });
 
   let handlerPromise: Promise<Response>;
 
@@ -199,7 +222,10 @@ app.all("/functions/v1/:name{.+}", async (c) => {
   try {
     if (timeoutMs > 0) {
       const timeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Function "${name}" timed out after ${timeoutMs}ms`)), timeoutMs),
+        setTimeout(() => {
+          abort.abort();
+          reject(new Error(`Function "${name}" timed out after ${timeoutMs}ms`));
+        }, timeoutMs),
       );
       return await Promise.race([handlerPromise, timeout]);
     }
@@ -215,8 +241,8 @@ app.all("/functions/v1/:name{.+}", async (c) => {
 });
 
 // Health & observability
-app.get("/health", createHealthHandler(registry));
-app.get("/metrics", createMetricsHandler());
+app.get("/health", createHealthHandler(registry, internalKey));
+app.get("/metrics", createMetricsHandler(internalKey));
 
 // Root info
 app.get("/", (c) =>
