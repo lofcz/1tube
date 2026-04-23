@@ -21,6 +21,7 @@ import { bodyLimit } from "npm:hono@4/body-limit";
 import { relative, sep as SEPARATOR } from "node:path";
 import { currentRequestStorage, FunctionRegistry } from "./registry.ts";
 import { discoverAndLoad, type DiscoveryProgress } from "./discovery.ts";
+import { createBootProgress } from "./boot-progress.ts";
 import { validateRequest } from "./gateway/auth.ts";
 import { watchdogBody } from "./gateway/body-watchdog.ts";
 import { corsMiddleware } from "./gateway/cors.ts";
@@ -64,9 +65,12 @@ function parseArgs(): CliOpts {
 
   let dev = envFlag("1TUBE_DEV");
   let hmr = envFlag("1TUBE_HMR");
-  // Lazy-load is on by default; opt out with --eager / 1TUBE_LAZY=0.
+  // Eager loading is the default — first-request latency reflects real
+  // function cost (no on-demand transpile tax). Opt in to lazy with
+  // --lazy or 1TUBE_LAZY=1 when boot speed matters more than first-hit
+  // latency (e.g. sites with hundreds of rarely-called functions).
   const lazyEnv = Deno.env.get("1TUBE_LAZY");
-  let lazy = lazyEnv === undefined ? true : !(lazyEnv === "0" || lazyEnv === "false");
+  let lazy = lazyEnv === undefined ? false : (lazyEnv === "1" || lazyEnv === "true");
   let port = parseInt(Deno.env.get("PORT") || "3100", 10);
   let host = (Deno.env.get("1TUBE_HOST") || "127.0.0.1").trim();
   let functionsPath = Deno.env.get("FUNCTIONS_PATH") || "./supabase/functions";
@@ -298,16 +302,45 @@ async function reloadFunctions(
   // HMR reloads always import eagerly so the change is observable on the
   // very next request — even when boot-time discovery was lazy.
   const useLazy = opts.lazy && isFullReload;
-  const { loaded, skipped, errors, removed, deferred } = await discoverAndLoad(
-    opts.functionsPath,
-    registry,
-    {
-      cacheBust,
-      only: isFullReload ? undefined : changedFunctionNames,
-      onProgress: (p) => console.log(progressLine(p)),
-      lazy: useLazy,
-    },
-  );
+
+  // Live progress: shows a spinner with currently in-flight imports so the
+  // operator doesn't stare at a silent terminal during the multi-second
+  // first-transpile window. Falls back to plain "starting…" lines when
+  // stdout isn't a TTY (CI logs, output redirection).
+  const progress = createBootProgress();
+  // Skip the live spinner for tiny HMR reloads (one or two functions) —
+  // the existing per-completion line is enough and a spinner would just
+  // flicker on screen.
+  const useSpinner = isFullReload ||
+    (changedFunctionNames instanceof Set && changedFunctionNames.size > 2);
+
+  let result;
+  try {
+    if (useSpinner) progress.start(0); // total filled in once we see the first onStart
+    result = await discoverAndLoad(
+      opts.functionsPath,
+      registry,
+      {
+        cacheBust,
+        only: isFullReload ? undefined : changedFunctionNames,
+        onStart: useSpinner
+          ? (p) => {
+              // Late-bind the total on the first start event — by then we
+              // know the real work-list size.
+              if (p.index === 1) progress.start(p.total);
+              progress.onStart(p.name);
+            }
+          : undefined,
+        onProgress: useSpinner
+          ? (p) => progress.onFinish(progressLine(p), p.name)
+          : (p) => console.log(progressLine(p)),
+        lazy: useLazy,
+      },
+    );
+  } finally {
+    progress.stop();
+  }
+  const { loaded, skipped, errors, removed, deferred } = result;
 
   for (const name of removed) {
     if (registry.delete(name)) {

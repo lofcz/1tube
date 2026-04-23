@@ -35,6 +35,14 @@ export interface DiscoveryOptions {
   /** Invoked once per function as it finishes (success or failure). */
   onProgress?: (p: DiscoveryProgress) => void;
   /**
+   * Invoked once per function the moment its dynamic import is dispatched
+   * (or, in lazy mode, the moment it's registered as a candidate). Useful
+   * for live progress UIs that want to show what's currently in-flight,
+   * not just what's completed — important because a single transpile can
+   * block a worker for several seconds with no completion events.
+   */
+  onStart?: (p: { name: string; index: number; total: number }) => void;
+  /**
    * When true, candidates are registered for lazy import on first dispatch.
    * Functions whose manifest sets `warm: true` are still imported eagerly
    * (in parallel, alongside other warm functions). Significantly cuts
@@ -109,6 +117,7 @@ export async function discoverAndLoad(
   }
 
   const total = work.length;
+  let started = 0;
   let completed = 0;
 
   const loadOne = async (name: string): Promise<void> => {
@@ -121,6 +130,7 @@ export async function discoverAndLoad(
       moduleUrl.searchParams.set("v", options.cacheBust);
     }
 
+    options?.onStart?.({ name, index: ++started, total });
     const start = performance.now();
     try {
       // Load the manifest first so it is attached to the registry before the
