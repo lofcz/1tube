@@ -37,6 +37,6 @@
     "prepublishOnly": "bun run typecheck && bun run check"
   },
   "dependencies": {
-    "hono": "^4"
+    "hono": "^4.12.14"
   }
 }
