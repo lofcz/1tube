@@ -13,7 +13,10 @@
 
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
-import { relative, SEPARATOR } from "@std/path";
+// Use node: specifiers (not "@std/path") so this entry point also works when
+// 1tube is launched from a host project's node_modules — bare specifiers
+// would otherwise require the host's deno.json to mirror our import map.
+import { relative, sep as SEPARATOR } from "node:path";
 import { currentRequestStorage, FunctionRegistry } from "./registry.ts";
 import { discoverAndLoad, type DiscoveryProgress } from "./discovery.ts";
 import { validateRequest } from "./gateway/auth.ts";

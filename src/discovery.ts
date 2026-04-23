@@ -9,7 +9,10 @@
  * registry's async-context binding.
  */
 
-import { join, toFileUrl } from "@std/path";
+// node: specifiers so this module loads cleanly from node_modules in any
+// host Deno project (no shared import-map entry required).
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { FunctionRegistry } from "./registry.ts";
 import { loadManifest } from "./manifest.ts";
 
@@ -110,7 +113,10 @@ export async function discoverAndLoad(
 
   const loadOne = async (name: string): Promise<void> => {
     const indexPath = join(resolvedDir, name, "index.ts");
-    const moduleUrl = toFileUrl(indexPath);
+    // pathToFileURL is the node:url equivalent of std/path's toFileUrl;
+    // both produce a `file://` URL whose searchParams we mutate below for
+    // HMR cache-busting.
+    const moduleUrl = pathToFileURL(indexPath);
     if (options?.cacheBust) {
       moduleUrl.searchParams.set("v", options.cacheBust);
     }

@@ -22,7 +22,9 @@
  * out of rotation.
  */
 
-import { join } from "@std/path";
+// node:path so this loads from node_modules in any host Deno project
+// without depending on a shared import-map entry.
+import { join } from "node:path";
 
 export interface ManifestPermissions {
   /** Hostnames the function may reach (e.g. "api.example.com"). [] = none. */
