@@ -303,37 +303,32 @@ async function reloadFunctions(
   // very next request — even when boot-time discovery was lazy.
   const useLazy = opts.lazy && isFullReload;
 
-  // Live progress: shows a spinner with currently in-flight imports so the
-  // operator doesn't stare at a silent terminal during the multi-second
-  // first-transpile window. Falls back to plain "starting…" lines when
-  // stdout isn't a TTY (CI logs, output redirection).
-  const progress = createBootProgress();
-  // Skip the live spinner for tiny HMR reloads (one or two functions) —
-  // the existing per-completion line is enough and a spinner would just
-  // flicker on screen.
-  const useSpinner = isFullReload ||
-    (changedFunctionNames instanceof Set && changedFunctionNames.size > 2);
+  // Append-only "still working" heartbeat. Does not redraw, does not race
+  // with foreign console.log() from imported modules — see
+  // src/boot-progress.ts for the design rationale. Heartbeat is silent for
+  // tiny HMR reloads (≤2 functions) where the per-completion line is
+  // already enough signal.
+  const isTinyReload = changedFunctionNames instanceof Set &&
+    changedFunctionNames.size <= 2;
+  const progress = createBootProgress(Deno.stdout, {
+    pulseMs: isTinyReload ? 0 : 2000,
+  });
 
   let result;
   try {
-    if (useSpinner) progress.start(0); // total filled in once we see the first onStart
     result = await discoverAndLoad(
       opts.functionsPath,
       registry,
       {
         cacheBust,
         only: isFullReload ? undefined : changedFunctionNames,
-        onStart: useSpinner
-          ? (p) => {
-              // Late-bind the total on the first start event — by then we
-              // know the real work-list size.
-              if (p.index === 1) progress.start(p.total);
-              progress.onStart(p.name);
-            }
-          : undefined,
-        onProgress: useSpinner
-          ? (p) => progress.onFinish(progressLine(p), p.name)
-          : (p) => console.log(progressLine(p)),
+        onStart: (p) => {
+          // Late-bind the total on the first start event — by then we
+          // know the real work-list size after `only`/exists filtering.
+          if (p.index === 1) progress.start(p.total);
+          progress.onStart(p.name);
+        },
+        onProgress: (p) => progress.onFinish(progressLine(p), p.name),
         lazy: useLazy,
       },
     );
