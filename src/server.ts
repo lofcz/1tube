@@ -11,11 +11,13 @@
  *   deno run --allow-all src/server.ts --dev --hmr   # local development
  */
 
-import { Hono } from "hono";
-import { bodyLimit } from "hono/body-limit";
-// Use node: specifiers (not "@std/path") so this entry point also works when
-// 1tube is launched from a host project's node_modules — bare specifiers
-// would otherwise require the host's deno.json to mirror our import map.
+// All third-party imports below use `npm:` / `node:` / `jsr:` specifiers
+// directly (not bare aliases from our deno.json) so this entry point loads
+// cleanly when launched from a host project's node_modules — bare
+// specifiers would otherwise require the host's deno.json to mirror our
+// import map. Same convention applies to every src/ file.
+import { Hono } from "npm:hono@4";
+import { bodyLimit } from "npm:hono@4/body-limit";
 import { relative, sep as SEPARATOR } from "node:path";
 import { currentRequestStorage, FunctionRegistry } from "./registry.ts";
 import { discoverAndLoad, type DiscoveryProgress } from "./discovery.ts";

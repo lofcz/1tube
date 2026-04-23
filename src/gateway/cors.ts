@@ -8,7 +8,7 @@
  * requests).
  */
 
-import type { Context, Next } from "hono";
+import type { Context, Next } from "npm:hono@4";
 
 const ALLOWED_HEADERS =
   "authorization, x-client-info, apikey, content-type, x-application-name, user-agent";

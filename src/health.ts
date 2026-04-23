@@ -8,7 +8,7 @@
  * strings leak into access logs, browser history, and proxy buffers).
  */
 
-import type { Context } from "hono";
+import type { Context } from "npm:hono@4";
 import type { FunctionRegistry } from "./registry.ts";
 import type { FunctionSupervisor } from "./supervisor.ts";
 import { getCollectedMetrics, getPrometheusMetrics } from "./gateway/logging.ts";

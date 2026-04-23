@@ -9,7 +9,7 @@
  * grow it unboundedly with synthetic high-cardinality function names.
  */
 
-import type { Context, Next } from "hono";
+import type { Context, Next } from "npm:hono@4";
 import { logError, logInfo } from "../log-buffer.ts";
 
 export interface FunctionMetrics {

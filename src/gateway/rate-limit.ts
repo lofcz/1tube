@@ -8,8 +8,8 @@
  * mint fresh buckets.
  */
 
-import type { Context, Next } from "hono";
-import { getConnInfo } from "hono/deno";
+import type { Context, Next } from "npm:hono@4";
+import { getConnInfo } from "npm:hono@4/deno";
 import type { FunctionRegistry } from "../registry.ts";
 
 interface Bucket {
