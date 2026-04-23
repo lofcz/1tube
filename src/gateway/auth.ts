@@ -3,25 +3,71 @@
  *
  * Validates HMAC-SHA256 JWTs using the same secret as Supabase,
  * producing tokens fully compatible with Supabase RLS policies.
+ *
+ * The JWT secret is read lazily on first use so that env defaults applied
+ * by the server bootstrap (e.g. dev mode) take effect even though this
+ * module is imported transitively before bootstrap runs.
+ *
+ * Verified payloads are cached in a bounded LRU keyed by the raw token
+ * string. Cache hits skip the SubtleCrypto verify (~50–200µs each on a
+ * realistic workload) and the JSON.parse, which is the single biggest
+ * single-process throughput win on the hot path.
+ *
+ *   - Cache is invalidated implicitly when JWT_SECRET rotates
+ *     (see `getSecret()`), so a stale entry can never validate against
+ *     a new key.
+ *   - Each entry stores the token's `exp` so we never serve a payload
+ *     past its TTL.
+ *   - The map is bounded; oldest insertions are evicted first
+ *     (insertion-order LRU; bumped on each hit).
  */
 
 import type { AuthContext, JWTPayload } from "../registry.ts";
-
-const JWT_SECRET = Deno.env.get("JWT_SECRET") || "";
-if (!JWT_SECRET) {
-  console.warn("[1tube] JWT_SECRET not set — authenticated endpoints will reject all requests");
-}
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 let _cachedKey: CryptoKey | null = null;
+let _cachedSecret: string | null = null;
+let _warnedNoSecret = false;
 
-async function getKey(): Promise<CryptoKey> {
+const VERIFY_CACHE_DEFAULT_MAX = 5_000;
+let _verifyCacheMax = VERIFY_CACHE_DEFAULT_MAX;
+
+interface VerifiedEntry {
+  payload: JWTPayload;
+  expiresAtMs: number;
+}
+
+const verifyCache = new Map<string, VerifiedEntry>();
+let _verifyCacheHits = 0;
+let _verifyCacheMisses = 0;
+
+function getSecret(): string {
+  const current = Deno.env.get("JWT_SECRET") || "";
+  if (current !== _cachedSecret) {
+    _cachedSecret = current;
+    _cachedKey = null;
+    // Any cached verifications were authorised against the previous key;
+    // drop them so a rotated secret cannot accidentally accept old tokens.
+    verifyCache.clear();
+    if (!current && !_warnedNoSecret) {
+      console.warn(
+        "[1tube] JWT_SECRET not set — authenticated endpoints will reject all requests",
+      );
+      _warnedNoSecret = true;
+    }
+  }
+  return current;
+}
+
+async function getKey(): Promise<CryptoKey | null> {
+  const secret = getSecret();
+  if (!secret) return null;
   if (_cachedKey) return _cachedKey;
   _cachedKey = await crypto.subtle.importKey(
     "raw",
-    encoder.encode(JWT_SECRET),
+    encoder.encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["verify"],
@@ -42,13 +88,54 @@ function parseBearer(header: string | null): string | null {
   return match ? match[1] : null;
 }
 
+function cacheGet(token: string, nowMs: number): JWTPayload | null {
+  const hit = verifyCache.get(token);
+  if (!hit) return null;
+  if (hit.expiresAtMs <= nowMs) {
+    verifyCache.delete(token);
+    return null;
+  }
+  // LRU bump: re-insert so this entry becomes the most recently used.
+  verifyCache.delete(token);
+  verifyCache.set(token, hit);
+  _verifyCacheHits++;
+  return hit.payload;
+}
+
+function cacheSet(token: string, payload: JWTPayload): void {
+  // Evict insertion-oldest while we're over capacity. Loop because the cap
+  // can be lowered at runtime via `_setVerifyCacheMaxForTests()`.
+  while (verifyCache.size >= _verifyCacheMax) {
+    const oldest = verifyCache.keys().next().value;
+    if (oldest === undefined) break;
+    verifyCache.delete(oldest);
+  }
+  verifyCache.set(token, {
+    payload,
+    expiresAtMs: payload.exp * 1000,
+  });
+}
+
 async function verifyToken(token: string): Promise<JWTPayload | null> {
+  // Resolve the secret BEFORE consulting the cache. getSecret() detects
+  // rotation and clears stale entries; if we read the cache first, a token
+  // signed with the previous key would be returned to the caller before the
+  // rotation took effect.
+  const secret = getSecret();
+  if (!secret) return null;
+
+  const nowMs = Date.now();
+  const cached = cacheGet(token, nowMs);
+  if (cached) return cached;
+
+  _verifyCacheMisses++;
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return null;
 
     const [headerB64, payloadB64, signatureB64] = parts;
     const key = await getKey();
+    if (!key) return null;
     const sigBytes = base64UrlDecode(signatureB64);
 
     const isValid = await crypto.subtle.verify(
@@ -61,8 +148,15 @@ async function verifyToken(token: string): Promise<JWTPayload | null> {
 
     const payload = JSON.parse(decoder.decode(base64UrlDecode(payloadB64))) as JWTPayload;
 
-    if (payload.exp < Math.floor(Date.now() / 1000)) return null;
+    // `exp` is a NumericDate (seconds since epoch). Per RFC 7519 the token
+    // MUST NOT be accepted past `exp`; we treat the second the token expires
+    // as "past" so a 1-second TTL token can't be replayed within the same
+    // wall-clock second.
+    if (typeof payload.exp !== "number" || payload.exp * 1000 <= nowMs) {
+      return null;
+    }
 
+    cacheSet(token, payload);
     return payload;
   } catch {
     return null;
@@ -85,4 +179,45 @@ export async function validateRequest(req: Request): Promise<AuthContext | null>
     payload,
     rawToken: token,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics & test hooks
+// ---------------------------------------------------------------------------
+
+export interface JwtVerifyCacheStats {
+  size: number;
+  capacity: number;
+  hits: number;
+  misses: number;
+}
+
+export function getVerifyCacheStats(): JwtVerifyCacheStats {
+  return {
+    size: verifyCache.size,
+    capacity: _verifyCacheMax,
+    hits: _verifyCacheHits,
+    misses: _verifyCacheMisses,
+  };
+}
+
+/** Test-only: clear the cache + counters and reset key/secret memoisation. */
+export function _resetAuthForTests(): void {
+  verifyCache.clear();
+  _verifyCacheHits = 0;
+  _verifyCacheMisses = 0;
+  _cachedKey = null;
+  _cachedSecret = null;
+  _warnedNoSecret = false;
+  _verifyCacheMax = VERIFY_CACHE_DEFAULT_MAX;
+}
+
+/** Test-only: shrink the cache so eviction is observable in unit tests. */
+export function _setVerifyCacheMaxForTests(max: number): void {
+  _verifyCacheMax = Math.max(1, Math.floor(max));
+  while (verifyCache.size > _verifyCacheMax) {
+    const oldest = verifyCache.keys().next().value;
+    if (oldest === undefined) break;
+    verifyCache.delete(oldest);
+  }
 }

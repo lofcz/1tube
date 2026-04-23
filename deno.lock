@@ -1,16 +1,24 @@
 {
   "version": "5",
   "specifiers": {
+    "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/internal@^1.0.12": "1.0.12",
     "jsr:@std/path@1": "1.1.4",
     "npm:@ai-sdk/mcp@0": "0.0.15_zod@3.25.76",
     "npm:@google/genai@1.39.0": "1.39.0",
     "npm:@supabase/supabase-js@2": "2.93.3",
     "npm:ai@6": "6.0.67_zod@3.25.76",
-    "npm:hono@4": "4.12.8",
+    "npm:hono@4": "4.12.14",
+    "npm:hono@^4.12.14": "4.12.14",
     "npm:zod@3": "3.25.76"
   },
   "jsr": {
+    "@std/assert@1.0.19": {
+      "integrity": "eaada96ee120cb980bc47e040f82814d786fe8162ecc53c91d8df60b8755991e",
+      "dependencies": [
+        "jsr:@std/internal"
+      ]
+    },
     "@std/internal@1.0.12": {
       "integrity": "972a634fd5bc34b242024402972cd5143eac68d8dffaca5eaa4dba30ce17b027"
     },
@@ -266,8 +274,8 @@
     "google-logging-utils@1.1.3": {
       "integrity": "sha512-eAmLkjDjAFCVXg7A1unxHsLf961m6y17QFqXqAXGj/gVkKFrEICfStRfwUlGNfeCEjNRa32JEWOUTlYXPyyKvA=="
     },
-    "hono@4.12.8": {
-      "integrity": "sha512-VJCEvtrezO1IAR+kqEYnxUOoStaQPGrCmX3j4wDTNOcD1uRPFpGlwQUIW8niPuvHXaTUxeOUl5MMDGrl+tmO9A=="
+    "hono@4.12.14": {
+      "integrity": "sha512-am5zfg3yu6sqn5yjKBNqhnTX7Cv+m00ox+7jbaKkrLMRJ4rAdldd1xPd/JzbBWspqaQv6RSTrgFN95EsfhC+7w=="
     },
     "https-proxy-agent@7.0.6": {
       "integrity": "sha512-vK9P5/iUfdl95AI+JVyUuIcVtd4ofvtrOr3HNtM2yxC9bnMbEdp3x01OhQNnjb8IJYi38VlTE3mBXwcfvywuSw==",
@@ -493,12 +501,13 @@
   },
   "workspace": {
     "dependencies": [
+      "jsr:@std/assert@1",
       "jsr:@std/path@1",
       "npm:hono@4"
     ],
     "packageJson": {
       "dependencies": [
-        "npm:hono@4"
+        "npm:hono@^4.12.14"
       ]
     }
   }

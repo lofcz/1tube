@@ -1,0 +1,6 @@
+{
+  "permissions": { "net": [], "env": [] },
+  "memoryMB": 64,
+  "timeoutMs": 2000,
+  "rpm": 30
+}

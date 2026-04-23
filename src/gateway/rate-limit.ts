@@ -1,9 +1,16 @@
 /**
  * In-memory token bucket rate limiter.
- * Keyed by user ID (authenticated) or IP (public endpoints).
+ * Keyed by user ID (set by the auth middleware) or remote IP.
+ *
+ * X-Forwarded-For is only honored when the immediate connection comes from a
+ * trusted proxy (env `1TUBE_TRUSTED_PROXIES`, comma-separated CIDRs/IPs).
+ * Otherwise the raw socket address is used so attackers cannot spoof XFF to
+ * mint fresh buckets.
  */
 
-import type { Context, Next } from "npm:hono@4";
+import type { Context, Next } from "hono";
+import { getConnInfo } from "hono/deno";
+import type { FunctionRegistry } from "../registry.ts";
 
 interface Bucket {
   tokens: number;
@@ -17,6 +24,11 @@ interface RateLimitConfig {
   overrides: Record<string, number>;
   /** Max buckets to track before evicting oldest. */
   maxBuckets: number;
+  /**
+   * Optional registry. When supplied, the limiter consults each function's
+   * `manifest.rpm` (highest precedence) before falling back to `overrides`.
+   */
+  registry?: FunctionRegistry;
 }
 
 const DEFAULT_CONFIG: RateLimitConfig = {
@@ -31,13 +43,25 @@ const DEFAULT_CONFIG: RateLimitConfig = {
 };
 
 const buckets = new Map<string, Bucket>();
+let _activeMaxBuckets = DEFAULT_CONFIG.maxBuckets;
+
+let _trustedProxies: Set<string> | null = null;
+
+function loadTrustedProxies(): Set<string> {
+  if (_trustedProxies) return _trustedProxies;
+  const raw = (Deno.env.get("1TUBE_TRUSTED_PROXIES") || "").trim();
+  _trustedProxies = new Set(
+    raw.split(",").map((s) => s.trim()).filter(Boolean),
+  );
+  return _trustedProxies;
+}
 
 function getOrCreateBucket(key: string, rpm: number): Bucket {
   const now = Date.now();
   let bucket = buckets.get(key);
 
   if (!bucket) {
-    if (buckets.size >= DEFAULT_CONFIG.maxBuckets) {
+    if (buckets.size >= _activeMaxBuckets) {
       const oldest = buckets.keys().next().value!;
       buckets.delete(oldest);
     }
@@ -60,15 +84,49 @@ function resolveKey(c: Context): string {
   const userId = c.get("userId") as string | undefined;
   if (userId) return `user:${userId}`;
 
-  return `ip:${c.req.header("x-forwarded-for") || c.req.header("x-real-ip") || "unknown"}`;
+  const trusted = loadTrustedProxies();
+  let socketAddr = "unknown";
+  try {
+    const info = getConnInfo(c);
+    socketAddr = info.remote.address || "unknown";
+  } catch {
+    // Conn info not available (e.g. unit tests). Fall through to "unknown".
+  }
+
+  if (trusted.size > 0 && trusted.has(socketAddr)) {
+    const xff = c.req.header("x-forwarded-for");
+    if (xff) {
+      // Use leftmost (original client) entry.
+      const first = xff.split(",")[0].trim();
+      if (first) return `ip:${first}`;
+    }
+    const realIp = c.req.header("x-real-ip");
+    if (realIp) return `ip:${realIp.trim()}`;
+  }
+
+  return `ip:${socketAddr}`;
 }
 
 export function createRateLimiter(config: Partial<RateLimitConfig> = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
+  // The bucket store is module-level (shared across limiter instances); the
+  // most-recently-configured cap wins. In production there is exactly one
+  // limiter, so this is correct; in tests, callers are expected to size
+  // maxBuckets relative to the cardinality they exercise.
+  _activeMaxBuckets = cfg.maxBuckets;
 
   return async (c: Context, next: Next) => {
-    const fnName = c.req.param("name");
-    const rpm = (fnName && cfg.overrides[fnName]) || cfg.defaultRpm;
+    // Middleware is mounted on `/functions/v1/*`, so c.req.param() won't see
+    // the trailing segments. Parse the function name out of the path
+    // ourselves — first segment after the prefix, before any nested route.
+    const path = c.req.path;
+    const after = path.startsWith("/functions/v1/")
+      ? path.slice("/functions/v1/".length)
+      : "";
+    const fnName = after.split("/", 1)[0] || "";
+
+    const manifestRpm = fnName ? cfg.registry?.manifestFor(fnName)?.rpm : undefined;
+    const rpm = manifestRpm ?? ((fnName && cfg.overrides[fnName]) || cfg.defaultRpm);
     const key = `${resolveKey(c)}:${fnName || "global"}`;
     const bucket = getOrCreateBucket(key, rpm);
 

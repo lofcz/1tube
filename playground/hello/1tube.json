@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "net":   ["api.ipify.org"],
+    "env":   [],
+    "read":  [],
+    "write": []
+  },
+  "memoryMB": 64,
+  "timeoutMs": 5000,
+  "rpm": 60,
+  "warm": true,
+  "min_replicas": 1
+}

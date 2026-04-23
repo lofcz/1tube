@@ -35,9 +35,30 @@ Deno does not run npm `postinstall` / build scripts unless you allow them. `deno
 
 | Path | Description |
 |---|---|
+| `GET /` | Liveness probe (`{"status":"ok"}`) — intentionally minimal so unauthenticated callers don't see the function map. |
 | `POST /functions/v1/:name` | Invoke an edge function |
-| `GET /health` | Health check + loaded function list |
-| `GET /metrics` | Prometheus-compatible metrics |
+| `GET /health` | Auth-gated health (`Authorization: Bearer $INTERNAL_KEY`); without auth returns the same minimal `{"status":"ok"}`. |
+| `GET /metrics` | Auth-gated Prometheus exposition (same scheme). |
+
+## Configuration
+
+All knobs default to safe-but-backwards-compatible values. The TS gateway (`src/server.ts`) reads:
+
+| Env / flag | Default | Notes |
+|---|---|---|
+| `--port` / `PORT` | `3100` | Listen port |
+| `--host` / `1TUBE_HOST` | `127.0.0.1` | Loopback by default — pass `--host 0.0.0.0` to expose. |
+| `--functions` / `FUNCTIONS_PATH` | `./supabase/functions` | Functions root |
+| `--timeout` / `FUNCTION_TIMEOUT_MS` | `150000` | Per-request wall-clock cap (also overridable per function) |
+| `--dev` / `1TUBE_DEV` | off | Applies the well-known local Supabase JWT/secrets. **Refuses to start in prod when JWT_SECRET / SUPABASE_SERVICE_ROLE_KEY are missing or are the public dev defaults.** |
+| `--hmr` / `1TUBE_HMR` | off | File-watch + per-function reload (dev only). |
+| `1TUBE_BODY_LIMIT_MB` | `30` | Hono `bodyLimit`; matches Supabase. Returns 413 before the handler runs. |
+| `1TUBE_BODY_READ_MS` | `30000` | Slow-loris guard. Max idle gap (ms) between body chunks before the request is aborted with **408**. NOT a total body-read deadline — large but fast uploads pass through. Set `0` to disable. |
+| `1TUBE_CORS_ORIGIN` | `*` (dev only) | Comma-separated allowlist or `*`. In prod, leaving unset disables CORS. |
+| `1TUBE_TRUSTED_PROXIES` | empty | Comma-separated list of remote IPs whose `X-Forwarded-For` is honored. Anything else uses the raw socket address — XFF spoofing no longer mints fresh rate-limit buckets. |
+| `1TUBE_SHUTDOWN_GRACE_MS` | `10000` | SIGINT/SIGTERM drain budget. |
+| `INTERNAL_KEY` | unset | Required to read detailed `/health` and `/metrics`. Header-only: `Authorization: Bearer $INTERNAL_KEY`. |
+```
 
 ## .NET integration
 
