@@ -81,6 +81,16 @@ export class FunctionRegistry {
   private handlers = new Map<string, RegisteredFunction>();
   private pendingManifests = new Map<string, FunctionManifest>();
   private candidates = new Map<string, FunctionCandidate>();
+  /**
+   * Manifests for functions that exist outside the in-process registry —
+   * specifically, workerd-backed functions whose handlers live in a
+   * subprocess. The gateway never holds a JS handler for these, but
+   * the rate-limiter / supervisor / fast-fail middleware all need to
+   * see the same manifest the function uses, so we register it here.
+   * Kept separate from `handlers` and `candidates` to avoid implying
+   * a JS handler exists.
+   */
+  private externalManifests = new Map<string, FunctionManifest>();
   /** In-flight import dedupe: many concurrent first-requests await the same Promise. */
   private loading = new Map<string, Promise<RegisteredFunction | null>>();
   private _legacyCurrentName = "";
@@ -149,7 +159,11 @@ export class FunctionRegistry {
    * to 404 unknown function names before paying for auth/rate-limit.
    */
   has(name: string): boolean {
-    return this.handlers.has(name) || this.candidates.has(name);
+    return (
+      this.handlers.has(name) ||
+      this.candidates.has(name) ||
+      this.externalManifests.has(name)
+    );
   }
 
   /** Names visible to dispatch (loaded handlers + unloaded candidates). */
@@ -157,7 +171,25 @@ export class FunctionRegistry {
     const out = new Set<string>();
     for (const k of this.handlers.keys()) out.add(k);
     for (const k of this.candidates.keys()) out.add(k);
+    for (const k of this.externalManifests.keys()) out.add(k);
     return [...out].sort();
+  }
+
+  /**
+   * Register a manifest for a function whose handler lives outside the
+   * in-process registry (workerd backend). The gateway will treat the
+   * name as known for fast-fail / rate-limit purposes and consult this
+   * manifest from `manifestFor()`. No `RegisteredFunction` is created
+   * — `getOrLoad()` will still return undefined for these names so
+   * dispatch logic that expects a JS handler keeps short-circuiting.
+   */
+  setExternalManifest(name: string, manifest: FunctionManifest): void {
+    this.externalManifests.set(name, manifest);
+  }
+
+  /** Drop all external manifests. Used by the workerd backend on stop. */
+  clearExternalManifests(): void {
+    this.externalManifests.clear();
   }
 
   /**
@@ -180,7 +212,11 @@ export class FunctionRegistry {
    * candidates BEFORE their first dispatch.
    */
   manifestFor(name: string): FunctionManifest | undefined {
-    return this.handlers.get(name)?.manifest ?? this.candidates.get(name)?.manifest;
+    return (
+      this.handlers.get(name)?.manifest ??
+      this.candidates.get(name)?.manifest ??
+      this.externalManifests.get(name)
+    );
   }
 
   /**

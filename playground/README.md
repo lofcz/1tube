@@ -10,6 +10,20 @@ playground/
   echo/index.ts        # public, mirrors method/headers/query/body
   whoami/index.ts      # authenticated, requires a valid Supabase JWT
   slow/index.ts        # public, exercises the per-function timeout
+  chat/index.ts        # public, BYOK chat — streams from Anthropic/OpenAI/Google
+  web/                 # frontend SPA (React Router 7) that drives /chat
+```
+
+The [`chat/`](./chat/index.ts) function holds the AI SDK 6 dependency and
+streams provider tokens back to the browser. The user's API key arrives in
+the `x-api-key` header — no server-side keys are stored.
+
+The [`web/`](./web/README.md) folder is a Vite app whose `/chat` route POSTs
+to `chat/` through the gateway. Run them together:
+
+```bash
+deno task play                     # terminal 1: gateway on :3199
+cd playground/web && bun run dev   # terminal 2: frontend on :5173
 ```
 
 ## Run

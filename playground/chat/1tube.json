@@ -1,0 +1,8 @@
+{
+  "$schema": "../../1tube.schema.json",
+  "timeoutMs": 120000,
+  "warm": true,
+  "permissions": {
+    "net": ["api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com"]
+  }
+}

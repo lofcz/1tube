@@ -1,0 +1,11 @@
+{
+  "permissions": { "net": [], "env": [], "read": [], "write": [] },
+  "memoryMB": 64,
+  "timeoutMs": 5000,
+  "recycle": {
+    "maxRequests": 0,
+    "errorRate": 1.0,
+    "errorWindow": 3,
+    "cooldownMs": 5000
+  }
+}

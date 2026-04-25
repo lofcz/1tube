@@ -1,0 +1,1 @@
+{"root":["./src/main.tsx","./src/components/apikeyinput.tsx","./src/lib/providers.ts","./src/lib/storage.ts","./src/lib/stream.ts","./src/routes/chat.tsx","./src/routes/home.tsx","./src/routes/layout.tsx","./src/routes/settings.tsx"],"errors":true,"version":"5.7.3"}

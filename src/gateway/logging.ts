@@ -107,9 +107,44 @@ export function getCollectedMetrics(): {
 }
 
 /**
+ * Optional extras passed by the gateway to enrich /metrics output with
+ * runtime state that doesn't live in the request-counting maps.
+ *
+ * - `workerd`: snapshot of the active workerd backend (process state,
+ *   memory budget, last reload duration, per-function bundle bytes).
+ *   Omitted when running on the Deno backend.
+ * - `breakers`: per-function circuit breaker view from the supervisor.
+ *   Lets dashboards alert on `breaker_open == 1` without scraping
+ *   /health.
+ *
+ * Pure data — built fresh by the caller every scrape.
+ */
+export interface PrometheusExtras {
+  workerd?: {
+    pid: number | null;
+    generation: number;
+    recycles: number;
+    rss_bytes: number | null;
+    budget_bytes: number | null;
+    last_reload_duration_ms: number | null;
+    bundle_bytes: Record<string, number>;
+  };
+  breakers?: Record<string, {
+    breakerOpen: boolean;
+    recycleRecommended: boolean;
+    errorRate: number;
+  }>;
+}
+
+/** Quote a Prometheus label value per the exposition spec. */
+function quoteLabel(v: string): string {
+  return v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+}
+
+/**
  * Prometheus-compatible text format for /metrics.
  */
-export function getPrometheusMetrics(): string {
+export function getPrometheusMetrics(extras?: PrometheusExtras): string {
   const lines: string[] = [];
 
   lines.push("# HELP onetube_uptime_seconds Gateway uptime in seconds");
@@ -145,6 +180,74 @@ export function getPrometheusMetrics(): string {
   for (const [name, m] of metricsMap) {
     const avg = m.invocations > 0 ? Math.round(m.totalDurationMs / m.invocations) : 0;
     lines.push(`onetube_function_duration_ms_avg{function="${name}"} ${avg}`);
+  }
+
+  if (extras?.breakers) {
+    // Per-function circuit-breaker view. Two gauges + one ratio so an
+    // alert can fire on either "breaker tripped" or "error rate over
+    // threshold" without a join. We emit ALL functions the supervisor
+    // knows about — including those whose breaker is closed — so the
+    // gauge stays present for `absent()` queries during normal ops.
+    lines.push("# HELP onetube_function_breaker_open 1 when the circuit breaker is open, 0 otherwise");
+    lines.push("# TYPE onetube_function_breaker_open gauge");
+    for (const [name, b] of Object.entries(extras.breakers)) {
+      lines.push(`onetube_function_breaker_open{function="${quoteLabel(name)}"} ${b.breakerOpen ? 1 : 0}`);
+    }
+    lines.push("# HELP onetube_function_error_rate Rolling error rate inside the supervisor's window (0..1)");
+    lines.push("# TYPE onetube_function_error_rate gauge");
+    for (const [name, b] of Object.entries(extras.breakers)) {
+      lines.push(`onetube_function_error_rate{function="${quoteLabel(name)}"} ${b.errorRate.toFixed(4)}`);
+    }
+    lines.push("# HELP onetube_function_recycle_recommended 1 when the supervisor has flagged this function for recycle");
+    lines.push("# TYPE onetube_function_recycle_recommended gauge");
+    for (const [name, b] of Object.entries(extras.breakers)) {
+      lines.push(`onetube_function_recycle_recommended{function="${quoteLabel(name)}"} ${b.recycleRecommended ? 1 : 0}`);
+    }
+  }
+
+  if (extras?.workerd) {
+    // Workerd-backend gauges. Wrapped in `extras.workerd` rather than
+    // emitted from a per-call closure so the logging module stays
+    // agnostic of which backend is active.
+    const w = extras.workerd;
+    lines.push("# HELP onetube_workerd_up 1 when a workerd subprocess is currently running, 0 otherwise");
+    lines.push("# TYPE onetube_workerd_up gauge");
+    lines.push(`onetube_workerd_up ${w.pid !== null ? 1 : 0}`);
+
+    lines.push("# HELP onetube_workerd_pid Current workerd subprocess PID (0 when not running)");
+    lines.push("# TYPE onetube_workerd_pid gauge");
+    lines.push(`onetube_workerd_pid ${w.pid ?? 0}`);
+
+    lines.push("# HELP onetube_workerd_generation Generation counter — increments on every reload (HMR / watchdog / crash recovery)");
+    lines.push("# TYPE onetube_workerd_generation counter");
+    lines.push(`onetube_workerd_generation ${w.generation}`);
+
+    lines.push("# HELP onetube_workerd_recycles_total Workerd processes recycled by the memory watchdog");
+    lines.push("# TYPE onetube_workerd_recycles_total counter");
+    lines.push(`onetube_workerd_recycles_total ${w.recycles}`);
+
+    if (w.rss_bytes !== null) {
+      lines.push("# HELP onetube_workerd_rss_bytes Last sampled resident set size of the workerd process");
+      lines.push("# TYPE onetube_workerd_rss_bytes gauge");
+      lines.push(`onetube_workerd_rss_bytes ${w.rss_bytes}`);
+    }
+    if (w.budget_bytes !== null) {
+      lines.push("# HELP onetube_workerd_budget_bytes RSS budget enforced by the watchdog");
+      lines.push("# TYPE onetube_workerd_budget_bytes gauge");
+      lines.push(`onetube_workerd_budget_bytes ${w.budget_bytes}`);
+    }
+    if (w.last_reload_duration_ms !== null) {
+      lines.push("# HELP onetube_workerd_last_reload_duration_ms Wall-clock duration of the most recent successful reload");
+      lines.push("# TYPE onetube_workerd_last_reload_duration_ms gauge");
+      lines.push(`onetube_workerd_last_reload_duration_ms ${w.last_reload_duration_ms.toFixed(1)}`);
+    }
+    if (Object.keys(w.bundle_bytes).length > 0) {
+      lines.push("# HELP onetube_workerd_bundle_bytes esbuild output size per function bundle");
+      lines.push("# TYPE onetube_workerd_bundle_bytes gauge");
+      for (const [name, bytes] of Object.entries(w.bundle_bytes)) {
+        lines.push(`onetube_workerd_bundle_bytes{function="${quoteLabel(name)}"} ${bytes}`);
+      }
+    }
   }
 
   return lines.join("\n") + "\n";

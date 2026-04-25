@@ -109,6 +109,21 @@ function resolveKey(c: Context): string {
 
 export function createRateLimiter(config: Partial<RateLimitConfig> = {}) {
   const cfg = { ...DEFAULT_CONFIG, ...config };
+  // Operators running load tests against this gateway need a way to
+  // disable rate limiting entirely without editing every per-function
+  // `1tube.json`. The opt-in env var below short-circuits the limiter
+  // to a no-op middleware for the lifetime of the process. This is
+  // BENCHMARK / DEV ONLY — production deployments must keep limits
+  // enabled or set per-function caps via manifests.
+  const disabled = (Deno.env.get("1TUBE_DISABLE_RATE_LIMIT") || "").trim();
+  if (disabled === "1" || disabled.toLowerCase() === "true") {
+    console.log(
+      `[1tube] rate limiter DISABLED via 1TUBE_DISABLE_RATE_LIMIT — load-test mode only, do not run in prod.`,
+    );
+    return async (_c: Context, next: Next) => {
+      await next();
+    };
+  }
   // The bucket store is module-level (shared across limiter instances); the
   // most-recently-configured cap wins. In production there is exactly one
   // limiter, so this is correct; in tests, callers are expected to size
