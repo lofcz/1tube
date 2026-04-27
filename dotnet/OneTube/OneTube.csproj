@@ -7,7 +7,13 @@
     <RootNamespace>OneTube</RootNamespace>
     <PackageId>OneTube</PackageId>
     <Version>0.2.0</Version>
+    <Authors>OneTube contributors</Authors>
     <Description>Host Supabase-compatible edge functions inside ASP.NET with zero-copy YARP proxying. Supports the deno and workerd backends; operator supplies explicit binary paths.</Description>
+    <PackageProjectUrl>https://github.com/lofcz/1tube</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/lofcz/1tube</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <IsPackable>true</IsPackable>
   </PropertyGroup>
 
@@ -49,6 +55,9 @@
       <Pack>true</Pack>
       <PackagePath>contentFiles\any\any\OneTubeGateway\deno.json;content\OneTubeGateway\deno.json</PackagePath>
     </Content>
+    <None Include="..\..\README.md"
+          Pack="true"
+          PackagePath="\" />
   </ItemGroup>
 
 </Project>

@@ -1,8 +1,16 @@
-name: Release and Publish to npm
+name: Release
 
 on:
   workflow_dispatch:
     inputs:
+      target:
+        description: Release target
+        required: true
+        default: npm
+        type: choice
+        options:
+          - npm
+          - onetube-cs
       release_type:
         description: Release type
         required: true
@@ -14,7 +22,8 @@ on:
           - major
 
 jobs:
-  release:
+  npm:
+    if: github.event.inputs.target == 'npm'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -75,4 +84,95 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+
+  onetube-cs:
+    if: github.event.inputs.target == 'onetube-cs'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      PROJECT_PATH: dotnet/OneTube/OneTube.csproj
+      PACKAGE_ID: OneTube
+      TAG_PREFIX: onetube-cs-v
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.100"
+
+      - name: Bump package version
+        id: version
+        shell: python
+        run: |
+          import os
+          import re
+          from pathlib import Path
+
+          project = Path(os.environ["PROJECT_PATH"])
+          release_type = "${{ github.event.inputs.release_type }}"
+          text = project.read_text(encoding="utf-8")
+          match = re.search(r"<Version>([^<]+)</Version>", text)
+          if not match:
+              raise SystemExit(f"{project} does not contain a <Version> element")
+
+          current = match.group(1).strip()
+          semver = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", current)
+          if not semver:
+              raise SystemExit(f"Only simple x.y.z package versions can be bumped automatically, got {current!r}")
+
+          major, minor, patch = map(int, semver.groups())
+          if release_type == "major":
+              major, minor, patch = major + 1, 0, 0
+          elif release_type == "minor":
+              minor, patch = minor + 1, 0
+          elif release_type == "patch":
+              patch += 1
+          else:
+              raise SystemExit(f"Unknown release_type {release_type!r}")
+
+          new_version = f"{major}.{minor}.{patch}"
+          updated = text[:match.start(1)] + new_version + text[match.end(1):]
+          project.write_text(updated, encoding="utf-8")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"version={new_version}\n")
+              fh.write(f"tag={os.environ['TAG_PREFIX']}{new_version}\n")
+
+      - name: Restore
+        run: dotnet restore "$PROJECT_PATH"
+
+      - name: Build
+        run: dotnet build "$PROJECT_PATH" --configuration Release --no-restore
+
+      - name: Pack
+        run: dotnet pack "$PROJECT_PATH" --configuration Release --no-build --output nupkgs
+
+      - name: Commit release version and create tag
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add "$PROJECT_PATH"
+          git commit -m "chore: release OneTube.cs v${{ steps.version.outputs.version }}"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release OneTube.cs v${{ steps.version.outputs.version }}"
+
+      - name: Publish to NuGet
+        run: dotnet nuget push "nupkgs/*.nupkg" --source "https://api.nuget.org/v3/index.json" --api-key "${{ secrets.NUGET_API_KEY }}" --skip-duplicate
+
+      - name: Push release commit and tag
+        run: git push --follow-tags
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: OneTube.cs v${{ steps.version.outputs.version }}
+          files: nupkgs/*.nupkg
           generate_release_notes: true
