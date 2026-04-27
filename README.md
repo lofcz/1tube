@@ -44,6 +44,9 @@ The published npm package exposes a `1tube` binary. It is a tiny Node shim that
 launches this repo's Deno CLI, so machines using it need Deno on `PATH`.
 
 ```bash
+# Show CLI help
+npx 1tube
+
 # Build and sign a firmware payload in one command
 npx 1tube package --functions supabase/functions --out fw.1tube --sign-key "$1TUBE_PACKAGE_SIGN_KEY"
 

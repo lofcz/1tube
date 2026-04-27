@@ -9,16 +9,19 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const denoConfig = resolve(packageRoot, "deno.json");
 const cliEntrypoint = resolve(packageRoot, "src", "cli.ts");
 const denoBin = process.env.DENO_BIN || "deno";
+const cliArgs = process.argv.slice(2);
+const forwardedArgs = cliArgs.length === 0 ? ["--help"] : cliArgs;
 
 const child = spawn(
   denoBin,
   [
     "run",
+    "--quiet",
     "-A",
     "--config",
     denoConfig,
     cliEntrypoint,
-    ...process.argv.slice(2),
+    ...forwardedArgs,
   ],
   {
     stdio: "inherit",
