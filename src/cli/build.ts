@@ -34,15 +34,15 @@
 import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import {
+  bundleAllChunked,
   bundleSharedModule,
-  type BundleResult,
-  createBundler,
   discoverEntrypoints,
   discoverSharedModules,
 } from "../backends/workerd/bundler.ts";
 import { loadManifest } from "../manifest.ts";
 import {
   PREBUILT_SCHEMA,
+  type PrebuiltChunkEntry,
   type PrebuiltFunctionEntry,
   type PrebuiltManifest,
   type PrebuiltSharedModuleEntry,
@@ -72,13 +72,64 @@ export interface BuildOptions {
   envAllowlist?: readonly string[];
   /** Shared module paths relative to functionsDir or absolute. */
   sharedModules?: readonly string[];
+  /** Progress callback for CLI/status reporting. */
+  onProgress?: (event: BuildProgress) => void;
 }
 
 export interface BuildResult {
   manifest: PrebuiltManifest;
   outDir: string;
   durationMs: number;
+  entryMinification: {
+    preBytes: number;
+    postBytes: number;
+  };
+  chunkMinification: {
+    preBytes: number;
+    postBytes: number;
+  };
+  sharedMinification: {
+    preBytes: number;
+    postBytes: number;
+  };
 }
+
+export type BuildProgress =
+  | { phase: "bundle-start"; functions: number }
+  | {
+    phase: "bundle-complete";
+    functions: number;
+    chunks: number;
+    durationMs: number;
+    entryPreBytes: number;
+    entryPostBytes: number;
+    chunkPreBytes: number;
+    chunkPostBytes: number;
+  }
+  | {
+    phase: "hash-function";
+    current: number;
+    total: number;
+    name: string;
+    bytes: number;
+    originalBytes: number;
+  }
+  | {
+    phase: "hash-chunk";
+    current: number;
+    total: number;
+    file: string;
+    bytes: number;
+    originalBytes: number;
+  }
+  | {
+    phase: "hash-shared";
+    current: number;
+    total: number;
+    id: string;
+    bytes: number;
+    originalBytes: number;
+  };
 
 /**
  * SHA-256 a `Uint8Array` to a lowercase hex string. Web-Crypto-only —
@@ -111,7 +162,9 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   const functionsDir = isAbsolute(opts.functionsDir)
     ? opts.functionsDir
     : resolvePath(cwd, opts.functionsDir);
-  const outDir = isAbsolute(opts.outDir) ? opts.outDir : resolvePath(cwd, opts.outDir);
+  const outDir = isAbsolute(opts.outDir)
+    ? opts.outDir
+    : resolvePath(cwd, opts.outDir);
 
   let inputs = await discoverEntrypoints(functionsDir);
   if (opts.only && opts.only.length > 0) {
@@ -135,27 +188,37 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
   const sharedOutDir = join(outDir, "shared");
   await ensureDir(functionsOutDir);
 
-  const sharedModules = await discoverSharedModules(functionsDir, opts.sharedModules ?? []);
+  const sharedModules = await discoverSharedModules(
+    functionsDir,
+    opts.sharedModules ?? [],
+  );
 
-  const bundler = createBundler({
-    outDir: functionsOutDir,
+  opts.onProgress?.({ phase: "bundle-start", functions: inputs.length });
+  const chunkStart = performance.now();
+  const chunked = await bundleAllChunked({
+    inputs,
+    outDir,
     configPath: opts.configPath,
     sourcemap: opts.sourcemap ?? "linked",
     minify: opts.minify ?? false,
     sharedModules,
   });
-
-  let bundleResults: BundleResult[];
-  try {
-    bundleResults = await bundler.bundleAll(inputs, {
-      concurrency: opts.concurrency ?? 4,
-    });
-  } finally {
-    await bundler.dispose().catch(() => {});
-  }
+  opts.onProgress?.({
+    phase: "bundle-complete",
+    functions: chunked.functions.length,
+    chunks: chunked.chunks.length,
+    durationMs: performance.now() - chunkStart,
+    entryPreBytes: chunked.entryMinification.preBytes,
+    entryPostBytes: chunked.entryMinification.postBytes,
+    chunkPreBytes: chunked.chunkMinification.preBytes,
+    chunkPostBytes: chunked.chunkMinification.postBytes,
+  });
+  const bundleResults = chunked.functions;
 
   const sharedEntries: PrebuiltSharedModuleEntry[] = [];
-  for (const module of sharedModules) {
+  const sharedMinification = { preBytes: 0, postBytes: 0 };
+  for (let i = 0; i < sharedModules.length; i++) {
+    const module = sharedModules[i];
     const shared = await bundleSharedModule({
       module,
       outDir: sharedOutDir,
@@ -164,6 +227,16 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
     });
     const bytes = await Deno.readFile(shared.bundlePath);
     const baseName = shared.bundlePath.split(/[\\/]/).pop()!;
+    sharedMinification.preBytes += shared.originalByteLength;
+    sharedMinification.postBytes += shared.byteLength;
+    opts.onProgress?.({
+      phase: "hash-shared",
+      current: i + 1,
+      total: sharedModules.length,
+      id: shared.id,
+      bytes: shared.byteLength,
+      originalBytes: shared.originalByteLength,
+    });
     sharedEntries.push({
       id: shared.id,
       bundleFile: `shared/${baseName}`,
@@ -173,25 +246,54 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
     });
   }
 
+  const chunkEntries: PrebuiltChunkEntry[] = await Promise.all(
+    chunked.chunks.map(async (chunk, idx) => {
+      const bytes = await Deno.readFile(chunk.path);
+      opts.onProgress?.({
+        phase: "hash-chunk",
+        current: idx + 1,
+        total: chunked.chunks.length,
+        file: chunk.file,
+        bytes: chunk.byteLength,
+        originalBytes: chunk.originalByteLength,
+      });
+      return {
+        file: chunk.file,
+        bytes: chunk.byteLength,
+        sha256: await sha256Hex(bytes),
+      };
+    }),
+  );
+
   // Hash each bundle. We do this on raw bytes (not the path) so the
   // resulting hash is stable across machines and can be verified at
   // serve time without needing esbuild present.
   const entries: PrebuiltFunctionEntry[] = await Promise.all(
-    bundleResults.map(async (r) => {
+    bundleResults.map(async (r, idx) => {
       const bytes = await Deno.readFile(r.bundlePath);
       const sha = await sha256Hex(bytes);
       const manifest = await loadManifest(functionsDir, r.name);
+      opts.onProgress?.({
+        phase: "hash-function",
+        current: idx + 1,
+        total: bundleResults.length,
+        name: r.name,
+        bytes: r.byteLength,
+        originalBytes: r.originalByteLength,
+      });
       // `bundleFile` is the manifest-relative path. Always uses
       // forward slashes so the same manifest validates on both
       // Windows (build) and Linux (serve) — `path.join` on either
       // OS treats this as a relative segment correctly.
       const baseName = r.bundlePath.split(/[\\/]/).pop()!;
       const bundleFile = `functions/${baseName}`;
+      const chunkedFn = chunked.functions.find((f) => f.name === r.name);
       return {
         name: r.name,
         bundleFile,
         bundleBytes: r.byteLength,
         bundleSha256: sha,
+        moduleFiles: chunkedFn?.moduleFiles ?? [bundleFile],
         manifest,
       };
     }),
@@ -203,11 +305,14 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
     schema: PREBUILT_SCHEMA,
     builtBy: `1tube@${VERSION}`,
     builtAt: new Date().toISOString(),
-    ...(opts.compatibilityDate ? { compatibilityDate: opts.compatibilityDate } : {}),
+    ...(opts.compatibilityDate
+      ? { compatibilityDate: opts.compatibilityDate }
+      : {}),
     ...(opts.compatibilityFlags && opts.compatibilityFlags.length > 0
       ? { compatibilityFlags: [...opts.compatibilityFlags] }
       : {}),
     envAllowlist: opts.envAllowlist ? [...opts.envAllowlist] : [],
+    chunks: chunkEntries.sort((a, b) => a.file.localeCompare(b.file)),
     sharedModules: sharedEntries,
     functions: entries,
   };
@@ -236,10 +341,20 @@ Schema: ${PREBUILT_SCHEMA}.  Built by: ${manifest.builtBy} at ${manifest.builtAt
   try {
     await Deno.stat(gitignorePath);
   } catch {
-    await Deno.writeTextFile(gitignorePath, "# 1tube build artifact — typically regenerated, not committed.\n*\n!.gitignore\n!README.txt\n");
+    await Deno.writeTextFile(
+      gitignorePath,
+      "# 1tube build artifact — typically regenerated, not committed.\n*\n!.gitignore\n!README.txt\n",
+    );
   }
 
-  return { manifest, outDir, durationMs: performance.now() - startedAt };
+  return {
+    manifest,
+    outDir,
+    durationMs: performance.now() - startedAt,
+    entryMinification: chunked.entryMinification,
+    chunkMinification: chunked.chunkMinification,
+    sharedMinification,
+  };
 }
 
 /**
@@ -253,7 +368,7 @@ Schema: ${PREBUILT_SCHEMA}.  Built by: ${manifest.builtBy} at ${manifest.builtAt
  *   --out <path>           where to write the artifact (default ./dist)
  *   --only A,B,C           build a subset of functions
  *   --sourcemap none|linked|inline   (default: linked)
- *   --minify               minify bundle output (default: off)
+ *   --minify               also minify during the initial esbuild pass
  *   --concurrency N        bundler concurrency (default: 4)
  *   --compat-date YYYY-MM-DD
  *   --compat-flag FLAG     repeatable; bakes a compat flag into manifest
@@ -283,13 +398,16 @@ export async function runBuild(args: string[]): Promise<number> {
     } else if ((a === "--out" || a === "-o") && args[i + 1]) {
       outDir = args[++i];
     } else if (a === "--only" && args[i + 1]) {
-      only = args[++i].split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+      only = args[++i].split(",").map((s) => s.trim()).filter((s) =>
+        s.length > 0
+      );
     } else if (a === "--sourcemap" && args[i + 1]) {
       const v = args[++i];
       if (v === "none" || v === "false" || v === "off") sourcemap = false;
       else if (v === "inline") sourcemap = "inline";
-      else if (v === "linked" || v === "true" || v === "on") sourcemap = "linked";
-      else {
+      else if (v === "linked" || v === "true" || v === "on") {
+        sourcemap = "linked";
+      } else {
         console.error(`[1tube build] unknown --sourcemap value: ${v}`);
         return 2;
       }
@@ -313,9 +431,13 @@ export async function runBuild(args: string[]): Promise<number> {
     } else if (a === "--no-config") {
       configPathArg = "";
     } else if (a === "--workerd-env" && args[i + 1]) {
-      envAllowlist = args[++i].split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+      envAllowlist = args[++i].split(",").map((s) => s.trim()).filter((s) =>
+        s.length > 0
+      );
     } else if (a.startsWith("--workerd-env=")) {
-      envAllowlist = a.slice("--workerd-env=".length).split(",").map((s) => s.trim())
+      envAllowlist = a.slice("--workerd-env=".length).split(",").map((s) =>
+        s.trim()
+      )
         .filter((s) => s.length > 0);
     } else if (a === "--workerd-shared" && args[i + 1]) {
       sharedModules.push(args[++i]);
@@ -344,13 +466,19 @@ export async function runBuild(args: string[]): Promise<number> {
     if (configPathArg === "") {
       configPath = undefined;
     } else {
-      const abs = isAbsolute(configPathArg) ? configPathArg : resolvePath(Deno.cwd(), configPathArg);
+      const abs = isAbsolute(configPathArg)
+        ? configPathArg
+        : resolvePath(Deno.cwd(), configPathArg);
       try {
         const stat = await Deno.stat(abs);
         if (!stat.isFile) throw new Error("not a regular file");
         configPath = abs;
       } catch (err) {
-        console.error(`[1tube build] --config path not readable: ${abs} (${(err as Error).message})`);
+        console.error(
+          `[1tube build] --config path not readable: ${abs} (${
+            (err as Error).message
+          })`,
+        );
         return 2;
       }
     }
@@ -363,7 +491,9 @@ export async function runBuild(args: string[]): Promise<number> {
     // The functions-dir fallback is what makes this work for sciobot-next
     // (a Vite/Bun project where the only deno.json lives next to the
     // edge functions, not at repo root).
-    const fnDirAbs = isAbsolute(functionsDir) ? functionsDir : resolvePath(Deno.cwd(), functionsDir);
+    const fnDirAbs = isAbsolute(functionsDir)
+      ? functionsDir
+      : resolvePath(Deno.cwd(), functionsDir);
     const candidates = [
       `${Deno.cwd()}/deno.json`,
       `${Deno.cwd()}/deno.jsonc`,
@@ -373,7 +503,10 @@ export async function runBuild(args: string[]): Promise<number> {
     for (const abs of candidates) {
       try {
         const stat = await Deno.stat(abs);
-        if (stat.isFile) { configPath = abs; break; }
+        if (stat.isFile) {
+          configPath = abs;
+          break;
+        }
       } catch { /* not found, try next */ }
     }
     if (configPath) {
@@ -386,7 +519,14 @@ export async function runBuild(args: string[]): Promise<number> {
     }
   }
 
-  console.log(`[1tube build] bundling functions from ${functionsDir} → ${outDir}`);
+  console.log(
+    `[1tube build] bundling functions from ${functionsDir} → ${outDir}`,
+  );
+  const fmt = (n: number) => {
+    if (n < 1024) return `${n}B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+    return `${(n / (1024 * 1024)).toFixed(2)}MB`;
+  };
   try {
     const result = await build({
       functionsDir,
@@ -400,26 +540,125 @@ export async function runBuild(args: string[]): Promise<number> {
       ...(compatDate ? { compatibilityDate: compatDate } : {}),
       ...(compatFlags.length > 0 ? { compatibilityFlags: compatFlags } : {}),
       ...(envAllowlist ? { envAllowlist } : {}),
+      onProgress(event) {
+        if (event.phase === "bundle-start") {
+          console.log(
+            `[1tube build] bundling ${event.functions} function entry module(s) with shared ESM chunks…`,
+          );
+        } else if (event.phase === "bundle-complete") {
+          const saved = (event.entryPreBytes + event.chunkPreBytes) -
+            (event.entryPostBytes + event.chunkPostBytes);
+          console.log(
+            `[1tube build] bundled and minified ${event.functions} entry module(s) and ${event.chunks} chunk(s) in ${
+              event.durationMs.toFixed(0)
+            }ms (entries ${fmt(event.entryPreBytes)} → ${
+              fmt(event.entryPostBytes)
+            }, chunks ${fmt(event.chunkPreBytes)} → ${
+              fmt(event.chunkPostBytes)
+            }, saved ${fmt(Math.max(0, saved))})`,
+          );
+        } else if (event.phase === "hash-function") {
+          console.log(
+            `[1tube build] entry ${event.current}/${event.total}: ${event.name} ${
+              fmt(event.originalBytes)
+            } → ${fmt(event.bytes)}`,
+          );
+        } else if (event.phase === "hash-chunk") {
+          console.log(
+            `[1tube build] chunk ${event.current}/${event.total}: ${event.file} ${
+              fmt(event.originalBytes)
+            } → ${fmt(event.bytes)}`,
+          );
+        } else if (event.phase === "hash-shared") {
+          console.log(
+            `[1tube build] shared runtime ${event.current}/${event.total}: ${event.id} ${
+              fmt(event.originalBytes)
+            } → ${fmt(event.bytes)}`,
+          );
+        }
+      },
     });
 
     const { manifest, durationMs } = result;
-    const totalBytes = manifest.functions.reduce((acc, f) => acc + f.bundleBytes, 0);
-    const fmt = (n: number) => {
-      if (n < 1024) return `${n}B`;
-      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
-      return `${(n / (1024 * 1024)).toFixed(2)}MB`;
-    };
-    const namePad = manifest.functions.reduce((m, f) => Math.max(m, f.name.length), 8);
-    console.log(`[1tube build] ${manifest.functions.length} function(s):`);
+    const functionBytes = manifest.functions.reduce(
+      (acc, f) => acc + f.bundleBytes,
+      0,
+    );
+    const chunkBytes = manifest.chunks.reduce((acc, c) => acc + c.bytes, 0);
+    const functionPreBytes = result.entryMinification.preBytes;
+    const chunkPreBytes = result.chunkMinification.preBytes;
+    const sharedPreBytes = result.sharedMinification.preBytes;
+    const sharedBytes = manifest.sharedModules.reduce(
+      (acc, m) => acc + m.bundleBytes,
+      0,
+    );
+    const totalBytes = functionBytes + chunkBytes + sharedBytes;
+    const namePad = manifest.functions.reduce(
+      (m, f) => Math.max(m, f.name.length),
+      8,
+    );
+    console.log(
+      `[1tube build] ${manifest.functions.length} function entry module(s), minified ${
+        fmt(functionPreBytes)
+      } → ${fmt(functionBytes)}:`,
+    );
     for (const f of manifest.functions) {
       console.log(
-        `  ${f.name.padEnd(namePad)}  ${fmt(f.bundleBytes).padStart(8)}  sha256=${f.bundleSha256.slice(0, 12)}…`,
+        `  ${f.name.padEnd(namePad)}  ${
+          fmt(f.bundleBytes).padStart(8)
+        }  sha256=${f.bundleSha256.slice(0, 12)}…`,
       );
     }
-    console.log(
-      `[1tube build] total ${fmt(totalBytes)} in ${durationMs.toFixed(0)}ms — wrote manifest.json (schema ${PREBUILT_SCHEMA})`,
+    const chunkPad = manifest.chunks.reduce(
+      (m, c) => Math.max(m, c.file.length),
+      8,
     );
-    console.log(`[1tube build] serve with: 1tube serve --backend workerd --prebuilt ${outDir}`);
+    if (manifest.chunks.length > 0) {
+      console.log(
+        `[1tube build] ${manifest.chunks.length} shared chunk(s), minified ${
+          fmt(chunkPreBytes)
+        } → ${fmt(chunkBytes)}:`,
+      );
+      for (const c of manifest.chunks) {
+        console.log(
+          `  ${c.file.padEnd(chunkPad)}  ${fmt(c.bytes).padStart(8)}  sha256=${
+            c.sha256.slice(0, 12)
+          }…`,
+        );
+      }
+    } else {
+      console.log(`[1tube build] 0 shared chunk(s)`);
+    }
+    if (manifest.sharedModules.length > 0) {
+      const sharedPad = manifest.sharedModules.reduce(
+        (m, s) => Math.max(m, s.id.length),
+        8,
+      );
+      console.log(
+        `[1tube build] ${manifest.sharedModules.length} shared runtime module(s), minified ${
+          fmt(sharedPreBytes)
+        } → ${fmt(sharedBytes)}:`,
+      );
+      for (const s of manifest.sharedModules) {
+        console.log(
+          `  ${s.id.padEnd(sharedPad)}  ${
+            fmt(s.bundleBytes).padStart(8)
+          }  sha256=${s.bundleSha256.slice(0, 12)}…`,
+        );
+      }
+    }
+    console.log(
+      `[1tube build] total ${fmt(totalBytes)} (${
+        fmt(functionBytes)
+      } entries + ${fmt(chunkBytes)} chunks${
+        sharedBytes > 0 ? ` + ${fmt(sharedBytes)} shared runtime` : ""
+      }) in ${
+        durationMs.toFixed(0)
+      }ms — wrote manifest.json (schema ${PREBUILT_SCHEMA})`,
+    );
+    console.log(
+      `[1tube build] serve with: 1tube serve --backend workerd --prebuilt ${outDir}`,
+    );
     return 0;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -435,7 +674,7 @@ Options:
   -o, --out <path>           Output directory (default: ./dist)
       --only A,B,C           Build only the named subset
       --sourcemap MODE       none | linked (default) | inline
-      --minify               Minify output (default: off)
+      --minify               Also minify during the initial esbuild pass
       --concurrency N        Bundler concurrency (default: 4)
       --compat-date DATE     Workerd compatibility date (YYYY-MM-DD)
       --compat-flag FLAG     Add a workerd compatibility flag (repeatable)

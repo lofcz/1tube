@@ -37,7 +37,7 @@ if (arg0 === "build") {
 Commands:
   serve       Run the gateway (default when no command given)
   build       Bundle functions into a sealed artifact for prebuilt deploys
-  package     Wrap a built dist/ into a signed .1tube firmware payload
+  package     Build and/or wrap dist/ into a signed .1tube firmware payload
   --version   Print version and exit
   --help      Print this help
 

@@ -202,6 +202,37 @@ export interface BundleResult {
   durationMs: number;
 }
 
+export interface ChunkedBundleChunk {
+  /** Manifest-relative POSIX path, e.g. `chunks/chunk-ABC123.js`. */
+  file: string;
+  /** Absolute path to the emitted chunk file. */
+  path: string;
+  /** Chunk byte size after chunk-only minification. */
+  byteLength: number;
+  /** Chunk byte size before chunk-only minification. */
+  originalByteLength: number;
+}
+
+export interface ChunkedBundleResult extends BundleResult {
+  /** Manifest-relative POSIX module files required by this worker, entry first. */
+  moduleFiles: string[];
+  /** Entry module byte size before entry-only minification. */
+  originalByteLength: number;
+}
+
+export interface ChunkedBundleAllResult {
+  functions: ChunkedBundleResult[];
+  chunks: ChunkedBundleChunk[];
+  entryMinification: {
+    preBytes: number;
+    postBytes: number;
+  };
+  chunkMinification: {
+    preBytes: number;
+    postBytes: number;
+  };
+}
+
 export interface WorkerdSharedModuleInput {
   /** Stable id used in the generated RPC path and prebuilt manifest. */
   id: string;
@@ -253,6 +284,7 @@ export interface Bundler {
 
 export interface SharedBundleResult extends SharedRuntimeModule {
   byteLength: number;
+  originalByteLength: number;
   durationMs: number;
 }
 
@@ -311,7 +343,10 @@ function importerToPath(importer: string): string | null {
 }
 
 function resolveLocalImport(args: esbuild.OnResolveArgs): string | null {
-  if (!args.path.startsWith(".") && !args.path.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(args.path)) {
+  if (
+    !args.path.startsWith(".") && !args.path.startsWith("/") &&
+    !/^[A-Za-z]:[\\/]/.test(args.path)
+  ) {
     return null;
   }
   if (args.path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(args.path)) {
@@ -322,8 +357,12 @@ function resolveLocalImport(args: esbuild.OnResolveArgs): string | null {
   return resolvePath(dirname(importerPath), args.path);
 }
 
-function sharedModulesExternalPlugin(sharedModules: readonly WorkerdSharedModuleInput[]): esbuild.Plugin {
-  const byPath = new Map(sharedModules.map((m) => [resolvePath(m.sourcePath), m]));
+function sharedModulesExternalPlugin(
+  sharedModules: readonly WorkerdSharedModuleInput[],
+): esbuild.Plugin {
+  const byPath = new Map(
+    sharedModules.map((m) => [resolvePath(m.sourcePath), m]),
+  );
   return {
     name: "1tube-shared-modules",
     setup(build) {
@@ -334,10 +373,15 @@ function sharedModulesExternalPlugin(sharedModules: readonly WorkerdSharedModule
         if (!mod) return null;
         return { path: mod.id, namespace: "1tube-shared-runtime" };
       });
-      build.onLoad({ filter: /.*/, namespace: "1tube-shared-runtime" }, (args) => ({
-        contents: sharedModuleStubSource(sharedModules.find((m) => m.id === args.path)!),
-        loader: "js",
-      }));
+      build.onLoad(
+        { filter: /.*/, namespace: "1tube-shared-runtime" },
+        (args) => ({
+          contents: sharedModuleStubSource(
+            sharedModules.find((m) => m.id === args.path)!,
+          ),
+          loader: "js",
+        }),
+      );
     },
   };
 }
@@ -352,9 +396,97 @@ function patchCjsDefaultInterop(code: string): string {
   // to module.exports. Preserve real default exports, but synthesize one
   // when absent.
   return code.replace(
-    "isNodeMode || !mod || !mod.__esModule ? __defProp(target, \"default\", { value: mod, enumerable: true }) : target,",
-    "isNodeMode || !mod || !mod.__esModule || !(\"default\" in mod) ? __defProp(target, \"default\", { value: mod, enumerable: true }) : target,",
+    'isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,',
+    'isNodeMode || !mod || !mod.__esModule || !("default" in mod) ? __defProp(target, "default", { value: mod, enumerable: true }) : target,',
   );
+}
+
+const ENTRY_PROXY_NAMESPACE = "1tube-entry-proxy";
+
+function toPosix(path: string): string {
+  return path.replace(/\\/g, "/");
+}
+
+function entryProxySource(entrypoint: string): string {
+  return `${BANNER}
+await import(${JSON.stringify(pathToFileURL(entrypoint).href)});
+${FOOTER}
+`;
+}
+
+function entryProxyPlugin(inputs: readonly BundleInput[]): esbuild.Plugin {
+  const byName = new Map(inputs.map((input) => [input.name, input]));
+  return {
+    name: "1tube-entry-proxy",
+    setup(build) {
+      build.onResolve({ filter: /^1tube-entry-proxy:/ }, (args) => {
+        return {
+          path: args.path.slice("1tube-entry-proxy:".length),
+          namespace: ENTRY_PROXY_NAMESPACE,
+        };
+      });
+      build.onLoad(
+        { filter: /.*/, namespace: ENTRY_PROXY_NAMESPACE },
+        (args) => {
+          const input = byName.get(args.path);
+          if (!input) {
+            throw new Error(
+              `missing 1tube entry proxy input for ${args.path}`,
+            );
+          }
+          return {
+            contents: entryProxySource(input.entrypoint),
+            loader: "js",
+            resolveDir: dirname(input.entrypoint),
+          };
+        },
+      );
+    },
+  };
+}
+
+async function patchOutputFile(path: string): Promise<void> {
+  const emitted = await Deno.readTextFile(path);
+  const patched = patchCjsDefaultInterop(emitted);
+  if (patched !== emitted) {
+    await Deno.writeTextFile(path, patched);
+  }
+}
+
+async function minifyOutputFile(
+  path: string,
+  sourcemap: boolean | "linked" | "inline",
+): Promise<{
+  originalByteLength: number;
+  byteLength: number;
+}> {
+  const original = await Deno.readTextFile(path);
+  const originalByteLength = new TextEncoder().encode(original).byteLength;
+  const result = await esbuild.transform(original, {
+    loader: "js",
+    format: "esm",
+    target: "es2022",
+    minify: true,
+    legalComments: "none",
+    sourcemap: sourcemap === "inline"
+      ? "inline"
+      : sourcemap === "linked"
+      ? "external"
+      : false,
+    sourcefile: path.split(/[\\/]/).pop() ?? "bundle.js",
+  });
+  let code = result.code;
+  if (sourcemap === "linked" && result.map) {
+    const mapPath = `${path}.map`;
+    await Deno.writeTextFile(mapPath, result.map);
+    code = code.replace(/\n?\/\/# sourceMappingURL=.*$/m, "");
+    code += `\n//# sourceMappingURL=${mapPath.split(/[\\/]/).pop()}\n`;
+  }
+  await Deno.writeTextFile(path, code);
+  return {
+    originalByteLength,
+    byteLength: new TextEncoder().encode(code).byteLength,
+  };
 }
 
 /**
@@ -383,41 +515,41 @@ export function createBundler(opts: BundlerOptions): Bundler {
 
     try {
       await esbuild.build({
-      // The deno-loader resolver needs absolute file URLs for entrypoints
-      // so its specifier matching is unambiguous on Windows (where naked
-      // paths can be interpreted as relative).
-      entryPoints: [pathToFileURL(input.entrypoint).href],
-      outfile,
-      plugins,
-      bundle: true,
-      format: "esm",
-      // Workerd targets a modern V8 — no need to down-level for IE11 etc.
-      // Matches Cloudflare's documented baseline; tightening this further
-      // (e.g. ES2022) caused regressions with some JSR packages historically.
-      target: "es2022",
-      platform: "neutral",
-      // Prefer browser/import conditions over node so packages with both
-      // entrypoints (`@supabase/supabase-js` etc.) pick the leaner ESM
-      // build. `node` is added so `node:`-prefixed imports resolve into
-      // workerd's nodejs_compat polyfills.
-      conditions: ["worker", "browser", "import", "default"],
-      banner: { js: BANNER },
-      footer: { js: FOOTER },
-      sourcemap,
-      minify: opts.minify ?? false,
-      // Tree-shaking is only safe when imports are pure — esbuild assumes
-      // this for `format: esm`. Leave at default (true) so unused npm
-      // surface (e.g. server-only Supabase code paths) is dropped.
-      treeShaking: true,
-      // Emit deterministic output regardless of CWD so the cache is
-      // content-comparable across machines.
-      absWorkingDir: opts.outDir,
-      // We don't want esbuild to log to stdout — the host gateway controls
-      // logging surface. Errors are surfaced via thrown exceptions.
-      logLevel: "silent",
-      // Workerd accepts standard ESM; explicit `mainFields` keeps esbuild
-      // honest if a package overrides condition resolution.
-      mainFields: ["module", "main"],
+        // The deno-loader resolver needs absolute file URLs for entrypoints
+        // so its specifier matching is unambiguous on Windows (where naked
+        // paths can be interpreted as relative).
+        entryPoints: [pathToFileURL(input.entrypoint).href],
+        outfile,
+        plugins,
+        bundle: true,
+        format: "esm",
+        // Workerd targets a modern V8 — no need to down-level for IE11 etc.
+        // Matches Cloudflare's documented baseline; tightening this further
+        // (e.g. ES2022) caused regressions with some JSR packages historically.
+        target: "es2022",
+        platform: "neutral",
+        // Prefer browser/import conditions over node so packages with both
+        // entrypoints (`@supabase/supabase-js` etc.) pick the leaner ESM
+        // build. `node` is added so `node:`-prefixed imports resolve into
+        // workerd's nodejs_compat polyfills.
+        conditions: ["worker", "browser", "import", "default"],
+        banner: { js: BANNER },
+        footer: { js: FOOTER },
+        sourcemap,
+        minify: opts.minify ?? false,
+        // Tree-shaking is only safe when imports are pure — esbuild assumes
+        // this for `format: esm`. Leave at default (true) so unused npm
+        // surface (e.g. server-only Supabase code paths) is dropped.
+        treeShaking: true,
+        // Emit deterministic output regardless of CWD so the cache is
+        // content-comparable across machines.
+        absWorkingDir: opts.outDir,
+        // We don't want esbuild to log to stdout — the host gateway controls
+        // logging surface. Errors are surfaced via thrown exceptions.
+        logLevel: "silent",
+        // Workerd accepts standard ESM; explicit `mainFields` keeps esbuild
+        // honest if a package overrides condition resolution.
+        mainFields: ["module", "main"],
       });
     } catch (err) {
       // esbuild throws on any build error with `logLevel: silent`. Re-raise
@@ -431,11 +563,7 @@ export function createBundler(opts: BundlerOptions): Bundler {
       );
     }
 
-    const emitted = await Deno.readTextFile(outfile);
-    const patched = patchCjsDefaultInterop(emitted);
-    if (patched !== emitted) {
-      await Deno.writeTextFile(outfile, patched);
-    }
+    await patchOutputFile(outfile);
 
     const stat = await Deno.stat(outfile);
     const sourcemapPath = sourcemap === "linked" ? `${outfile}.map` : null;
@@ -483,6 +611,177 @@ export function createBundler(opts: BundlerOptions): Bundler {
   };
 }
 
+export async function bundleAllChunked(
+  opts: BundlerOptions & {
+    inputs: BundleInput[];
+  },
+): Promise<ChunkedBundleAllResult> {
+  await ensureDir(opts.outDir);
+  const start = performance.now();
+  const sourcemap = opts.sourcemap ?? "linked";
+  const sharedModules = opts.sharedModules ?? [];
+  const plugins = [
+    entryProxyPlugin(opts.inputs),
+    ...(sharedModules.length > 0
+      ? [sharedModulesExternalPlugin(sharedModules)]
+      : []),
+    denoPlugin({ configPath: opts.configPath }),
+  ];
+  const entryPoints = Object.fromEntries(
+    opts.inputs.map((input) => [input.name, `1tube-entry-proxy:${input.name}`]),
+  );
+
+  let result: esbuild.BuildResult<{
+    metafile: true;
+    write: true;
+  }>;
+  try {
+    result = await esbuild.build({
+      entryPoints,
+      outdir: opts.outDir,
+      plugins,
+      bundle: true,
+      splitting: true,
+      format: "esm",
+      target: "es2022",
+      platform: "neutral",
+      conditions: ["worker", "browser", "import", "default"],
+      sourcemap,
+      minify: opts.minify ?? false,
+      treeShaking: true,
+      absWorkingDir: opts.outDir,
+      logLevel: "silent",
+      mainFields: ["module", "main"],
+      entryNames: "functions/[name]",
+      chunkNames: "chunks/[name]-[hash]",
+      metafile: true,
+      write: true,
+    });
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new Error(`workerd chunked bundle failed\n${cause}`, {
+      cause: err instanceof Error ? err : undefined,
+    });
+  }
+
+  const outputs = result.metafile.outputs;
+  const entryByName = new Map<string, string>();
+  const importsByOutput = new Map<string, string[]>();
+  for (const [outputPath, output] of Object.entries(outputs)) {
+    if (!outputPath.endsWith(".js")) continue;
+    const rel = toPosix(outputPath);
+    importsByOutput.set(
+      rel,
+      output.imports
+        .filter((i) => i.path.endsWith(".js"))
+        .map((i) => toPosix(i.path)),
+    );
+    if (output.entryPoint) {
+      const match = output.entryPoint.match(/^1tube-entry-proxy:(.+)$/);
+      if (match) entryByName.set(match[1], rel);
+    }
+  }
+
+  const collectReachable = (entry: string): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const visit = (file: string) => {
+      if (seen.has(file)) return;
+      seen.add(file);
+      out.push(file);
+      for (const dep of importsByOutput.get(file) ?? []) visit(dep);
+    };
+    visit(entry);
+    return out;
+  };
+
+  const emittedJs = Object.keys(outputs)
+    .map(toPosix)
+    .filter((file) => file.endsWith(".js"));
+  await Promise.all(
+    emittedJs.map((file) => patchOutputFile(join(opts.outDir, file))),
+  );
+  const minifiedSizesByFile = new Map<string, {
+    originalByteLength: number;
+    byteLength: number;
+  }>();
+  await Promise.all(
+    emittedJs.map(async (file) => {
+      minifiedSizesByFile.set(
+        file,
+        await minifyOutputFile(join(opts.outDir, file), sourcemap),
+      );
+    }),
+  );
+
+  const chunkFiles = emittedJs
+    .filter((file) => file.startsWith("chunks/"))
+    .sort();
+  const chunks: ChunkedBundleChunk[] = chunkFiles.map((file) => {
+    const path = join(opts.outDir, file);
+    const sizes = minifiedSizesByFile.get(file);
+    if (!sizes) {
+      throw new Error(
+        `workerd chunked bundle missing minified size for ${file}`,
+      );
+    }
+    return {
+      file,
+      path,
+      byteLength: sizes.byteLength,
+      originalByteLength: sizes.originalByteLength,
+    };
+  });
+  const chunkMinification = chunks.reduce(
+    (acc, chunk) => {
+      acc.preBytes += chunk.originalByteLength;
+      acc.postBytes += chunk.byteLength;
+      return acc;
+    },
+    { preBytes: 0, postBytes: 0 },
+  );
+  const entryMinification = [...entryByName.values()].reduce(
+    (acc, entry) => {
+      const sizes = minifiedSizesByFile.get(entry);
+      if (sizes) {
+        acc.preBytes += sizes.originalByteLength;
+        acc.postBytes += sizes.byteLength;
+      }
+      return acc;
+    },
+    { preBytes: 0, postBytes: 0 },
+  );
+
+  const durationMs = performance.now() - start;
+  const functions: ChunkedBundleResult[] = [];
+  for (const input of opts.inputs) {
+    const entry = entryByName.get(input.name);
+    if (!entry) {
+      throw new Error(
+        `workerd chunked bundle missing entry output for ${input.name}`,
+      );
+    }
+    const bundlePath = join(opts.outDir, entry);
+    const sizes = minifiedSizesByFile.get(entry);
+    if (!sizes) {
+      throw new Error(
+        `workerd chunked bundle missing minified size for ${entry}`,
+      );
+    }
+    functions.push({
+      name: input.name,
+      bundlePath,
+      sourcemapPath: sourcemap === "linked" ? `${bundlePath}.map` : null,
+      byteLength: sizes.byteLength,
+      durationMs: durationMs / Math.max(1, opts.inputs.length),
+      moduleFiles: collectReachable(entry),
+      originalByteLength: sizes.originalByteLength,
+    });
+  }
+
+  return { functions, chunks, entryMinification, chunkMinification };
+}
+
 export async function bundleSharedModule(opts: {
   module: WorkerdSharedModuleInput;
   outDir: string;
@@ -508,17 +807,14 @@ export async function bundleSharedModule(opts: {
     logLevel: "silent",
     mainFields: ["module", "main"],
   });
-  const emitted = await Deno.readTextFile(outfile);
-  const patched = patchCjsDefaultInterop(emitted);
-  if (patched !== emitted) {
-    await Deno.writeTextFile(outfile, patched);
-  }
-  const stat = await Deno.stat(outfile);
+  await patchOutputFile(outfile);
+  const sizes = await minifyOutputFile(outfile, false);
   return {
     id: opts.module.id,
     bundlePath: outfile,
     exportNames: opts.module.exportNames,
-    byteLength: stat.size,
+    byteLength: sizes.byteLength,
+    originalByteLength: sizes.originalByteLength,
     durationMs: performance.now() - start,
   };
 }
@@ -530,19 +826,33 @@ function moduleIdFromPath(path: string): string {
 
 function extractExportedFunctionNames(source: string): string[] {
   const names = new Set<string>();
-  for (const match of source.matchAll(/export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g)) {
+  for (
+    const match of source.matchAll(
+      /export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g,
+    )
+  ) {
     names.add(match[1]);
   }
-  for (const match of source.matchAll(/export\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/g)) {
+  for (
+    const match of source.matchAll(
+      /export\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/g,
+    )
+  ) {
     names.add(match[1]);
   }
-  for (const match of source.matchAll(/export\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*async\s+/g)) {
+  for (
+    const match of source.matchAll(
+      /export\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*async\s+/g,
+    )
+  ) {
     names.add(match[1]);
   }
   return [...names].sort();
 }
 
-async function maybeSharedModule(path: string): Promise<WorkerdSharedModuleInput | null> {
+async function maybeSharedModule(
+  path: string,
+): Promise<WorkerdSharedModuleInput | null> {
   try {
     const stat = await Deno.stat(path);
     if (!stat.isFile) return null;
@@ -568,7 +878,9 @@ export async function discoverSharedModules(
 ): Promise<WorkerdSharedModuleInput[]> {
   const root = resolvePath(functionsDir);
   const candidates = explicitPaths.length > 0
-    ? explicitPaths.map((p) => /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") ? p : resolvePath(root, p))
+    ? explicitPaths.map((p) =>
+      /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") ? p : resolvePath(root, p)
+    )
     : [];
 
   // Built-in convention: if a Supabase-style profile cache exists, run

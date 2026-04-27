@@ -28,7 +28,7 @@ import {
   parseEnvelope,
   verifyEnvelope,
 } from "../src/cli/envelope.ts";
-import { packageDist, readPayload } from "../src/cli/package.ts";
+import { packageDist, readPayload, runPackage } from "../src/cli/package.ts";
 import { parsePrebuiltManifest } from "../src/backends/workerd/prebuilt.ts";
 
 const PROJECT_ROOT = resolvePath(
@@ -46,6 +46,10 @@ for (let i = 0; i < KEY.length; i++) KEY[i] = i + 1;
 const WRONG_KEY = new Uint8Array(32);
 for (let i = 0; i < WRONG_KEY.length; i++) WRONG_KEY[i] = (i + 1) ^ 0xff;
 
+function hexKey(bytes: Uint8Array): string {
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 async function buildFixture(label: string): Promise<string> {
   const out = await Deno.makeTempDir({ prefix: `1tube-pkg-build-${label}-` });
   await build({
@@ -59,8 +63,12 @@ async function buildFixture(label: string): Promise<string> {
 }
 
 async function buildSharedFixture(label: string): Promise<string> {
-  const root = await Deno.makeTempDir({ prefix: `1tube-pkg-shared-src-${label}-` });
-  const out = await Deno.makeTempDir({ prefix: `1tube-pkg-shared-build-${label}-` });
+  const root = await Deno.makeTempDir({
+    prefix: `1tube-pkg-shared-src-${label}-`,
+  });
+  const out = await Deno.makeTempDir({
+    prefix: `1tube-pkg-shared-build-${label}-`,
+  });
   await Deno.mkdir(join(root, "_shared"), { recursive: true });
   await Deno.mkdir(join(root, "needs-profile"), { recursive: true });
   await Deno.writeTextFile(
@@ -101,7 +109,9 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
   const view = new Uint8Array(buf);
   let out = "";
-  for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, "0");
+  for (let i = 0; i < view.length; i++) {
+    out += view[i].toString(16).padStart(2, "0");
+  }
   return out;
 }
 
@@ -115,7 +125,10 @@ async function verifyPayload(
   key: Uint8Array,
 ): Promise<
   | { stage: "ok"; envelope: FirmwareEnvelope }
-  | { stage: "envelope-parse" | "signature" | "manifest-hash" | "bundle-hash"; reason: string }
+  | {
+    stage: "envelope-parse" | "signature" | "manifest-hash" | "bundle-hash";
+    reason: string;
+  }
 > {
   let envelope: FirmwareEnvelope;
   let entries: Map<string, Uint8Array>;
@@ -124,183 +137,317 @@ async function verifyPayload(
     envelope = r.envelope;
     entries = r.entries;
   } catch (err) {
-    return { stage: "envelope-parse", reason: err instanceof Error ? err.message : String(err) };
+    return {
+      stage: "envelope-parse",
+      reason: err instanceof Error ? err.message : String(err),
+    };
   }
 
   let sigOk = false;
   try {
     sigOk = await verifyEnvelope(envelope, key);
   } catch (err) {
-    return { stage: "signature", reason: err instanceof Error ? err.message : String(err) };
+    return {
+      stage: "signature",
+      reason: err instanceof Error ? err.message : String(err),
+    };
   }
   if (!sigOk) return { stage: "signature", reason: "HMAC mismatch" };
 
   const manifestBytes = entries.get("dist/manifest.json");
-  if (!manifestBytes) return { stage: "manifest-hash", reason: "missing dist/manifest.json" };
+  if (!manifestBytes) {
+    return { stage: "manifest-hash", reason: "missing dist/manifest.json" };
+  }
   const manifestSha = await sha256Hex(manifestBytes);
   if (manifestSha !== envelope.manifestSha256) {
-    return { stage: "manifest-hash", reason: `expected ${envelope.manifestSha256}, got ${manifestSha}` };
+    return {
+      stage: "manifest-hash",
+      reason: `expected ${envelope.manifestSha256}, got ${manifestSha}`,
+    };
   }
 
-  const manifest = parsePrebuiltManifest(JSON.parse(new TextDecoder().decode(manifestBytes)));
+  const manifest = parsePrebuiltManifest(
+    JSON.parse(new TextDecoder().decode(manifestBytes)),
+  );
   for (const fn of manifest.functions) {
     const bytes = entries.get(`dist/${fn.bundleFile}`);
-    if (!bytes) return { stage: "bundle-hash", reason: `missing dist/${fn.bundleFile}` };
+    if (!bytes) {
+      return { stage: "bundle-hash", reason: `missing dist/${fn.bundleFile}` };
+    }
     const sha = await sha256Hex(bytes);
     if (sha !== fn.bundleSha256) {
-      return { stage: "bundle-hash", reason: `${fn.name}: expected ${fn.bundleSha256}, got ${sha}` };
+      return {
+        stage: "bundle-hash",
+        reason: `${fn.name}: expected ${fn.bundleSha256}, got ${sha}`,
+      };
     }
   }
   for (const shared of manifest.sharedModules) {
     const bytes = entries.get(`dist/${shared.bundleFile}`);
-    if (!bytes) return { stage: "bundle-hash", reason: `missing dist/${shared.bundleFile}` };
+    if (!bytes) {
+      return {
+        stage: "bundle-hash",
+        reason: `missing dist/${shared.bundleFile}`,
+      };
+    }
     const sha = await sha256Hex(bytes);
     if (sha !== shared.bundleSha256) {
-      return { stage: "bundle-hash", reason: `${shared.id}: expected ${shared.bundleSha256}, got ${sha}` };
+      return {
+        stage: "bundle-hash",
+        reason: `${shared.id}: expected ${shared.bundleSha256}, got ${sha}`,
+      };
+    }
+  }
+  for (const chunk of manifest.chunks) {
+    const bytes = entries.get(`dist/${chunk.file}`);
+    if (!bytes) {
+      return { stage: "bundle-hash", reason: `missing dist/${chunk.file}` };
+    }
+    const sha = await sha256Hex(bytes);
+    if (sha !== chunk.sha256) {
+      return {
+        stage: "bundle-hash",
+        reason: `${chunk.file}: expected ${chunk.sha256}, got ${sha}`,
+      };
     }
   }
   return { stage: "ok", envelope };
 }
 
-Deno.test("package round-trip: signature + manifest + bundles all verify", TEST_OPTS, async () => {
-  const dist = await buildFixture("rt");
-  const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
-  const payload = join(out, "fw.1tube");
+Deno.test(
+  "package round-trip: signature + manifest + bundles all verify",
+  TEST_OPTS,
+  async () => {
+    const dist = await buildFixture("rt");
+    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const payload = join(out, "fw.1tube");
 
-  const result = await packageDist({ distDir: dist, outFile: payload, key: KEY });
-  assertEquals(result.envelope.envelopeSchema, ENVELOPE_SCHEMA);
-  assertEquals(result.envelope.signature.algo, "hmac-sha256");
-  assertEquals(result.envelope.functionCount, 2);
-  assert(result.envelope.totalBundleBytes > 0);
-  assert(result.envelope.version.length > 0);
-  assert(result.envelope.createdBy.startsWith("1tube@"));
+    const result = await packageDist({
+      distDir: dist,
+      outFile: payload,
+      key: KEY,
+    });
+    assertEquals(result.envelope.envelopeSchema, ENVELOPE_SCHEMA);
+    assertEquals(result.envelope.signature.algo, "hmac-sha256");
+    assertEquals(result.envelope.functionCount, 2);
+    assert(result.envelope.totalBundleBytes > 0);
+    assert(result.envelope.version.length > 0);
+    assert(result.envelope.createdBy.startsWith("1tube@"));
 
-  const v = await verifyPayload(payload, KEY);
-  assertEquals(v.stage, "ok");
+    const v = await verifyPayload(payload, KEY);
+    assertEquals(v.stage, "ok");
 
-  // The zip is also independently extractable — we treat it as a
-  // black box once written. Reading it back must yield byte-
-  // identical envelope + bundle bytes.
-  const { envelope, entries } = await readPayload(payload);
-  assertEquals(envelope, result.envelope);
-  assert(entries.has("envelope.json"));
-  assert(entries.has("dist/manifest.json"));
-  for (const fn of result.manifest.functions) {
-    assert(entries.has(`dist/${fn.bundleFile}`), `missing entry dist/${fn.bundleFile}`);
-  }
-});
+    // The zip is also independently extractable — we treat it as a
+    // black box once written. Reading it back must yield byte-
+    // identical envelope + bundle bytes.
+    const { envelope, entries } = await readPayload(payload);
+    assertEquals(envelope, result.envelope);
+    assert(entries.has("envelope.json"));
+    assert(entries.has("dist/manifest.json"));
+    for (const fn of result.manifest.functions) {
+      assert(
+        entries.has(`dist/${fn.bundleFile}`),
+        `missing entry dist/${fn.bundleFile}`,
+      );
+    }
+    for (const chunk of result.manifest.chunks) {
+      assert(
+        entries.has(`dist/${chunk.file}`),
+        `missing entry dist/${chunk.file}`,
+      );
+    }
+  },
+);
 
-Deno.test("package round-trip: shared module bundles are included and verified", TEST_OPTS, async () => {
-  const dist = await buildSharedFixture("rt");
-  const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
-  const payload = join(out, "fw.1tube");
+Deno.test(
+  "package CLI can build and write firmware in one command",
+  TEST_OPTS,
+  async () => {
+    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-one-shot-" });
+    const payload = join(out, "fw.1tube");
+    try {
+      const code = await runPackage([
+        "--functions",
+        PLAYGROUND,
+        "--only",
+        "hello",
+        "--sourcemap",
+        "none",
+        "--config",
+        DENO_JSON,
+        "--out",
+        payload,
+        "--sign-key",
+        hexKey(KEY),
+      ]);
+      assertEquals(code, 0);
 
-  const result = await packageDist({ distDir: dist, outFile: payload, key: KEY });
-  assertEquals(result.manifest.sharedModules.length, 1);
+      const verified = await verifyPayload(payload, KEY);
+      assertEquals(verified.stage, "ok");
+      if (verified.stage === "ok") {
+        assertEquals(verified.envelope.functionCount, 1);
+      }
+    } finally {
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
 
-  const v = await verifyPayload(payload, KEY);
-  assertEquals(v.stage, "ok");
+Deno.test(
+  "package round-trip: shared module bundles are included and verified",
+  TEST_OPTS,
+  async () => {
+    const dist = await buildSharedFixture("rt");
+    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const payload = join(out, "fw.1tube");
 
-  const { entries } = await readPayload(payload);
-  const shared = result.manifest.sharedModules[0];
-  assert(entries.has(`dist/${shared.bundleFile}`), `missing entry dist/${shared.bundleFile}`);
-  await Deno.remove(dist, { recursive: true }).catch(() => {});
-  await Deno.remove(out, { recursive: true }).catch(() => {});
-});
+    const result = await packageDist({
+      distDir: dist,
+      outFile: payload,
+      key: KEY,
+    });
+    assertEquals(result.manifest.sharedModules.length, 1);
 
-Deno.test("package: wrong key fails signature verification", TEST_OPTS, async () => {
-  const dist = await buildFixture("wrong-key");
-  const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
-  const payload = join(out, "fw.1tube");
+    const v = await verifyPayload(payload, KEY);
+    assertEquals(v.stage, "ok");
 
-  await packageDist({ distDir: dist, outFile: payload, key: KEY });
-
-  const v = await verifyPayload(payload, WRONG_KEY);
-  assertEquals(v.stage, "signature");
-});
-
-Deno.test("package: tampered envelope (flip one bit in version) fails signature", TEST_OPTS, async () => {
-  const dist = await buildFixture("tamper-env");
-  const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
-  const payload = join(out, "fw.1tube");
-
-  await packageDist({ distDir: dist, outFile: payload, key: KEY });
-
-  // Read the zip, mutate the envelope's version field, write a new
-  // zip back. Signature was computed over the original bytes so any
-  // change inside `signature` *or* the unsigned portion of the
-  // envelope must invalidate it.
-  const { envelope, entries } = await readPayload(payload);
-  envelope.version = envelope.version + "-tampered";
-  const newEnv = new TextEncoder().encode(JSON.stringify(envelope, null, 2) + "\n");
-  await rewritePayload(payload, new Map([...entries, ["envelope.json", newEnv]]));
-
-  const v = await verifyPayload(payload, KEY);
-  // parseEnvelope still passes (the field is a valid string), but
-  // signature verification fails.
-  assertEquals(v.stage, "signature");
-});
-
-Deno.test("package: tampered manifest fails the manifest-hash check", TEST_OPTS, async () => {
-  const dist = await buildFixture("tamper-manifest");
-  const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
-  const payload = join(out, "fw.1tube");
-
-  await packageDist({ distDir: dist, outFile: payload, key: KEY });
-
-  const { entries } = await readPayload(payload);
-  const original = entries.get("dist/manifest.json")!;
-  // Flip a byte well past the schema header so it stays parseable
-  // as JSON. We're testing the hash gate, not the parser gate.
-  const tampered = new Uint8Array(original);
-  tampered[tampered.length - 5] ^= 0x01;
-  await rewritePayload(payload, new Map([...entries, ["dist/manifest.json", tampered]]));
-
-  const v = await verifyPayload(payload, KEY);
-  assertEquals(v.stage, "manifest-hash");
-});
-
-Deno.test("package: tampered bundle fails the per-bundle hash check", TEST_OPTS, async () => {
-  const dist = await buildFixture("tamper-bundle");
-  const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
-  const payload = join(out, "fw.1tube");
-
-  const { manifest } = await packageDist({ distDir: dist, outFile: payload, key: KEY });
-  const target = `dist/${manifest.functions[0].bundleFile}`;
-
-  const { entries } = await readPayload(payload);
-  const original = entries.get(target)!;
-  const tampered = new Uint8Array(original);
-  tampered[tampered.length - 1] ^= 0x42;
-  await rewritePayload(payload, new Map([...entries, [target, tampered]]));
-
-  const v = await verifyPayload(payload, KEY);
-  assertEquals(v.stage, "bundle-hash");
-});
-
-Deno.test("package: layout matches the .1tube spec (envelope.json + dist/...)", TEST_OPTS, async () => {
-  const dist = await buildFixture("layout");
-  const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
-  const payload = join(out, "fw.1tube");
-
-  await packageDist({ distDir: dist, outFile: payload, key: KEY });
-
-  const { entries } = await readPayload(payload);
-  const filenames = [...entries.keys()].sort();
-  // Exact set: envelope at root, manifest under dist/, runtime bundles
-  // under dist/functions/ or dist/shared/. No README, no .gitignore — those are
-  // build-time conveniences, not part of the runtime contract.
-  assert(filenames.includes("envelope.json"));
-  assert(filenames.includes("dist/manifest.json"));
-  for (const f of filenames) {
-    if (f === "envelope.json") continue;
-    if (f === "dist/manifest.json") continue;
+    const { entries } = await readPayload(payload);
+    const shared = result.manifest.sharedModules[0];
     assert(
-      f.startsWith("dist/functions/") || f.startsWith("dist/shared/"),
-      `unexpected entry in payload: ${f}`,
+      entries.has(`dist/${shared.bundleFile}`),
+      `missing entry dist/${shared.bundleFile}`,
     );
-  }
-});
+    await Deno.remove(dist, { recursive: true }).catch(() => {});
+    await Deno.remove(out, { recursive: true }).catch(() => {});
+  },
+);
+
+Deno.test(
+  "package: wrong key fails signature verification",
+  TEST_OPTS,
+  async () => {
+    const dist = await buildFixture("wrong-key");
+    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const payload = join(out, "fw.1tube");
+
+    await packageDist({ distDir: dist, outFile: payload, key: KEY });
+
+    const v = await verifyPayload(payload, WRONG_KEY);
+    assertEquals(v.stage, "signature");
+  },
+);
+
+Deno.test(
+  "package: tampered envelope (flip one bit in version) fails signature",
+  TEST_OPTS,
+  async () => {
+    const dist = await buildFixture("tamper-env");
+    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const payload = join(out, "fw.1tube");
+
+    await packageDist({ distDir: dist, outFile: payload, key: KEY });
+
+    // Read the zip, mutate the envelope's version field, write a new
+    // zip back. Signature was computed over the original bytes so any
+    // change inside `signature` *or* the unsigned portion of the
+    // envelope must invalidate it.
+    const { envelope, entries } = await readPayload(payload);
+    envelope.version = envelope.version + "-tampered";
+    const newEnv = new TextEncoder().encode(
+      JSON.stringify(envelope, null, 2) + "\n",
+    );
+    await rewritePayload(
+      payload,
+      new Map([...entries, ["envelope.json", newEnv]]),
+    );
+
+    const v = await verifyPayload(payload, KEY);
+    // parseEnvelope still passes (the field is a valid string), but
+    // signature verification fails.
+    assertEquals(v.stage, "signature");
+  },
+);
+
+Deno.test(
+  "package: tampered manifest fails the manifest-hash check",
+  TEST_OPTS,
+  async () => {
+    const dist = await buildFixture("tamper-manifest");
+    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const payload = join(out, "fw.1tube");
+
+    await packageDist({ distDir: dist, outFile: payload, key: KEY });
+
+    const { entries } = await readPayload(payload);
+    const original = entries.get("dist/manifest.json")!;
+    // Flip a byte well past the schema header so it stays parseable
+    // as JSON. We're testing the hash gate, not the parser gate.
+    const tampered = new Uint8Array(original);
+    tampered[tampered.length - 5] ^= 0x01;
+    await rewritePayload(
+      payload,
+      new Map([...entries, ["dist/manifest.json", tampered]]),
+    );
+
+    const v = await verifyPayload(payload, KEY);
+    assertEquals(v.stage, "manifest-hash");
+  },
+);
+
+Deno.test(
+  "package: tampered bundle fails the per-bundle hash check",
+  TEST_OPTS,
+  async () => {
+    const dist = await buildFixture("tamper-bundle");
+    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const payload = join(out, "fw.1tube");
+
+    const { manifest } = await packageDist({
+      distDir: dist,
+      outFile: payload,
+      key: KEY,
+    });
+    const target = `dist/${manifest.functions[0].bundleFile}`;
+
+    const { entries } = await readPayload(payload);
+    const original = entries.get(target)!;
+    const tampered = new Uint8Array(original);
+    tampered[tampered.length - 1] ^= 0x42;
+    await rewritePayload(payload, new Map([...entries, [target, tampered]]));
+
+    const v = await verifyPayload(payload, KEY);
+    assertEquals(v.stage, "bundle-hash");
+  },
+);
+
+Deno.test(
+  "package: layout matches the .1tube spec (envelope.json + dist/...)",
+  TEST_OPTS,
+  async () => {
+    const dist = await buildFixture("layout");
+    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const payload = join(out, "fw.1tube");
+
+    await packageDist({ distDir: dist, outFile: payload, key: KEY });
+
+    const { entries } = await readPayload(payload);
+    const filenames = [...entries.keys()].sort();
+    // Exact set: envelope at root, manifest under dist/, runtime bundles
+    // under dist/functions/ or dist/shared/. No README, no .gitignore — those are
+    // build-time conveniences, not part of the runtime contract.
+    assert(filenames.includes("envelope.json"));
+    assert(filenames.includes("dist/manifest.json"));
+    for (const f of filenames) {
+      if (f === "envelope.json") continue;
+      if (f === "dist/manifest.json") continue;
+      assert(
+        f.startsWith("dist/functions/") || f.startsWith("dist/shared/") ||
+          f.startsWith("dist/chunks/"),
+        `unexpected entry in payload: ${f}`,
+      );
+    }
+  },
+);
 
 Deno.test("envelope: parseEnvelope rejects bad schema / algo", () => {
   let threw = false;
@@ -350,7 +497,9 @@ async function rewritePayload(
   payloadPath: string,
   entries: Map<string, Uint8Array>,
 ): Promise<void> {
-  const { BlobWriter, Uint8ArrayReader, ZipWriter } = await import("@zip-js/zip-js");
+  const { BlobWriter, Uint8ArrayReader, ZipWriter } = await import(
+    "@zip-js/zip-js"
+  );
   const blobWriter = new BlobWriter("application/zip");
   const zip = new ZipWriter(blobWriter, { level: 6 });
   for (const [name, bytes] of entries) {

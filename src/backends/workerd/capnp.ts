@@ -59,6 +59,12 @@ export interface CapnpFunctionInput {
    */
   bundleBasename: string;
   /**
+   * Relative ESM module files this worker should embed, entry first.
+   * When omitted, `bundleBasename` is emitted as a legacy single-module
+   * worker named "worker".
+   */
+  moduleFiles?: readonly string[];
+  /**
    * Optional per-function override for the compatibility date. When
    * omitted the global default (or {@link CapnpOptions.compatibilityDate})
    * applies.
@@ -306,6 +312,19 @@ export function generateCapnp(
   const serviceBlocks: string[] = inputs.map((input, idx) => {
     const route = routes[idx];
     const bundlePath = validateBundleEmbedPath(input.bundleBasename);
+    const moduleFiles = input.moduleFiles && input.moduleFiles.length > 0
+      ? dedupeStable(input.moduleFiles.map(validateBundleEmbedPath))
+      : [];
+    const modules = moduleFiles.length > 0
+      ? moduleFiles
+      : [bundlePath];
+    const moduleLines = modules
+      .map((path, moduleIdx) => {
+        const name = moduleFiles.length > 0 ? path : "worker";
+        const comma = moduleIdx === modules.length - 1 ? "" : ",";
+        return `        (name = ${capnpString(name)}, esModule = embed "${path}")${comma}`;
+      })
+      .join("\n");
     const compatDate = input.compatibilityDate
       ? validateCompatDate(input.compatibilityDate)
       : globalDate;
@@ -334,7 +353,7 @@ export function generateCapnp(
     name = "${route.service}",
     worker = (
       modules = [
-        (name = "worker", esModule = embed "${bundlePath}")
+${moduleLines}
       ],
       compatibilityDate = ${capnpString(compatDate)},
       ${flagsLine}${bindingsLine}

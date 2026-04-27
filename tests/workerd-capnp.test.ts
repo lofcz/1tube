@@ -135,6 +135,17 @@ Deno.test("workerd-capnp: local outbound network still supports public HTTPS", (
   assertStringIncludes(result.text, `tlsOptions = (trustBrowserCas = true)`);
 });
 
+Deno.test("workerd-capnp: emits entry and shared chunk modules for prebuilt functions", () => {
+  const result = generateCapnp([{
+    name: "fn",
+    bundleBasename: "functions/fn.js",
+    moduleFiles: ["functions/fn.js", "chunks/shared-ABC123.js"],
+  }]);
+
+  assertStringIncludes(result.text, `(name = "functions/fn.js", esModule = embed "functions/fn.js")`);
+  assertStringIncludes(result.text, `(name = "chunks/shared-ABC123.js", esModule = embed "chunks/shared-ABC123.js")`);
+});
+
 Deno.test("workerd-capnp: rejects empty input", () => {
   assertThrows(() => generateCapnp([]), Error, "at least one function");
 });

@@ -18,7 +18,7 @@ import { type FunctionManifest, parseManifest } from "../../manifest.ts";
  * schema is newer than this constant — older binaries should fail
  * fast rather than misinterpret a future format.
  */
-export const PREBUILT_SCHEMA = 2;
+export const PREBUILT_SCHEMA = 3;
 
 /**
  * Per-function record carried inside `dist/manifest.json`. The bundle
@@ -32,8 +32,19 @@ export interface PrebuiltFunctionEntry {
   bundleBytes: number;
   /** SHA-256 over the bundle bytes, lowercase hex. */
   bundleSha256: string;
+  /**
+   * Manifest-relative ESM files this function's workerd service needs,
+   * entry first. Missing/empty means legacy self-contained bundleFile.
+   */
+  moduleFiles: string[];
   /** Per-function `1tube.json` parsed at build time. */
   manifest: FunctionManifest;
+}
+
+export interface PrebuiltChunkEntry {
+  file: string;
+  bytes: number;
+  sha256: string;
 }
 
 export interface PrebuiltSharedModuleEntry {
@@ -56,6 +67,8 @@ export interface PrebuiltManifest {
   compatibilityFlags?: string[];
   /** Env var names the build expects to be available at serve time. */
   envAllowlist: string[];
+  /** Shared dependency chunks emitted by esbuild splitting. */
+  chunks: PrebuiltChunkEntry[];
   /** Gateway-owned shared module bundles used by workerd RPC stubs. */
   sharedModules: PrebuiltSharedModuleEntry[];
   /** Indexed function table, sorted by name for deterministic diffs. */
@@ -105,14 +118,33 @@ export function parsePrebuiltManifest(raw: unknown): PrebuiltManifest {
         `functions[${idx}] missing required fields (name, bundleFile, bundleSha256)`,
       );
     }
+    const moduleFiles = Array.isArray(e.moduleFiles)
+      ? e.moduleFiles.filter((n): n is string => typeof n === "string")
+      : [];
     return {
       name,
       bundleFile,
       bundleBytes,
       bundleSha256,
+      moduleFiles: moduleFiles.length > 0 ? moduleFiles : [bundleFile],
       manifest: parseManifest(e.manifest, /* fromFile */ true),
     };
   });
+  const chunks: PrebuiltChunkEntry[] = Array.isArray(obj.chunks)
+    ? obj.chunks.map((rawEntry, idx) => {
+      if (!rawEntry || typeof rawEntry !== "object") {
+        throw new Error(`chunks[${idx}] is not an object`);
+      }
+      const e = rawEntry as Record<string, unknown>;
+      const file = typeof e.file === "string" ? e.file : "";
+      const bytes = typeof e.bytes === "number" ? e.bytes : 0;
+      const sha256 = typeof e.sha256 === "string" ? e.sha256 : "";
+      if (!file || !sha256) {
+        throw new Error(`chunks[${idx}] missing required fields (file, sha256)`);
+      }
+      return { file, bytes, sha256 };
+    })
+    : [];
   const sharedModules: PrebuiltSharedModuleEntry[] = Array.isArray(obj.sharedModules)
     ? obj.sharedModules.map((rawEntry, idx) => {
       if (!rawEntry || typeof rawEntry !== "object") {
@@ -147,6 +179,7 @@ export function parsePrebuiltManifest(raw: unknown): PrebuiltManifest {
     envAllowlist: Array.isArray(obj.envAllowlist)
       ? obj.envAllowlist.filter((n): n is string => typeof n === "string")
       : [],
+    chunks,
     sharedModules,
     functions,
   };

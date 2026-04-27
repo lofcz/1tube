@@ -1189,6 +1189,9 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       const prebuiltBundleFiles = prebuiltManifest
         ? new Map(prebuiltManifest.functions.map((e) => [e.name, e.bundleFile]))
         : null;
+      const prebuiltModuleFiles = prebuiltManifest
+        ? new Map(prebuiltManifest.functions.map((e) => [e.name, e.moduleFiles]))
+        : null;
       if (!sharedRuntime && sharedModules.length > 0) {
         sharedRuntime = await startWorkerdSharedRuntime(sharedModules);
       }
@@ -1210,6 +1213,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
           // and capnp is written at dist/, so use the manifest-relative
           // path ("functions/<fn>.js") or workerd cannot resolve embeds.
           bundleBasename: bundleEmbedPath,
+          moduleFiles: prebuiltModuleFiles?.get(r.name),
           envBindings: fnEnvBindings,
         };
       });
@@ -1635,6 +1639,28 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
             throw new Error(
               `workerd backend cannot start: prebuilt bundle "${e.name}" failed integrity check ` +
                 `(expected ${e.bundleSha256}, got ${got}). Bundle has been modified or is corrupt.`,
+            );
+          }
+        }
+        for (const e of prebuiltManifest.chunks) {
+          const chunkPath = join(prebuiltDir, e.file);
+          let bytes: Uint8Array;
+          try {
+            bytes = await Deno.readFile(chunkPath);
+          } catch (err) {
+            started = false;
+            const msg = err instanceof Error ? err.message : String(err);
+            throw new Error(`prebuilt chunk ${chunkPath} unreadable (${msg})`);
+          }
+          const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+          const hex = Array.from(new Uint8Array(digest))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join("");
+          if (hex !== e.sha256) {
+            started = false;
+            throw new Error(
+              `prebuilt chunk hash mismatch for ${e.file}: ` +
+                `manifest=${e.sha256} actual=${hex}`,
             );
           }
         }

@@ -726,6 +726,36 @@ public sealed class FirmwareSupervisor : IHostedService
                 VerifyManifestBundle(unpackedDir, shared, "shared module");
             }
         }
+
+        if (doc.RootElement.TryGetProperty("chunks", out var chunks) &&
+            chunks.ValueKind == System.Text.Json.JsonValueKind.Array)
+        {
+            foreach (var chunk in chunks.EnumerateArray())
+            {
+                VerifyManifestChunk(unpackedDir, chunk);
+            }
+        }
+    }
+
+    private static void VerifyManifestChunk(string unpackedDir, System.Text.Json.JsonElement entry)
+    {
+        var file = entry.GetProperty("file").GetString()
+            ?? throw new InvalidDataException("chunk entry missing file");
+        var expected = entry.GetProperty("sha256").GetString()
+            ?? throw new InvalidDataException("chunk entry missing sha256");
+
+        var chunkPath = Path.Combine(unpackedDir, "dist", file);
+        if (!File.Exists(chunkPath))
+        {
+            throw new InvalidDataException($"chunk missing on disk: {file}");
+        }
+        using var fs = File.OpenRead(chunkPath);
+        var actual = Convert.ToHexString(SHA256.HashData(fs)).ToLowerInvariant();
+        if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                $"chunk hash mismatch for {file}: expected={expected} actual={actual}");
+        }
     }
 
     private static void VerifyManifestBundle(

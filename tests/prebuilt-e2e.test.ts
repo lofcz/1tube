@@ -35,6 +35,25 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+function freeWorkerdBasePort(): number {
+  const span = 16;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const base = 20_000 + Math.floor(Math.random() * 20_000);
+    const listeners: Deno.Listener[] = [];
+    try {
+      for (let offset = 0; offset < span; offset++) {
+        listeners.push(Deno.listen({ hostname: "127.0.0.1", port: base + offset }));
+      }
+      return base;
+    } catch {
+      // try another range
+    } finally {
+      for (const l of listeners) l.close();
+    }
+  }
+  throw new Error("could not reserve a free workerd base port range");
+}
+
 async function waitForGateway(port: number, timeoutMs: number): Promise<void> {
   const deadline = performance.now() + timeoutMs;
   while (performance.now() < deadline) {
@@ -174,6 +193,114 @@ Deno.test(
       } catch { /* */ }
       await child.status;
       await Promise.all([teePump, stdoutPump]).catch(() => {});
+      await Deno.remove(dist, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
+  "prebuilt shared chunks serve two functions through workerd",
+  E2E_OPTS,
+  async () => {
+    if (!(await workerdAvailable())) {
+      console.log("[skipped: workerd binary not on PATH]");
+      return;
+    }
+
+    const root = await Deno.makeTempDir({ prefix: "1tube-prebuilt-chunk-src-" });
+    const dist = await Deno.makeTempDir({ prefix: "1tube-prebuilt-chunk-dist-" });
+    await Deno.mkdir(join(root, "_shared"), { recursive: true });
+    await Deno.mkdir(join(root, "alpha"), { recursive: true });
+    await Deno.mkdir(join(root, "beta"), { recursive: true });
+    await Deno.writeTextFile(
+      join(root, "_shared", "handler.ts"),
+      `export function serve(handler, opts = {}) {
+  globalThis.__edgeFunctionRegistry.register(handler, { public: opts.public ?? true });
+}
+`,
+    );
+    await Deno.writeTextFile(
+      join(root, "_shared", "large-dep.ts"),
+      `export const payload = ${JSON.stringify("chunked-dependency-" + "x".repeat(4096))};
+export function answer(name) {
+  return name + ":" + payload.slice(0, 18);
+}
+`,
+    );
+    for (const name of ["alpha", "beta"]) {
+      await Deno.writeTextFile(
+        join(root, name, "index.ts"),
+        `import { serve } from "../_shared/handler.ts";
+import { answer } from "../_shared/large-dep.ts";
+serve(() => Response.json({ value: answer(${JSON.stringify(name)}) }), { public: true });
+`,
+      );
+    }
+
+    await build({
+      functionsDir: root,
+      outDir: dist,
+      only: ["alpha", "beta"],
+      sourcemap: false,
+    });
+    const manifest = JSON.parse(await Deno.readTextFile(join(dist, "manifest.json")));
+    assert(manifest.chunks.length > 0, "expected build to emit shared chunks");
+
+    const port = await freePort();
+    const workerdBasePort = freeWorkerdBasePort();
+    const child = new Deno.Command(Deno.execPath(), {
+      args: [
+        "run",
+        "--quiet",
+        "--allow-all",
+        "src/cli.ts",
+        "--backend",
+        "workerd",
+        "--prebuilt",
+        dist,
+        "--port",
+        String(port),
+        "--host",
+        "127.0.0.1",
+        "--workerd-base-port",
+        String(workerdBasePort),
+        "--dev",
+      ],
+      cwd: PROJECT_ROOT,
+      env: { ...Deno.env.toObject(), "1TUBE_LAZY": "0" },
+      stdout: "piped",
+      stderr: "piped",
+    }).spawn();
+
+    const pump = async (stream: ReadableStream<Uint8Array>) => {
+      const reader = stream.getReader();
+      try {
+        while (!(await reader.read()).done) {
+          // drain
+        }
+      } catch {
+        // child closed
+      }
+    };
+    const stdoutPump = pump(child.stdout);
+    const stderrPump = pump(child.stderr);
+    try {
+      await waitForGateway(port, 30_000);
+      for (const name of ["alpha", "beta"]) {
+        const res = await fetch(`http://127.0.0.1:${port}/functions/v1/${name}`, { cache: "no-store" });
+        assertEquals(res.status, 200);
+        const body = await res.json();
+        assertEquals(body.value, `${name}:chunked-dependency`);
+      }
+    } finally {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // already exited
+      }
+      await child.status;
+      await Promise.all([stdoutPump, stderrPump]).catch(() => {});
+      await Deno.remove(root, { recursive: true }).catch(() => {});
       await Deno.remove(dist, { recursive: true }).catch(() => {});
     }
   },

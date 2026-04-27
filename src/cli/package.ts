@@ -18,6 +18,8 @@
  *         ├── functions/
  *         │   ├── <fn>.js
  *         │   └── <fn>.js.map   (when sourcemap=linked)
+ *         ├── chunks/
+ *         │   └── <chunk>.js     (when shared ESM chunks are emitted)
  *         └── shared/
  *             └── <module>.js   (when manifest.sharedModules is non-empty)
  *
@@ -40,14 +42,17 @@ import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { walk } from "jsr:@std/fs@^1/walk";
 import { BlobWriter, Uint8ArrayReader, ZipWriter } from "@zip-js/zip-js";
 import {
-  type FirmwareEnvelope,
-  ENVELOPE_SCHEMA,
   decodeKey,
+  ENVELOPE_SCHEMA,
+  type FirmwareEnvelope,
   parseEnvelope,
   signEnvelope,
   type UnsignedEnvelope,
 } from "./envelope.ts";
-import { parsePrebuiltManifest, type PrebuiltManifest } from "../backends/workerd/prebuilt.ts";
+import {
+  parsePrebuiltManifest,
+  type PrebuiltManifest,
+} from "../backends/workerd/prebuilt.ts";
 import { VERSION } from "../version.ts";
 
 /**
@@ -108,7 +113,9 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
   const view = new Uint8Array(buf);
   let out = "";
-  for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, "0");
+  for (let i = 0; i < view.length; i++) {
+    out += view[i].toString(16).padStart(2, "0");
+  }
   return out;
 }
 
@@ -166,11 +173,23 @@ async function collectDistFiles(
   const plan: Array<{ src: string; zipPath: string; size: number }> = [];
   {
     const stat = await Deno.stat(manifestPath);
-    plan.push({ src: manifestPath, zipPath: "dist/manifest.json", size: stat.size });
+    plan.push({
+      src: manifestPath,
+      zipPath: "dist/manifest.json",
+      size: stat.size,
+    });
   }
-  for await (const entry of walk(functionsDir, { includeFiles: true, includeDirs: false })) {
+  for await (
+    const entry of walk(functionsDir, {
+      includeFiles: true,
+      includeDirs: false,
+    })
+  ) {
     const stat = await Deno.stat(entry.path);
-    const rel = entry.path.slice(distDir.length).replace(/\\/g, "/").replace(/^\/+/, "");
+    const rel = entry.path.slice(distDir.length).replace(/\\/g, "/").replace(
+      /^\/+/,
+      "",
+    );
     plan.push({ src: entry.path, zipPath: `dist/${rel}`, size: stat.size });
   }
 
@@ -178,10 +197,44 @@ async function collectDistFiles(
   try {
     const stat = await Deno.stat(sharedDir);
     if (stat.isDirectory) {
-      for await (const entry of walk(sharedDir, { includeFiles: true, includeDirs: false })) {
+      for await (
+        const entry of walk(sharedDir, {
+          includeFiles: true,
+          includeDirs: false,
+        })
+      ) {
         const fileStat = await Deno.stat(entry.path);
-        const rel = entry.path.slice(distDir.length).replace(/\\/g, "/").replace(/^\/+/, "");
-        plan.push({ src: entry.path, zipPath: `dist/${rel}`, size: fileStat.size });
+        const rel = entry.path.slice(distDir.length).replace(/\\/g, "/")
+          .replace(/^\/+/, "");
+        plan.push({
+          src: entry.path,
+          zipPath: `dist/${rel}`,
+          size: fileStat.size,
+        });
+      }
+    }
+  } catch (err) {
+    if (!(err instanceof Deno.errors.NotFound)) throw err;
+  }
+
+  const chunksDir = join(distDir, "chunks");
+  try {
+    const stat = await Deno.stat(chunksDir);
+    if (stat.isDirectory) {
+      for await (
+        const entry of walk(chunksDir, {
+          includeFiles: true,
+          includeDirs: false,
+        })
+      ) {
+        const fileStat = await Deno.stat(entry.path);
+        const rel = entry.path.slice(distDir.length).replace(/\\/g, "/")
+          .replace(/^\/+/, "");
+        plan.push({
+          src: entry.path,
+          zipPath: `dist/${rel}`,
+          size: fileStat.size,
+        });
       }
     }
   } catch (err) {
@@ -192,13 +245,25 @@ async function collectDistFiles(
   for (const fn of manifest.functions) {
     const expected = `dist/${fn.bundleFile}`;
     if (!plannedZipPaths.has(expected)) {
-      throw new Error(`1tube package: manifest references missing function bundle ${expected}`);
+      throw new Error(
+        `1tube package: manifest references missing function bundle ${expected}`,
+      );
     }
   }
   for (const shared of manifest.sharedModules) {
     const expected = `dist/${shared.bundleFile}`;
     if (!plannedZipPaths.has(expected)) {
-      throw new Error(`1tube package: manifest references missing shared module bundle ${expected}`);
+      throw new Error(
+        `1tube package: manifest references missing shared module bundle ${expected}`,
+      );
+    }
+  }
+  for (const chunk of manifest.chunks) {
+    const expected = `dist/${chunk.file}`;
+    if (!plannedZipPaths.has(expected)) {
+      throw new Error(
+        `1tube package: manifest references missing chunk ${expected}`,
+      );
     }
   }
 
@@ -231,11 +296,17 @@ async function collectDistFiles(
  * to writing the zip file, so callers (tests, CI scripts) can
  * inspect them without re-reading the file.
  */
-export async function packageDist(opts: PackageOptions): Promise<PackageResult> {
+export async function packageDist(
+  opts: PackageOptions,
+): Promise<PackageResult> {
   const startedAt = performance.now();
   const cwd = Deno.cwd();
-  const distDir = isAbsolute(opts.distDir) ? opts.distDir : resolvePath(cwd, opts.distDir);
-  const outFile = isAbsolute(opts.outFile) ? opts.outFile : resolvePath(cwd, opts.outFile);
+  const distDir = isAbsolute(opts.distDir)
+    ? opts.distDir
+    : resolvePath(cwd, opts.distDir);
+  const outFile = isAbsolute(opts.outFile)
+    ? opts.outFile
+    : resolvePath(cwd, opts.outFile);
 
   // Sanity-check the input by parsing the manifest first. We don't
   // actually need the parsed value to write the zip (the manifest
@@ -256,9 +327,13 @@ export async function packageDist(opts: PackageOptions): Promise<PackageResult> 
   const manifestEntry = files.find((f) => f.zipPath === "dist/manifest.json")!;
   const manifestSha256 = await sha256Hex(manifestEntry.bytes);
 
-  const totalBundleBytes = manifest.functions.reduce((acc, f) => acc + f.bundleBytes, 0);
+  const totalBundleBytes = manifest.functions.reduce(
+    (acc, f) => acc + f.bundleBytes,
+    0,
+  );
   const createdAt = opts.createdAt ?? new Date().toISOString();
-  const version = opts.version ?? defaultVersion(manifestSha256, new Date(createdAt));
+  const version = opts.version ??
+    defaultVersion(manifestSha256, new Date(createdAt));
 
   const unsigned: UnsignedEnvelope = {
     envelopeSchema: ENVELOPE_SCHEMA,
@@ -271,7 +346,9 @@ export async function packageDist(opts: PackageOptions): Promise<PackageResult> 
   };
   const envelope = await signEnvelope(unsigned, opts.key);
 
-  const envelopeBytes = new TextEncoder().encode(JSON.stringify(envelope, null, 2) + "\n");
+  const envelopeBytes = new TextEncoder().encode(
+    JSON.stringify(envelope, null, 2) + "\n",
+  );
 
   // ── Write the zip ─────────────────────────────────────────────
   // BlobWriter buffers in memory because firmware payloads are
@@ -349,7 +426,9 @@ export async function readPayload(
   /** Map of zip-relative path → entry bytes. */
   entries: Map<string, Uint8Array>;
 }> {
-  const { BlobReader, ZipReader, Uint8ArrayWriter } = await import("@zip-js/zip-js");
+  const { BlobReader, ZipReader, Uint8ArrayWriter } = await import(
+    "@zip-js/zip-js"
+  );
   const bytes = await Deno.readFile(payloadPath);
   const blob = new Blob([bytes as BlobPart]);
   const reader = new ZipReader(new BlobReader(blob));
@@ -363,7 +442,9 @@ export async function readPayload(
     }
     const envBytes = entries.get("envelope.json");
     if (!envBytes) throw new Error("payload missing envelope.json");
-    const envelope = parseEnvelope(JSON.parse(new TextDecoder().decode(envBytes)));
+    const envelope = parseEnvelope(
+      JSON.parse(new TextDecoder().decode(envBytes)),
+    );
     return { envelope, entries };
   } finally {
     await reader.close();
@@ -418,9 +499,7 @@ function makeProgressRenderer(): (e: PackageProgress) => void {
       : e.phase === "compress"
       ? "zipping"
       : "wrote";
-    const namePart = e.name
-      ? ` ${truncateMiddle(e.name, 40)}`
-      : "";
+    const namePart = e.name ? ` ${truncateMiddle(e.name, 40)}` : "";
     const line = `[1tube package] ${tag} ${e.current}/${e.total}` +
       (pct ? ` (${pct})` : "") +
       ` ${sizeStr}${namePart}`;
@@ -460,10 +539,21 @@ function truncateMiddle(s: string, max: number): string {
 const PACKAGE_USAGE = `Usage: 1tube package [options]
 
 Options:
-  -i, --in <dir>             Path to dist/ produced by \`1tube build\` (required)
+  -i, --in <dir>             Path to dist/. With --functions, build here and keep it.
+                             Without --functions, packages an existing dist/ (required).
+  -f, --functions <dir>      Build functions first, then package the resulting dist/.
   -o, --out <file>           Path to .1tube zip to write (required)
       --sign-key <hex|b64>   HMAC signing key. Falls back to env 1TUBE_PACKAGE_SIGN_KEY.
       --version <id>         Stable version id (default: <ISO>-<8hex of manifestSha256>)
+      --only A,B,C           Build only the named subset when --functions is set
+      --sourcemap MODE       Build sourcemap mode: none | linked (default) | inline
+      --minify               Also minify during the initial esbuild pass
+      --compat-date DATE     Workerd compatibility date for the generated manifest
+      --compat-flag FLAG     Add a workerd compatibility flag (repeatable)
+      --workerd-env A,B,C    Env vars baked into the manifest's allowlist
+      --workerd-shared path  Shared module path (repeatable)
+      --config <path>        Explicit deno.json path for the build import map
+      --no-config            Skip the build import map entirely
   -h, --help                 Show this help`;
 
 /**
@@ -476,14 +566,45 @@ export async function runPackage(args: string[]): Promise<number> {
   let outFile: string | undefined;
   let signKeyArg: string | undefined;
   let version: string | undefined;
+  let functionsDir: string | undefined;
+  const buildArgs: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if ((a === "--in" || a === "-i") && args[i + 1]) inDir = args[++i];
-    else if ((a === "--out" || a === "-o") && args[i + 1]) outFile = args[++i];
-    else if (a === "--sign-key" && args[i + 1]) signKeyArg = args[++i];
-    else if (a.startsWith("--sign-key=")) signKeyArg = a.slice("--sign-key=".length);
-    else if (a === "--version" && args[i + 1]) version = args[++i];
+    else if ((a === "--functions" || a === "-f") && args[i + 1]) {
+      functionsDir = args[++i];
+      buildArgs.push("--functions", functionsDir);
+    } else if (a === "--only" && args[i + 1]) {
+      buildArgs.push(a, args[++i]);
+    } else if (a === "--sourcemap" && args[i + 1]) {
+      buildArgs.push(a, args[++i]);
+    } else if (a === "--concurrency" && args[i + 1]) {
+      buildArgs.push(a, args[++i]);
+    } else if (a === "--compat-date" && args[i + 1]) {
+      buildArgs.push(a, args[++i]);
+    } else if (a === "--compat-flag" && args[i + 1]) {
+      buildArgs.push(a, args[++i]);
+    } else if (a === "--workerd-env" && args[i + 1]) {
+      buildArgs.push(a, args[++i]);
+    } else if (a.startsWith("--workerd-env=")) {
+      buildArgs.push(a);
+    } else if (a === "--workerd-shared" && args[i + 1]) {
+      buildArgs.push(a, args[++i]);
+    } else if (a.startsWith("--workerd-shared=")) {
+      buildArgs.push(a);
+    } else if (a === "--config" && args[i + 1]) {
+      buildArgs.push(a, args[++i]);
+    } else if (
+      a.startsWith("--config=") || a === "--no-config" || a === "--minify"
+    ) {
+      buildArgs.push(a);
+    } else if ((a === "--out" || a === "-o") && args[i + 1]) {
+      outFile = args[++i];
+    } else if (a === "--sign-key" && args[i + 1]) signKeyArg = args[++i];
+    else if (a.startsWith("--sign-key=")) {
+      signKeyArg = a.slice("--sign-key=".length);
+    } else if (a === "--version" && args[i + 1]) version = args[++i];
     else if (a === "--help" || a === "-h") {
       console.log(PACKAGE_USAGE);
       return 0;
@@ -493,8 +614,10 @@ export async function runPackage(args: string[]): Promise<number> {
     }
   }
 
-  if (!inDir || !outFile) {
-    console.error(`[1tube package] --in and --out are required\n${PACKAGE_USAGE}`);
+  if (!outFile || (!inDir && !functionsDir)) {
+    console.error(
+      `[1tube package] --out and either --in or --functions are required\n${PACKAGE_USAGE}`,
+    );
     return 2;
   }
 
@@ -516,7 +639,21 @@ export async function runPackage(args: string[]): Promise<number> {
     return 2;
   }
 
+  let cleanupDir: string | undefined;
   try {
+    if (functionsDir) {
+      if (!inDir) {
+        inDir = await Deno.makeTempDir({ prefix: "1tube-package-build-" });
+        cleanupDir = inDir;
+      }
+      const { runBuild } = await import("./build.ts");
+      const buildCode = await runBuild([...buildArgs, "--out", inDir]);
+      if (buildCode !== 0) return buildCode;
+    }
+    if (!inDir) {
+      throw new Error("internal error: no dist directory selected");
+    }
+
     const result = await packageDist({
       distDir: inDir,
       outFile,
@@ -531,7 +668,9 @@ export async function runPackage(args: string[]): Promise<number> {
     };
     console.log(
       `[1tube package] wrote ${outFile} (${fmt(result.zipBytes)}) ` +
-        `in ${result.durationMs.toFixed(0)}ms — version=${result.envelope.version}`,
+        `in ${
+          result.durationMs.toFixed(0)
+        }ms — version=${result.envelope.version}`,
     );
     console.log(
       `[1tube package] envelope: ${result.envelope.functionCount} function(s), ` +
@@ -543,5 +682,9 @@ export async function runPackage(args: string[]): Promise<number> {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[1tube package] FAILED: ${msg}`);
     return 1;
+  } finally {
+    if (cleanupDir) {
+      await Deno.remove(cleanupDir, { recursive: true }).catch(() => {});
+    }
   }
 }

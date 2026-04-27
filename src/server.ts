@@ -505,7 +505,16 @@ if (enforceManifest && !allowAll) {
 // watcher, and that's gated off when prebuilt is on.
 const resolvedFunctionsPath = opts.prebuiltDir
   ? ""
-  : await Deno.realPath(opts.functionsPath);
+  : await (async () => {
+    try {
+      return await Deno.realPath(opts.functionsPath);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[1tube] FATAL: functions directory not found: ${opts.functionsPath} (${msg})`);
+      flushLogs();
+      Deno.exit(EXIT_CODES.CONFIG);
+    }
+  })();
 
 /**
  * Map a changed filesystem path to either a function name or `null` ("shared",

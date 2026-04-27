@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: C# build
+            target: dotnet
+          - name: TypeScript tests
+            target: deno
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        if: matrix.target == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.100"
+
+      - name: Restore OneTube.cs
+        if: matrix.target == 'dotnet'
+        run: dotnet restore dotnet/OneTube/OneTube.csproj
+
+      - name: Build OneTube.cs
+        if: matrix.target == 'dotnet'
+        run: dotnet build dotnet/OneTube/OneTube.csproj --configuration Release --no-restore
+
+      - name: Setup Deno
+        if: matrix.target == 'deno'
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2.7.13"
+
+      - name: Run TypeScript tests
+        if: matrix.target == 'deno'
+        run: deno test --allow-all tests/

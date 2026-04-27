@@ -75,7 +75,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "dev-guard: prod start with leaked-default JWT_SECRET exits 1",
+  name: "dev-guard: prod start allows local default JWT_SECRET",
   permissions: { run: true, read: true, env: true },
 }, async () => {
   const { code, stderr } = await runServer({
@@ -84,13 +84,17 @@ Deno.test({
   });
   assert(code !== 0, `expected non-zero exit, got ${code}\n${stderr}`);
   assert(
-    stderr.includes("well-known dev default"),
-    `expected dev-default message, got: ${stderr}`,
+    stderr.includes("functions directory not found"),
+    `expected startup to proceed past secret guard and fail on missing functions dir, got: ${stderr}`,
+  );
+  assert(
+    !stderr.includes("well-known dev default"),
+    `local Supabase default should no longer be rejected, got: ${stderr}`,
   );
 });
 
 Deno.test({
-  name: "dev-guard: prod start with leaked-default SUPABASE_SERVICE_ROLE_KEY exits 1",
+  name: "dev-guard: prod start ignores local default SUPABASE_SERVICE_ROLE_KEY",
   permissions: { run: true, read: true, env: true },
 }, async () => {
   const { code, stderr } = await runServer({
@@ -99,8 +103,12 @@ Deno.test({
   });
   assert(code !== 0, `expected non-zero exit, got ${code}\n${stderr}`);
   assert(
-    stderr.includes("well-known dev default"),
-    `expected dev-default message, got: ${stderr}`,
+    stderr.includes("functions directory not found"),
+    `expected startup to proceed past secret guard and fail on missing functions dir, got: ${stderr}`,
+  );
+  assert(
+    !stderr.includes("well-known dev default"),
+    `local Supabase service key should no longer be rejected, got: ${stderr}`,
   );
 });
 

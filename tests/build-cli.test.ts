@@ -15,12 +15,17 @@
  * a build-CLI unit test.
  */
 
-import { assert, assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+} from "@std/assert";
 import { join, resolve as resolvePath } from "node:path";
 import { build, runBuild } from "../src/cli/build.ts";
 import {
-  PREBUILT_SCHEMA,
   parsePrebuiltManifest,
+  PREBUILT_SCHEMA,
   type PrebuiltManifest,
 } from "../src/backends/workerd/prebuilt.ts";
 
@@ -36,127 +41,227 @@ async function tmpOutDir(label: string): Promise<string> {
   return await Deno.makeTempDir({ prefix: `1tube-build-${label}-` });
 }
 
-Deno.test("build() produces a manifest.json with hashed bundle entries", TEST_OPTS, async () => {
-  const out = await tmpOutDir("happy");
-  const result = await build({
-    functionsDir: PLAYGROUND,
-    outDir: out,
-    configPath: DENO_JSON,
-    only: ["hello", "echo"],
-    sourcemap: false,
-  });
+Deno.test(
+  "build() produces a manifest.json with hashed bundle entries",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("happy");
+    const result = await build({
+      functionsDir: PLAYGROUND,
+      outDir: out,
+      configPath: DENO_JSON,
+      only: ["hello", "echo"],
+      sourcemap: false,
+    });
 
-  assertEquals(result.manifest.schema, PREBUILT_SCHEMA);
-  assertEquals(result.manifest.functions.length, 2);
-  const names = result.manifest.functions.map((f) => f.name).sort();
-  assertEquals(names, ["echo", "hello"]);
+    assertEquals(result.manifest.schema, PREBUILT_SCHEMA);
+    assertEquals(result.manifest.functions.length, 2);
+    const names = result.manifest.functions.map((f) => f.name).sort();
+    assertEquals(names, ["echo", "hello"]);
 
-  // Re-load from disk to make sure what's written matches what we got
-  // back in-memory.
-  const onDisk = JSON.parse(
-    await Deno.readTextFile(join(out, "manifest.json")),
-  );
-  const parsed = parsePrebuiltManifest(onDisk);
-  assertEquals(parsed.functions.length, 2);
+    // Re-load from disk to make sure what's written matches what we got
+    // back in-memory.
+    const onDisk = JSON.parse(
+      await Deno.readTextFile(join(out, "manifest.json")),
+    );
+    const parsed = parsePrebuiltManifest(onDisk);
+    assertEquals(parsed.functions.length, 2);
 
-  // Each entry's recorded sha256 matches the actual file bytes.
-  for (const fn of parsed.functions) {
-    const bytes = await Deno.readFile(join(out, fn.bundleFile));
-    assertEquals(bytes.length, fn.bundleBytes);
-    const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
-    let hex = "";
-    for (const b of new Uint8Array(digest)) hex += b.toString(16).padStart(2, "0");
-    assertEquals(hex, fn.bundleSha256);
-  }
+    // Each entry's recorded sha256 matches the actual file bytes.
+    for (const fn of parsed.functions) {
+      const bytes = await Deno.readFile(join(out, fn.bundleFile));
+      assertEquals(bytes.length, fn.bundleBytes);
+      const digest = await crypto.subtle.digest(
+        "SHA-256",
+        bytes as BufferSource,
+      );
+      let hex = "";
+      for (const b of new Uint8Array(digest)) {
+        hex += b.toString(16).padStart(
+          2,
+          "0",
+        );
+      }
+      assertEquals(hex, fn.bundleSha256);
+    }
 
-  // README + .gitignore land alongside the bundles.
-  await Deno.stat(join(out, "README.txt"));
-  await Deno.stat(join(out, ".gitignore"));
-});
+    // README + .gitignore land alongside the bundles.
+    await Deno.stat(join(out, "README.txt"));
+    await Deno.stat(join(out, ".gitignore"));
+  },
+);
 
-Deno.test("build() bakes envAllowlist + compatibility settings into the manifest", TEST_OPTS, async () => {
-  const out = await tmpOutDir("compat");
-  await build({
-    functionsDir: PLAYGROUND,
-    outDir: out,
-    configPath: DENO_JSON,
-    only: ["hello"],
-    sourcemap: false,
-    compatibilityDate: "2026-01-01",
-    compatibilityFlags: ["nodejs_compat", "nodejs_als"],
-    envAllowlist: ["MY_VAR", "OTHER"],
-  });
-  const m: PrebuiltManifest = parsePrebuiltManifest(
-    JSON.parse(await Deno.readTextFile(join(out, "manifest.json"))),
-  );
-  assertEquals(m.compatibilityDate, "2026-01-01");
-  assertEquals(m.compatibilityFlags, ["nodejs_compat", "nodejs_als"]);
-  assertEquals(m.envAllowlist, ["MY_VAR", "OTHER"]);
-});
+Deno.test(
+  "build() bakes envAllowlist + compatibility settings into the manifest",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("compat");
+    await build({
+      functionsDir: PLAYGROUND,
+      outDir: out,
+      configPath: DENO_JSON,
+      only: ["hello"],
+      sourcemap: false,
+      compatibilityDate: "2026-01-01",
+      compatibilityFlags: ["nodejs_compat", "nodejs_als"],
+      envAllowlist: ["MY_VAR", "OTHER"],
+    });
+    const m: PrebuiltManifest = parsePrebuiltManifest(
+      JSON.parse(await Deno.readTextFile(join(out, "manifest.json"))),
+    );
+    assertEquals(m.compatibilityDate, "2026-01-01");
+    assertEquals(m.compatibilityFlags, ["nodejs_compat", "nodejs_als"]);
+    assertEquals(m.envAllowlist, ["MY_VAR", "OTHER"]);
+  },
+);
 
-Deno.test("build() packages default shared profile module metadata", TEST_OPTS, async () => {
-  const root = await Deno.makeTempDir({ prefix: "1tube-build-shared-src-" });
-  const out = await tmpOutDir("shared");
-  try {
-    await Deno.mkdir(join(root, "_shared"), { recursive: true });
-    await Deno.mkdir(join(root, "needs-profile"), { recursive: true });
-    await Deno.writeTextFile(
-      join(root, "_shared", "profile-cache.ts"),
-      `const bootId = crypto.randomUUID();
+Deno.test(
+  "build() packages default shared profile module metadata",
+  TEST_OPTS,
+  async () => {
+    const root = await Deno.makeTempDir({ prefix: "1tube-build-shared-src-" });
+    const out = await tmpOutDir("shared");
+    try {
+      await Deno.mkdir(join(root, "_shared"), { recursive: true });
+      await Deno.mkdir(join(root, "needs-profile"), { recursive: true });
+      await Deno.writeTextFile(
+        join(root, "_shared", "profile-cache.ts"),
+        `const bootId = crypto.randomUUID();
 export async function getCachedProfile(userId: string) {
   return { userId, bootId };
 }
 export function invalidateProfile(_userId: string) {}
 `,
-    );
-    await Deno.writeTextFile(
-      join(root, "_shared", "handler.ts"),
-      `export function serve(handler: (req: Request) => Response | Promise<Response>) {
+      );
+      await Deno.writeTextFile(
+        join(root, "_shared", "handler.ts"),
+        `export function serve(handler: (req: Request) => Response | Promise<Response>) {
   (globalThis as { __edgeFunctionRegistry: { register: (h: unknown, m: unknown) => void } })
     .__edgeFunctionRegistry.register(handler, { public: true });
 }
 `,
-    );
-    await Deno.writeTextFile(
-      join(root, "needs-profile", "index.ts"),
-      `import { serve } from "../_shared/handler.ts";
+      );
+      await Deno.writeTextFile(
+        join(root, "needs-profile", "index.ts"),
+        `import { serve } from "../_shared/handler.ts";
 import { getCachedProfile } from "../_shared/profile-cache.ts";
 serve(async () => Response.json(await getCachedProfile("u1")));
 `,
-    );
+      );
 
-    await build({
-      functionsDir: root,
-      outDir: out,
-      only: ["needs-profile"],
-      sourcemap: false,
-    });
-    const m = parsePrebuiltManifest(JSON.parse(await Deno.readTextFile(join(out, "manifest.json"))));
-    assertEquals(m.sharedModules.length, 1);
-    assertEquals(m.sharedModules[0].id, "profile-cache");
-    assertEquals(m.sharedModules[0].exportNames, ["getCachedProfile", "invalidateProfile"]);
-    await Deno.stat(join(out, m.sharedModules[0].bundleFile));
-  } finally {
-    await Deno.remove(root, { recursive: true }).catch(() => {});
-    await Deno.remove(out, { recursive: true }).catch(() => {});
-  }
-});
-
-Deno.test("build() throws on unknown function name in --only", TEST_OPTS, async () => {
-  const out = await tmpOutDir("only-miss");
-  await assertRejects(
-    () =>
-      build({
-        functionsDir: PLAYGROUND,
+      const result = await build({
+        functionsDir: root,
         outDir: out,
-        configPath: DENO_JSON,
-        only: ["does-not-exist"],
+        only: ["needs-profile"],
         sourcemap: false,
-      }),
-    Error,
-    "no functions matched",
-  );
-});
+      });
+      const m = parsePrebuiltManifest(
+        JSON.parse(await Deno.readTextFile(join(out, "manifest.json"))),
+      );
+      assertEquals(m.sharedModules.length, 1);
+      assertEquals(m.sharedModules[0].id, "profile-cache");
+      assertEquals(m.sharedModules[0].exportNames, [
+        "getCachedProfile",
+        "invalidateProfile",
+      ]);
+      const sharedPath = join(out, m.sharedModules[0].bundleFile);
+      const sharedStat = await Deno.stat(sharedPath);
+      assertEquals(sharedStat.size, m.sharedModules[0].bundleBytes);
+      assert(
+        result.sharedMinification.preBytes >
+          result.sharedMinification.postBytes,
+      );
+    } finally {
+      await Deno.remove(root, { recursive: true }).catch(() => {});
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
+  "build() emits shared ESM chunks for common dependencies",
+  TEST_OPTS,
+  async () => {
+    const root = await Deno.makeTempDir({ prefix: "1tube-build-chunks-src-" });
+    const out = await tmpOutDir("chunks");
+    try {
+      await Deno.mkdir(join(root, "_shared"), { recursive: true });
+      await Deno.mkdir(join(root, "alpha"), { recursive: true });
+      await Deno.mkdir(join(root, "beta"), { recursive: true });
+      await Deno.writeTextFile(
+        join(root, "_shared", "handler.ts"),
+        `export function serve(handler: (req: Request) => Response | Promise<Response>) {
+  (globalThis as { __edgeFunctionRegistry: { register: (h: unknown, m: unknown) => void } })
+    .__edgeFunctionRegistry.register(handler, { public: true });
+}
+`,
+      );
+      await Deno.writeTextFile(
+        join(root, "_shared", "big-lib.ts"),
+        `export const marker = "shared-" + ${JSON.stringify("x".repeat(2048))};
+export function label(name: string) {
+  return marker.slice(0, 6) + name;
+}
+`,
+      );
+      for (const name of ["alpha", "beta"]) {
+        await Deno.writeTextFile(
+          join(root, name, "index.ts"),
+          `import { serve } from "../_shared/handler.ts";
+import { label } from "../_shared/big-lib.ts";
+serve(() => Response.json({ value: label(${JSON.stringify(name)}) }));
+`,
+        );
+      }
+
+      const result = await build({
+        functionsDir: root,
+        outDir: out,
+        only: ["alpha", "beta"],
+        sourcemap: false,
+      });
+      assert(
+        result.manifest.chunks.length > 0,
+        "expected at least one shared chunk",
+      );
+      for (const chunk of result.manifest.chunks) {
+        await Deno.stat(join(out, chunk.file));
+        assert(chunk.bytes > 0);
+        assert(chunk.sha256.length > 0);
+      }
+      for (const fn of result.manifest.functions) {
+        assertEquals(fn.moduleFiles[0], fn.bundleFile);
+        assert(
+          fn.moduleFiles.some((file) => file.startsWith("chunks/")),
+          `${fn.name} should reference a chunk`,
+        );
+      }
+    } finally {
+      await Deno.remove(root, { recursive: true }).catch(() => {});
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
+  "build() throws on unknown function name in --only",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("only-miss");
+    await assertRejects(
+      () =>
+        build({
+          functionsDir: PLAYGROUND,
+          outDir: out,
+          configPath: DENO_JSON,
+          only: ["does-not-exist"],
+          sourcemap: false,
+        }),
+      Error,
+      "no functions matched",
+    );
+  },
+);
 
 Deno.test("parsePrebuiltManifest rejects newer schema versions", () => {
   const fakeFutureManifest = {
@@ -191,7 +296,7 @@ Deno.test("parsePrebuiltManifest tolerates partial per-function manifest objects
         bundleFile: "x.js",
         bundleBytes: 10,
         bundleSha256: "deadbeef",
-        manifest: { /* deliberately empty */ },
+        manifest: {/* deliberately empty */},
       },
     ],
   });
@@ -200,25 +305,54 @@ Deno.test("parsePrebuiltManifest tolerates partial per-function manifest objects
   assertEquals(m.functions[0].manifest.fromFile, true);
 });
 
-Deno.test("runBuild CLI happy path returns 0 and writes artifact", TEST_OPTS, async () => {
-  const out = await tmpOutDir("cli");
-  const code = await runBuild([
-    "--functions",
-    PLAYGROUND,
-    "--out",
-    out,
-    "--only",
-    "hello",
-    "--sourcemap",
-    "none",
-  ]);
-  assertEquals(code, 0);
-  const manifest = parsePrebuiltManifest(
-    JSON.parse(await Deno.readTextFile(join(out, "manifest.json"))),
-  );
-  assertEquals(manifest.functions.length, 1);
-  assertEquals(manifest.functions[0].name, "hello");
-});
+Deno.test(
+  "runBuild CLI happy path returns 0 and writes artifact",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("cli");
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => {
+      logs.push(args.map(String).join(" "));
+      originalLog(...args);
+    };
+    let code: number;
+    try {
+      code = await runBuild([
+        "--functions",
+        PLAYGROUND,
+        "--out",
+        out,
+        "--only",
+        "hello",
+        "--sourcemap",
+        "none",
+      ]);
+    } finally {
+      console.log = originalLog;
+    }
+    assertEquals(code, 0);
+    const manifest = parsePrebuiltManifest(
+      JSON.parse(await Deno.readTextFile(join(out, "manifest.json"))),
+    );
+    assertEquals(manifest.functions.length, 1);
+    assertEquals(manifest.functions[0].name, "hello");
+    const output = logs.join("\n");
+    assertStringIncludes(
+      output,
+      "bundling 1 function entry module(s) with shared ESM chunks",
+    );
+    assertStringIncludes(output, "bundled and minified 1 entry module(s)");
+    assertStringIncludes(output, "entry 1/1:");
+    assertStringIncludes(output, "chunk 1/1:");
+    assertStringIncludes(output, " → ");
+    assertStringIncludes(output, "1 function entry module(s), minified");
+    assertStringIncludes(output, "1 shared chunk(s), minified");
+    assertStringIncludes(output, "minified");
+    assertStringIncludes(output, "entries +");
+    assertStringIncludes(output, "chunks");
+  },
+);
 
 Deno.test("runBuild CLI returns 2 on unknown flag", TEST_OPTS, async () => {
   const code = await runBuild(["--made-up-flag", "foo"]);
