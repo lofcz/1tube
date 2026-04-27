@@ -82,7 +82,10 @@ jobs:
 
       - name: Smoke test npm package
         if: inputs.publish_npm
-        run: bun run check
+        run: |
+          bun run check
+          bun run smoke:bin
+          npm pack --dry-run
 
       - name: Bump npm package version
         if: inputs.publish_npm

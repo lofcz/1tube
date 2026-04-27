@@ -17,8 +17,12 @@
     "./eslint-plugin": "./eslint-plugin.js",
     "./package.json": "./package.json"
   },
+  "bin": {
+    "1tube": "./scripts/npm-cli.js"
+  },
   "files": [
     "eslint-plugin.js",
+    "scripts/npm-cli.js",
     "src",
     "deno.json",
     "deno.lock",
@@ -32,9 +36,10 @@
   "scripts": {
     "dev": "deno task dev",
     "serve": "deno task serve",
-    "typecheck": "deno check src/server.ts eslint-plugin.js",
+    "typecheck": "deno check src/server.ts src/cli.ts eslint-plugin.js",
     "check": "deno cache --allow-scripts=npm:protobufjs src/server.ts",
-    "prepublishOnly": "bun run typecheck && bun run check"
+    "smoke:bin": "node ./scripts/npm-cli.js --version",
+    "prepublishOnly": "bun run typecheck && bun run check && bun run smoke:bin"
   },
   "dependencies": {
     "hono": "^4.12.14"
