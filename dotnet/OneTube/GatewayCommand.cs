@@ -1,0 +1,243 @@
+namespace OneTube;
+
+/// <summary>
+/// Translates <see cref="OneTubeOptions"/> into the argv + env that
+/// the 1tube Deno gateway expects. Pulled out of the host service so
+/// it's independently testable: every CLI flag we emit lines up with
+/// a property on <see cref="OneTubeOptions"/>, and every
+/// option-derived env var lives in one place.
+///
+/// Conventions:
+/// <list type="bullet">
+///   <item>
+///     <description>
+///       Knobs that have a CLI flag use the flag (more visible in
+///       process listings, easier to grep in logs).
+///     </description>
+///   </item>
+///   <item>
+///     <description>
+///       Knobs that 1tube only reads from env vars (body limits,
+///       timeouts, INTERNAL_KEY) are forwarded as env vars on the
+///       child <see cref="ProcessStartInfo"/>. We never mutate the
+///       host process env.
+///     </description>
+///   </item>
+///   <item>
+///     <description>
+///       <c>--allow-all</c> is unconditional. The gateway needs net,
+///       fs, env, and run permissions; granting them piecemeal would
+///       just be busywork for the operator.
+///     </description>
+///   </item>
+/// </list>
+/// </summary>
+internal static class GatewayCommand
+{
+    /// <summary>
+    /// Build the argv list (excluding the deno binary itself).
+    /// The slot's port + prebuilt-dir override are honoured so the
+    /// candidate gateway can boot on a different port and against
+    /// a different staged version than the active one.
+    /// </summary>
+    public static List<string> BuildArgs(OneTubeOptions opts, GatewaySlot slot, string serverScriptPath, string? resolvedWorkerdBin)
+    {
+        var args = new List<string>
+        {
+            "run",
+            "--allow-all",
+            serverScriptPath,
+            // Resolve to absolute against AppContext.BaseDirectory.
+            // The Deno child runs with cwd = OneTubeGateway/ (so it
+            // can find the bundled deno.json), which means relative
+            // paths configured by the host would otherwise resolve
+            // against the gateway dir, not the host's bin/. Always
+            // hand the gateway absolute paths.
+            "--functions", ResolveHostPath(opts.FunctionsPath),
+            "--port", slot.Port.ToString(),
+            "--host", opts.Host,
+            "--backend", opts.Backend == OneTubeBackend.Workerd ? "workerd" : "deno",
+        };
+
+        if (opts.Hmr) args.Add("--hmr");
+        if (opts.Dev) args.Add("--dev");
+        // The gateway flag is `--lazy` (default off). We only emit it
+        // when the operator explicitly opts in; no flag means "use
+        // gateway default" which is also off, so behavior matches.
+        if (opts.Lazy) args.Add("--lazy");
+
+        if (opts.Backend == OneTubeBackend.Workerd)
+        {
+            // Always pass the absolute resolved path here. We've
+            // already validated it exists in the host service — the
+            // Deno gateway will call this directly with no further
+            // PATH lookup.
+            if (!string.IsNullOrEmpty(resolvedWorkerdBin))
+            {
+                args.Add("--workerd-bin");
+                args.Add(resolvedWorkerdBin);
+            }
+
+            if (opts.WorkerdEnvAllowlist is { Count: > 0 } allow)
+            {
+                // Comma-separated, no shell-escaping needed because
+                // we're not going through a shell — Process.Start
+                // arguments arrive verbatim.
+                args.Add("--workerd-env=" + string.Join(",", allow));
+            }
+
+            if (opts.WorkerdSharedModules is { Count: > 0 } shared)
+            {
+                foreach (var module in shared.Where(s => !string.IsNullOrWhiteSpace(s)))
+                {
+                    args.Add("--workerd-shared");
+                    args.Add(module);
+                }
+            }
+
+            if (WorkerdBasePortForSlot(opts, slot) is int basePort)
+            {
+                args.Add($"--workerd-base-port={basePort}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(opts.WorkerdInspectorAddr))
+            {
+                args.Add("--inspector-addr=" + opts.WorkerdInspectorAddr);
+            }
+
+            if (opts.WorkerdMaxHeapMb is int heap && heap > 0)
+            {
+                args.Add($"--workerd-max-heap-mb={heap}");
+            }
+
+            if (opts.KillStaleWorkerd)
+            {
+                args.Add("--kill-stale-workerd");
+            }
+
+            // Prefer the slot's own override (firmware-staged version)
+            // over the global PrebuiltDir; the firmware supervisor
+            // never mutates OneTubeOptions, it just hands the candidate
+            // slot a different version directory.
+            string? prebuilt = slot.PrebuiltDirOverride ?? opts.PrebuiltDir;
+            if (!string.IsNullOrWhiteSpace(prebuilt))
+            {
+                args.Add("--prebuilt");
+                args.Add(ResolveHostPath(prebuilt));
+            }
+        }
+
+        return args;
+    }
+
+    /// <summary>
+    /// Resolve a host-side configured path to an absolute one. Absolute
+    /// inputs are returned verbatim; relatives are resolved against
+    /// <see cref="AppContext.BaseDirectory"/> (the host's <c>bin/</c>),
+    /// matching the convention documented on <see cref="OneTubeOptions"/>.
+    /// </summary>
+    private static string ResolveHostPath(string path)
+        => Path.IsPathRooted(path)
+            ? path
+            : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, path));
+
+    /// <summary>
+    /// Outer gateway ports must not share the same inner workerd socket
+    /// range. WorkerdBackend itself uses base and base+500 for its own
+    /// reload generations, so reserve 1000 ports per outer gateway port.
+    /// Firmware swaps alternate which outer port is active, therefore
+    /// this is keyed by port rather than by the transient role label.
+    /// </summary>
+    private static int? WorkerdBasePortForSlot(OneTubeOptions opts, GatewaySlot slot)
+    {
+        if (opts.Backend != OneTubeBackend.Workerd) return null;
+        var basePort = opts.WorkerdBasePort ?? 8800;
+        return slot.Port == opts.CandidatePort
+            ? basePort + 1000
+            : basePort;
+    }
+
+    /// <summary>
+    /// Build the env-var dictionary to layer on top of the inherited
+    /// process environment. Returned as a flat dictionary so callers
+    /// can apply it onto <see cref="ProcessStartInfo.Environment"/>.
+    ///
+    /// <para>Layering order (later wins):
+    /// <list type="number">
+    ///   <item>Gateway-derived bindings (PORT, FUNCTIONS_PATH, etc.)</item>
+    ///   <item><see cref="OneTubeOptions.EnvVars"/> from appCfg</item>
+    ///   <item><paramref name="secretsOverlay"/> — runtime-edited
+    ///   secrets from the live secrets store. Wins on collision so
+    ///   appCfg keys are treated as defaults that secrets can
+    ///   override.</item>
+    /// </list>
+    /// The <c>secretsOverlay</c> argument is optional so consumers
+    /// without the secrets feature pay nothing for it.</para>
+    /// </summary>
+    public static Dictionary<string, string> BuildEnvironment(
+        OneTubeOptions opts,
+        GatewaySlot slot,
+        IReadOnlyDictionary<string, string>? secretsOverlay = null)
+    {
+        var env = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        // The gateway also reads PORT/FUNCTIONS_PATH as defaults, but
+        // we pass them on the CLI for visibility. Setting them here
+        // too ensures any helper code inside the gateway that looks
+        // at env (rather than parsed args) agrees on the value.
+        env["PORT"] = slot.Port.ToString();
+        env["FUNCTIONS_PATH"] = ResolveHostPath(opts.FunctionsPath);
+        env["1TUBE_HOST"] = opts.Host;
+
+        if (opts.BodyLimitMb is double bodyMb && bodyMb > 0)
+        {
+            // Deno parses this as a float; invariant culture so we
+            // don't write `30,0` on a German-locale Windows host.
+            env["1TUBE_BODY_LIMIT_MB"] = bodyMb.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        if (opts.BodyReadIdleMs is int bodyMs && bodyMs > 0)
+        {
+            env["1TUBE_BODY_READ_MS"] = bodyMs.ToString();
+        }
+
+        if (opts.FunctionTimeoutMs is int fnMs && fnMs > 0)
+        {
+            env["FUNCTION_TIMEOUT_MS"] = fnMs.ToString();
+        }
+
+        if (opts.ShutdownGraceMs is int graceMs && graceMs > 0)
+        {
+            env["1TUBE_SHUTDOWN_GRACE_MS"] = graceMs.ToString();
+        }
+
+        if (!string.IsNullOrEmpty(opts.InternalKey))
+        {
+            env["INTERNAL_KEY"] = opts.InternalKey;
+        }
+
+        // Caller-supplied passthrough is layered last so it always
+        // wins — operators may want to override a derived value
+        // (e.g. set INTERNAL_KEY directly via EnvVars instead of the
+        // typed property).
+        foreach (var (k, v) in opts.EnvVars)
+        {
+            env[k] = v;
+        }
+
+        // Live-edited secrets layer on top of EnvVars. The secrets
+        // store rejects gateway-reserved keys at write time so this
+        // overlay can never accidentally clobber PORT/INTERNAL_KEY/
+        // etc. — but it CAN override anything an operator put in
+        // EnvVars, which is the whole point.
+        if (secretsOverlay is not null)
+        {
+            foreach (var (k, v) in secretsOverlay)
+            {
+                env[k] = v;
+            }
+        }
+
+        return env;
+    }
+}

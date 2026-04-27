@@ -23,6 +23,10 @@ if (arg0 === "build") {
   const { runBuild } = await import("./cli/build.ts");
   const code = await runBuild(Deno.args.slice(1));
   Deno.exit(code);
+} else if (arg0 === "package") {
+  const { runPackage } = await import("./cli/package.ts");
+  const code = await runPackage(Deno.args.slice(1));
+  Deno.exit(code);
 } else if (arg0 === "--version" || arg0 === "-v") {
   const { VERSION } = await import("./version.ts");
   console.log(VERSION);
@@ -33,6 +37,7 @@ if (arg0 === "build") {
 Commands:
   serve       Run the gateway (default when no command given)
   build       Bundle functions into a sealed artifact for prebuilt deploys
+  package     Wrap a built dist/ into a signed .1tube firmware payload
   --version   Print version and exit
   --help      Print this help
 

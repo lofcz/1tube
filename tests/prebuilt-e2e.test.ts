@@ -200,7 +200,7 @@ Deno.test(
 
       // Corrupt the bundle bytes without updating the manifest's
       // sha-256 — boot must reject this.
-      const bundlePath = join(dist, "hello.js");
+      const bundlePath = join(dist, "functions", "hello.js");
       const original = await Deno.readTextFile(bundlePath);
       await Deno.writeTextFile(bundlePath, original + "\n// tampered\n");
 

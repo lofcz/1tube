@@ -20,7 +20,12 @@ import { assert, assertEquals, assertRejects, assertStringIncludes } from "@std/
 import { join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import * as esbuild from "esbuild";
-import { type Bundler, createBundler, discoverEntrypoints } from "../src/backends/workerd/bundler.ts";
+import {
+  type Bundler,
+  createBundler,
+  discoverEntrypoints,
+  discoverSharedModules,
+} from "../src/backends/workerd/bundler.ts";
 
 const PROJECT_ROOT = resolvePath(new URL("..", import.meta.url).pathname.replace(/^\/(\w:)/, "$1"));
 const PLAYGROUND = join(PROJECT_ROOT, "playground");
@@ -173,6 +178,55 @@ Deno.test("workerd-bundler: emits the Deno.env shim verbatim into the bundle", B
     assertStringIncludes(text, 'Object.defineProperty(globalThis, "Deno"');
   } finally {
     await Deno.remove(outDir, { recursive: true });
+  }
+});
+
+Deno.test("workerd-bundler: shared modules are replaced with RPC stubs", BUNDLER_TEST, async () => {
+  const root = await Deno.makeTempDir({ prefix: "1tube-shared-fixture-" });
+  const outDir = await makeOutDir("shared-stub");
+  try {
+    await Deno.mkdir(join(root, "_shared"), { recursive: true });
+    await Deno.mkdir(join(root, "needs-profile"), { recursive: true });
+    await Deno.writeTextFile(
+      join(root, "_shared", "profile-cache.ts"),
+      `const cache = new Map([["u1", { claims: ["teacher"] }]]);
+export async function getCachedProfile(userId: string) {
+  return cache.get(userId) ?? { claims: [] };
+}
+export function invalidateProfile(userId: string) {
+  cache.delete(userId);
+}
+`,
+    );
+    await Deno.writeTextFile(
+      join(root, "_shared", "handler.ts"),
+      `export function serve(handler: (req: Request) => Response | Promise<Response>) {
+  (globalThis as any).__edgeFunctionRegistry.register(handler, { public: true });
+}
+`,
+    );
+    await Deno.writeTextFile(
+      join(root, "needs-profile", "index.ts"),
+      `import { serve } from "../_shared/handler.ts";
+import { getCachedProfile } from "../_shared/profile-cache.ts";
+serve(async () => Response.json(await getCachedProfile("u1")));
+`,
+    );
+
+    const sharedModules = await discoverSharedModules(root);
+    const bundler = createBundler({ outDir, sharedModules, sourcemap: false });
+    const result = await bundler.bundle({
+      name: "needs-profile",
+      entrypoint: join(root, "needs-profile", "index.ts"),
+    });
+    const text = await Deno.readTextFile(result.bundlePath);
+    assertStringIncludes(text, "/modules/");
+    assertStringIncludes(text, "/call/");
+    assertStringIncludes(text, "getCachedProfile");
+    assert(!text.includes("new Map([[\"u1\""), "real shared module must not be bundled into isolate");
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => {});
+    await Deno.remove(outDir, { recursive: true }).catch(() => {});
   }
 });
 

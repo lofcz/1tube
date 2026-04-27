@@ -49,7 +49,7 @@ Deno.test("cors: production with no allowlist emits no CORS headers", async () =
 
 Deno.test("cors: production allowlist accepts a listed origin", async () => {
   resetTubeEnv();
-  Deno.env.set("1TUBE_CORS_ORIGIN", "https://app.example.com,https://admin.example.com");
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com,admin.example.com");
   const { corsMiddleware } = await freshCors();
   const app = appWith(corsMiddleware);
 
@@ -63,7 +63,7 @@ Deno.test("cors: production allowlist accepts a listed origin", async () => {
 
 Deno.test("cors: production allowlist rejects an unlisted origin", async () => {
   resetTubeEnv();
-  Deno.env.set("1TUBE_CORS_ORIGIN", "https://app.example.com");
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com");
   const { corsMiddleware } = await freshCors();
   const app = appWith(corsMiddleware);
 
@@ -71,6 +71,41 @@ Deno.test("cors: production allowlist rejects an unlisted origin", async () => {
     new Request("http://localhost/x", { headers: { Origin: "https://evil.example.com" } }),
   );
   assertEquals(blocked.headers.get("access-control-allow-origin"), null);
+});
+
+Deno.test("cors: production allowlist accepts wildcard subdomains", async () => {
+  resetTubeEnv();
+  Deno.env.set("1TUBE_CORS_ORIGIN", "https://app.example.com,*.schools.example");
+  const { corsMiddleware } = await freshCors();
+  const app = appWith(corsMiddleware);
+
+  const ok = await app.fetch(
+    new Request("http://localhost/x", { headers: { Origin: "https://tenant.schools.example" } }),
+  );
+  assertEquals(ok.headers.get("access-control-allow-origin"), "https://tenant.schools.example");
+  assertEquals(ok.headers.get("access-control-allow-credentials"), "true");
+
+  const apex = await app.fetch(
+    new Request("http://localhost/x", { headers: { Origin: "https://schools.example" } }),
+  );
+  assertEquals(apex.headers.get("access-control-allow-origin"), null);
+
+  const anyScheme = await app.fetch(
+    new Request("http://localhost/x", { headers: { Origin: "http://tenant.schools.example" } }),
+  );
+  assertEquals(anyScheme.headers.get("access-control-allow-origin"), "http://tenant.schools.example");
+});
+
+Deno.test("cors: '*' inside comma list allows any origin", async () => {
+  resetTubeEnv();
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com,*");
+  const { corsMiddleware } = await freshCors();
+  const app = appWith(corsMiddleware);
+
+  const res = await app.fetch(
+    new Request("http://localhost/x", { headers: { Origin: "https://anywhere.example" } }),
+  );
+  assertEquals(res.headers.get("access-control-allow-origin"), "https://anywhere.example");
 });
 
 Deno.test("cors: explicit '*' allows any origin in production", async () => {
@@ -89,7 +124,7 @@ Deno.test("cors: explicit '*' allows any origin in production", async () => {
 
 Deno.test("cors: OPTIONS preflight short-circuits to 204", async () => {
   resetTubeEnv();
-  Deno.env.set("1TUBE_CORS_ORIGIN", "https://app.example.com");
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com");
   const { corsMiddleware } = await freshCors();
   const app = appWith(corsMiddleware);
 
@@ -106,7 +141,7 @@ Deno.test("cors: OPTIONS preflight short-circuits to 204", async () => {
 
 Deno.test("cors: OPTIONS from a disallowed origin returns 204 with no allow-origin header", async () => {
   resetTubeEnv();
-  Deno.env.set("1TUBE_CORS_ORIGIN", "https://app.example.com");
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com");
   const { corsMiddleware } = await freshCors();
   const app = appWith(corsMiddleware);
 

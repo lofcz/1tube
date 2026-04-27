@@ -34,11 +34,16 @@
  * there is no mock layer because esbuild's behaviour is the contract.
  */
 
-import { join, resolve as resolvePath } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join, resolve as resolvePath } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
 import * as esbuild from "esbuild";
 import { denoPlugin } from "@deno/esbuild-plugin";
+import {
+  SHARED_RUNTIME_TOKEN_ENV,
+  SHARED_RUNTIME_URL_ENV,
+  type SharedRuntimeModule,
+} from "./shared-runtime.ts";
 
 /**
  * Banner injected at the top of every bundle. Runs before any user code so
@@ -67,7 +72,9 @@ const __1tubeRegistry = {
 const __1tubeDenoEnv = {
   get(key) {
     const v = __1tubeWorkerEnv?.[key];
-    return typeof v === "string" ? v : undefined;
+    if (typeof v === "string") return v;
+    const pv = globalThis.process?.env?.[key];
+    return typeof pv === "string" ? pv : undefined;
   },
   set() {
     throw new Error("Deno.env.set is not supported under the workerd backend");
@@ -76,10 +83,15 @@ const __1tubeDenoEnv = {
     throw new Error("Deno.env.delete is not supported under the workerd backend");
   },
   has(key) {
-    return typeof __1tubeWorkerEnv?.[key] === "string";
+    return typeof __1tubeWorkerEnv?.[key] === "string" ||
+      typeof globalThis.process?.env?.[key] === "string";
   },
   toObject() {
     const out = {};
+    for (const k of Object.keys(globalThis.process?.env ?? {})) {
+      const v = globalThis.process.env[k];
+      if (typeof v === "string") out[k] = v;
+    }
     for (const k of Object.keys(__1tubeWorkerEnv ?? {})) {
       const v = __1tubeWorkerEnv[k];
       if (typeof v === "string") out[k] = v;
@@ -190,6 +202,15 @@ export interface BundleResult {
   durationMs: number;
 }
 
+export interface WorkerdSharedModuleInput {
+  /** Stable id used in the generated RPC path and prebuilt manifest. */
+  id: string;
+  /** Absolute source module path on disk. */
+  sourcePath: string;
+  /** Exported functions to expose through the shared runtime. */
+  exportNames: readonly string[];
+}
+
 export interface BundlerOptions {
   /**
    * Directory to write bundles into. Files are named `<name>.js` (+
@@ -209,6 +230,12 @@ export interface BundlerOptions {
   sourcemap?: boolean | "linked" | "inline";
   /** Emit minified output. Defaults to false (keeps readable stack traces). */
   minify?: boolean;
+  /**
+   * Modules that should be owned by the gateway process, not by each
+   * workerd isolate. Imports that resolve to one of these source paths
+   * are replaced with generated RPC stubs.
+   */
+  sharedModules?: readonly WorkerdSharedModuleInput[];
 }
 
 /** State held by a long-lived bundler so esbuild can be reused across builds. */
@@ -222,6 +249,112 @@ export interface Bundler {
   ): Promise<BundleResult[]>;
   /** Release esbuild's worker process. Always call from a `try/finally`. */
   dispose(): Promise<void>;
+}
+
+export interface SharedBundleResult extends SharedRuntimeModule {
+  byteLength: number;
+  durationMs: number;
+}
+
+function sharedModuleStubSource(module: WorkerdSharedModuleInput): string {
+  const exports = module.exportNames.map((name) =>
+    `export async function ${name}(...args) {
+  return await callShared(${JSON.stringify(name)}, args);
+}`
+  ).join("\n\n");
+  return `
+const RUNTIME_URL_ENV = ${JSON.stringify(SHARED_RUNTIME_URL_ENV)};
+const RUNTIME_TOKEN_ENV = ${JSON.stringify(SHARED_RUNTIME_TOKEN_ENV)};
+const MODULE_ID = ${JSON.stringify(module.id)};
+
+function env(name) {
+  const v = globalThis.Deno?.env?.get?.(name) ?? globalThis.process?.env?.[name];
+  return typeof v === "string" ? v : "";
+}
+
+async function callShared(exportName, args) {
+  const base = env(RUNTIME_URL_ENV);
+  const token = env(RUNTIME_TOKEN_ENV);
+  if (!base || !token) {
+    throw new Error("1tube shared runtime is not configured");
+  }
+  const res = await fetch(
+    base + "/modules/" + encodeURIComponent(MODULE_ID) + "/call/" + encodeURIComponent(exportName),
+    {
+    method: "POST",
+    headers: {
+      "authorization": "Bearer " + token,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ args }),
+    },
+  );
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(payload?.error || "1tube shared runtime request failed");
+  }
+  return payload.value;
+}
+
+${exports}
+`;
+}
+
+function importerToPath(importer: string): string | null {
+  if (!importer) return null;
+  try {
+    if (importer.startsWith("file:")) return fileURLToPath(importer);
+    return importer;
+  } catch {
+    return null;
+  }
+}
+
+function resolveLocalImport(args: esbuild.OnResolveArgs): string | null {
+  if (!args.path.startsWith(".") && !args.path.startsWith("/") && !/^[A-Za-z]:[\\/]/.test(args.path)) {
+    return null;
+  }
+  if (args.path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(args.path)) {
+    return resolvePath(args.path);
+  }
+  const importerPath = importerToPath(args.importer);
+  if (!importerPath) return null;
+  return resolvePath(dirname(importerPath), args.path);
+}
+
+function sharedModulesExternalPlugin(sharedModules: readonly WorkerdSharedModuleInput[]): esbuild.Plugin {
+  const byPath = new Map(sharedModules.map((m) => [resolvePath(m.sourcePath), m]));
+  return {
+    name: "1tube-shared-modules",
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, (args) => {
+        const resolved = resolveLocalImport(args);
+        if (!resolved) return null;
+        const mod = byPath.get(resolved);
+        if (!mod) return null;
+        return { path: mod.id, namespace: "1tube-shared-runtime" };
+      });
+      build.onLoad({ filter: /.*/, namespace: "1tube-shared-runtime" }, (args) => ({
+        contents: sharedModuleStubSource(sharedModules.find((m) => m.id === args.path)!),
+        loader: "js",
+      }));
+    },
+  };
+}
+
+function patchCjsDefaultInterop(code: string): string {
+  // esbuild's default helper intentionally withholds `default` when a
+  // CommonJS module sets `__esModule`. That matches Babel-transpiled
+  // modules that also provide a real `.default`, but breaks plain CJS
+  // packages such as `tslib` whose UMD wrapper sets `__esModule` while
+  // only exporting named helpers. Workerd's nodejs_compat behavior is
+  // closer to Node's ESM/CJS bridge: a default import from CJS resolves
+  // to module.exports. Preserve real default exports, but synthesize one
+  // when absent.
+  return code.replace(
+    "isNodeMode || !mod || !mod.__esModule ? __defProp(target, \"default\", { value: mod, enumerable: true }) : target,",
+    "isNodeMode || !mod || !mod.__esModule || !(\"default\" in mod) ? __defProp(target, \"default\", { value: mod, enumerable: true }) : target,",
+  );
 }
 
 /**
@@ -239,20 +372,23 @@ export function createBundler(opts: BundlerOptions): Bundler {
   // The Rust loader auto-discovers `deno.lock` next to `deno.json` for
   // JSR pinning; no explicit lockPath knob is exposed by the plugin.
   const plugin = denoPlugin({ configPath: opts.configPath });
+  const sharedModules = opts.sharedModules ?? [];
+  const plugins = sharedModules.length > 0
+    ? [sharedModulesExternalPlugin(sharedModules), plugin]
+    : [plugin];
 
   const buildOne = async (input: BundleInput): Promise<BundleResult> => {
     const start = performance.now();
     const outfile = join(opts.outDir, `${input.name}.js`);
 
-    let result;
     try {
-      result = await esbuild.build({
+      await esbuild.build({
       // The deno-loader resolver needs absolute file URLs for entrypoints
       // so its specifier matching is unambiguous on Windows (where naked
       // paths can be interpreted as relative).
       entryPoints: [pathToFileURL(input.entrypoint).href],
       outfile,
-      plugins: [plugin],
+      plugins,
       bundle: true,
       format: "esm",
       // Workerd targets a modern V8 — no need to down-level for IE11 etc.
@@ -293,6 +429,12 @@ export function createBundler(opts: BundlerOptions): Bundler {
         `workerd bundle failed for function "${input.name}" (${input.entrypoint})\n${cause}`,
         { cause: err instanceof Error ? err : undefined },
       );
+    }
+
+    const emitted = await Deno.readTextFile(outfile);
+    const patched = patchCjsDefaultInterop(emitted);
+    if (patched !== emitted) {
+      await Deno.writeTextFile(outfile, patched);
     }
 
     const stat = await Deno.stat(outfile);
@@ -339,6 +481,113 @@ export function createBundler(opts: BundlerOptions): Bundler {
       await esbuild.stop();
     },
   };
+}
+
+export async function bundleSharedModule(opts: {
+  module: WorkerdSharedModuleInput;
+  outDir: string;
+  configPath?: string;
+  minify?: boolean;
+}): Promise<SharedBundleResult> {
+  await ensureDir(opts.outDir);
+  const start = performance.now();
+  const outfile = join(opts.outDir, `${opts.module.id}.js`);
+  await esbuild.build({
+    entryPoints: [pathToFileURL(opts.module.sourcePath).href],
+    outfile,
+    plugins: [denoPlugin({ configPath: opts.configPath })],
+    bundle: true,
+    format: "esm",
+    target: "es2022",
+    platform: "neutral",
+    conditions: ["worker", "browser", "import", "default"],
+    sourcemap: false,
+    minify: opts.minify ?? false,
+    treeShaking: true,
+    absWorkingDir: opts.outDir,
+    logLevel: "silent",
+    mainFields: ["module", "main"],
+  });
+  const emitted = await Deno.readTextFile(outfile);
+  const patched = patchCjsDefaultInterop(emitted);
+  if (patched !== emitted) {
+    await Deno.writeTextFile(outfile, patched);
+  }
+  const stat = await Deno.stat(outfile);
+  return {
+    id: opts.module.id,
+    bundlePath: outfile,
+    exportNames: opts.module.exportNames,
+    byteLength: stat.size,
+    durationMs: performance.now() - start,
+  };
+}
+
+function moduleIdFromPath(path: string): string {
+  const base = path.split(/[\\/]/).pop() ?? "shared";
+  return base.replace(/\.[^.]+$/, "").replace(/[^A-Za-z0-9_-]/g, "-");
+}
+
+function extractExportedFunctionNames(source: string): string[] {
+  const names = new Set<string>();
+  for (const match of source.matchAll(/export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/g)) {
+    names.add(match[1]);
+  }
+  for (const match of source.matchAll(/export\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/g)) {
+    names.add(match[1]);
+  }
+  for (const match of source.matchAll(/export\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*async\s+/g)) {
+    names.add(match[1]);
+  }
+  return [...names].sort();
+}
+
+async function maybeSharedModule(path: string): Promise<WorkerdSharedModuleInput | null> {
+  try {
+    const stat = await Deno.stat(path);
+    if (!stat.isFile) return null;
+    const source = await Deno.readTextFile(path);
+    const exportNames = extractExportedFunctionNames(source);
+    if (exportNames.length === 0) {
+      throw new Error(`shared module ${path} does not export any functions`);
+    }
+    return {
+      id: moduleIdFromPath(path),
+      sourcePath: resolvePath(path),
+      exportNames,
+    };
+  } catch (err) {
+    if (err instanceof Deno.errors.NotFound) return null;
+    throw err;
+  }
+}
+
+export async function discoverSharedModules(
+  functionsDir: string,
+  explicitPaths: readonly string[] = [],
+): Promise<WorkerdSharedModuleInput[]> {
+  const root = resolvePath(functionsDir);
+  const candidates = explicitPaths.length > 0
+    ? explicitPaths.map((p) => /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") ? p : resolvePath(root, p))
+    : [];
+
+  // Built-in convention: if a Supabase-style profile cache exists, run
+  // it as a gateway-owned shared module unless the caller already named it.
+  const defaultProfile = join(root, "_shared", "profile-cache.ts");
+  if (!candidates.some((p) => resolvePath(p) === resolvePath(defaultProfile))) {
+    candidates.push(defaultProfile);
+  }
+
+  const out: WorkerdSharedModuleInput[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const resolved = resolvePath(candidate);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    const mod = await maybeSharedModule(resolved);
+    if (mod) out.push(mod);
+  }
+  return out;
 }
 
 /**

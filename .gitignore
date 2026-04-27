@@ -1,3 +1,6 @@
 node_modules/
 .env
 *.log
+/dotnet/OneTube/bin
+/dotnet/OneTube/obj
+/dotnet/OneTube/.idea

@@ -48,7 +48,7 @@ Deno.test("workerd-capnp: emits well-formed config for two functions", () => {
   assertStringIncludes(result.text, `address = "127.0.0.1:8800"`);
   assertStringIncludes(result.text, `address = "127.0.0.1:8801"`);
   assertStringIncludes(result.text, `compatibilityDate = "2026-04-25"`);
-  assertStringIncludes(result.text, `compatibilityFlags = ["nodejs_compat"]`);
+  assertStringIncludes(result.text, `compatibilityFlags = ["nodejs_compat", "nodejs_compat_populate_process_env"]`);
 
   // The bracket structure should balance — a quick sanity check that
   // saves an entire class of "missing comma" regressions.
@@ -124,6 +124,17 @@ Deno.test("workerd-capnp: de-duplicates compatibility flags in stable order", ()
   assertEquals(occurrences, 1);
 });
 
+Deno.test("workerd-capnp: local outbound network still supports public HTTPS", () => {
+  const result = generateCapnp(
+    [{ name: "fn", bundleBasename: "fn.js" }],
+    { allowLocalOutbound: true },
+  );
+
+  assertStringIncludes(result.text, `name = "internet"`);
+  assertStringIncludes(result.text, `allow = ["public", "local"]`);
+  assertStringIncludes(result.text, `tlsOptions = (trustBrowserCas = true)`);
+});
+
 Deno.test("workerd-capnp: rejects empty input", () => {
   assertThrows(() => generateCapnp([]), Error, "at least one function");
 });
@@ -156,12 +167,17 @@ Deno.test("workerd-capnp: rejects unsafe service names", () => {
   }
 });
 
-Deno.test("workerd-capnp: rejects unsafe bundle basenames", () => {
-  for (const bad of ["", "../escape.js", "sub/dir.js", "back\\slash.js", `quote".js`, ".", ".."]) {
+Deno.test("workerd-capnp: accepts safe relative bundle paths", () => {
+  const r = generateCapnp([{ name: "fn", bundleBasename: "functions/fn.js" }]);
+  assert(r.text.includes('embed "functions/fn.js"'));
+});
+
+Deno.test("workerd-capnp: rejects unsafe bundle embed paths", () => {
+  for (const bad of ["", "../escape.js", "/abs.js", "./fn.js", "sub//dir.js", "back\\slash.js", `quote".js`, ".", ".."]) {
     assertThrows(
       () => generateCapnp([{ name: "fn", bundleBasename: bad }]),
       Error,
-      "basename",
+      "bundle embed path",
       `expected rejection for ${JSON.stringify(bad)}`,
     );
   }

@@ -52,8 +52,8 @@ export interface RegisteredFunction {
  * Async-context-scoped binding of "the function currently being imported".
  * Set by the discovery loader via `runWithCurrentFunction()` so that concurrent
  * dynamic imports each see the correct name when their top-level `serve()` call
- * fires `register()`. Falls back to a mutable field for legacy single-threaded
- * callers (kept for backwards compat).
+ * fires `register()`. The async-context is the only supported path —
+ * `register()` throws if no scope is active.
  */
 const currentNameStorage = new AsyncLocalStorage<string>();
 
@@ -93,7 +93,6 @@ export class FunctionRegistry {
   private externalManifests = new Map<string, FunctionManifest>();
   /** In-flight import dedupe: many concurrent first-requests await the same Promise. */
   private loading = new Map<string, Promise<RegisteredFunction | null>>();
-  private _legacyCurrentName = "";
 
   /**
    * Loader hook: stash a manifest for a function before its module is
@@ -118,14 +117,6 @@ export class FunctionRegistry {
   }
 
   /**
-   * Legacy setter for callers that don't use the async-context API.
-   * Prefer `runWithCurrentFunction()` for parallel-safe loading.
-   */
-  setCurrentFunction(name: string): void {
-    this._legacyCurrentName = name;
-  }
-
-  /**
    * Called by the `serve()` shim in `_shared/handler.ts`.
    * Captures the handler instead of starting a server.
    */
@@ -133,11 +124,11 @@ export class FunctionRegistry {
     handler: AuthenticatedHandler | PublicHandler,
     opts: { public: boolean; timeoutMs?: number },
   ): void {
-    const name = currentNameStorage.getStore() ?? this._legacyCurrentName;
+    const name = currentNameStorage.getStore();
     if (!name) {
       throw new Error(
         "[1tube] registry.register() called without an active function context. " +
-        "This is a bug in the function loader.",
+        "This is a bug in the function loader — must be wrapped in runWithCurrentFunction().",
       );
     }
     const manifest = this.pendingManifests.get(name) ?? defaultManifest();
@@ -270,7 +261,6 @@ export class FunctionRegistry {
     this.pendingManifests.clear();
     this.candidates.clear();
     this.loading.clear();
-    this._legacyCurrentName = "";
   }
 
   list(): string[] {

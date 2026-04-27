@@ -6,13 +6,49 @@
     <Nullable>enable</Nullable>
     <RootNamespace>OneTube</RootNamespace>
     <PackageId>OneTube</PackageId>
-    <Version>0.1.0</Version>
-    <Description>Host Supabase-compatible Deno edge functions inside ASP.NET with zero-copy YARP proxying.</Description>
+    <Version>0.2.0</Version>
+    <Description>Host Supabase-compatible edge functions inside ASP.NET with zero-copy YARP proxying. Supports the deno and workerd backends; operator supplies explicit binary paths.</Description>
     <IsPackable>true</IsPackable>
   </PropertyGroup>
 
   <ItemGroup>
+    <!--
+      We sit on top of ASP.NET Core (WebApplication, IHostedService,
+      ILogger, IOptions, …) so we declare the framework reference
+      explicitly. This keeps the package small (the framework is
+      shared from the host) while letting the library compile in
+      isolation for CI and `dotnet pack`.
+    -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="Yarp.ReverseProxy" Version="2.*" />
+  </ItemGroup>
+
+  <!--
+    Ship the 1tube TypeScript gateway sources alongside the DLL.
+    Consumers (priprava, sciobot-next-host, …) must NOT need a sibling
+    1tube checkout to run the gateway: the OneTube package carries
+    everything Deno needs to spin up the gateway process. At build
+    time these files land in <consumer>/bin/<config>/<tfm>/OneTubeGateway/…
+    and DenoHostService resolves them via AppContext.BaseDirectory.
+    deno.json travels with the sources so jsr:/npm: specifiers in the
+    gateway resolve through 1tube's own import map (not the consumer's).
+  -->
+  <ItemGroup>
+    <Content Include="..\..\src\**\*.ts"
+             Exclude="..\..\src\**\*.test.ts">
+      <Link>OneTubeGateway\src\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Pack>true</Pack>
+      <PackagePath>contentFiles\any\any\OneTubeGateway\src\%(RecursiveDir)%(Filename)%(Extension);content\OneTubeGateway\src\%(RecursiveDir)%(Filename)%(Extension)</PackagePath>
+    </Content>
+    <Content Include="..\..\deno.json">
+      <Link>OneTubeGateway\deno.json</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Pack>true</Pack>
+      <PackagePath>contentFiles\any\any\OneTubeGateway\deno.json;content\OneTubeGateway\deno.json</PackagePath>
+    </Content>
   </ItemGroup>
 
 </Project>

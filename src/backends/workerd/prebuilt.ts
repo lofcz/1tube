@@ -18,7 +18,7 @@ import { type FunctionManifest, parseManifest } from "../../manifest.ts";
  * schema is newer than this constant — older binaries should fail
  * fast rather than misinterpret a future format.
  */
-export const PREBUILT_SCHEMA = 1;
+export const PREBUILT_SCHEMA = 2;
 
 /**
  * Per-function record carried inside `dist/manifest.json`. The bundle
@@ -36,6 +36,14 @@ export interface PrebuiltFunctionEntry {
   manifest: FunctionManifest;
 }
 
+export interface PrebuiltSharedModuleEntry {
+  id: string;
+  bundleFile: string;
+  bundleBytes: number;
+  bundleSha256: string;
+  exportNames: string[];
+}
+
 export interface PrebuiltManifest {
   schema: number;
   /** "1tube@x.y.z" string emitted by the build command. Diagnostic only. */
@@ -48,6 +56,8 @@ export interface PrebuiltManifest {
   compatibilityFlags?: string[];
   /** Env var names the build expects to be available at serve time. */
   envAllowlist: string[];
+  /** Gateway-owned shared module bundles used by workerd RPC stubs. */
+  sharedModules: PrebuiltSharedModuleEntry[];
   /** Indexed function table, sorted by name for deterministic diffs. */
   functions: PrebuiltFunctionEntry[];
 }
@@ -103,6 +113,27 @@ export function parsePrebuiltManifest(raw: unknown): PrebuiltManifest {
       manifest: parseManifest(e.manifest, /* fromFile */ true),
     };
   });
+  const sharedModules: PrebuiltSharedModuleEntry[] = Array.isArray(obj.sharedModules)
+    ? obj.sharedModules.map((rawEntry, idx) => {
+      if (!rawEntry || typeof rawEntry !== "object") {
+        throw new Error(`sharedModules[${idx}] is not an object`);
+      }
+      const e = rawEntry as Record<string, unknown>;
+      const id = typeof e.id === "string" ? e.id : "";
+      const bundleFile = typeof e.bundleFile === "string" ? e.bundleFile : "";
+      const bundleBytes = typeof e.bundleBytes === "number" ? e.bundleBytes : 0;
+      const bundleSha256 = typeof e.bundleSha256 === "string" ? e.bundleSha256 : "";
+      const exportNames = Array.isArray(e.exportNames)
+        ? e.exportNames.filter((n): n is string => typeof n === "string")
+        : [];
+      if (!id || !bundleFile || !bundleSha256) {
+        throw new Error(
+          `sharedModules[${idx}] missing required fields (id, bundleFile, bundleSha256)`,
+        );
+      }
+      return { id, bundleFile, bundleBytes, bundleSha256, exportNames };
+    })
+    : [];
   return {
     schema,
     builtBy: typeof obj.builtBy === "string" ? obj.builtBy : "unknown",
@@ -116,6 +147,7 @@ export function parsePrebuiltManifest(raw: unknown): PrebuiltManifest {
     envAllowlist: Array.isArray(obj.envAllowlist)
       ? obj.envAllowlist.filter((n): n is string => typeof n === "string")
       : [],
+    sharedModules,
     functions,
   };
 }

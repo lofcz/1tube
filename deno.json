@@ -16,7 +16,8 @@
     "@std/assert": "jsr:@std/assert@^1",
     "hono": "npm:hono@4",
     "esbuild": "npm:esbuild@^0.28",
-    "@deno/esbuild-plugin": "jsr:@deno/esbuild-plugin@^1.2"
+    "@deno/esbuild-plugin": "jsr:@deno/esbuild-plugin@^1.2",
+    "@zip-js/zip-js": "jsr:@zip-js/zip-js@^2.8"
   },
   "lint": {
     "rules": {

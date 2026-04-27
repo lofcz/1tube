@@ -31,11 +31,34 @@ const PROJECT_ROOT = resolvePath(dirname(fromFileUrl(import.meta.url)), "..");
 
 const E2E_OPTS = { sanitizeOps: false, sanitizeResources: false } as const;
 
-async function freePort(): Promise<number> {
+function freePort(): number {
   const l = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const port = (l.addr as Deno.NetAddr).port;
   l.close();
   return port;
+}
+
+function freeWorkerdBasePort(): number {
+  const span = 64;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const base = 20_000 + Math.floor(Math.random() * 30_000);
+    const listeners: Deno.Listener[] = [];
+    try {
+      for (const slotOffset of [0, 500]) {
+        for (let i = 0; i < span; i++) {
+          listeners.push(Deno.listen({ hostname: "127.0.0.1", port: base + slotOffset + i }));
+        }
+      }
+      return base;
+    } catch {
+      // Try another range; some other process owns at least one port here.
+    } finally {
+      for (const l of listeners) {
+        try { l.close(); } catch { /* already closed */ }
+      }
+    }
+  }
+  throw new Error("could not reserve a free workerd e2e port range");
 }
 
 /** Block until the port responds with any HTTP status, or `timeoutMs` elapses. */
@@ -71,7 +94,8 @@ Deno.test("workerd-e2e: gateway proxies hello + echo through workerd", E2E_OPTS,
     return;
   }
 
-  const port = await freePort();
+  const port = freePort();
+  const workerdBasePort = freeWorkerdBasePort();
   const playgroundDir = join(PROJECT_ROOT, "playground");
 
   // Spawn the gateway as a child process with the workerd backend
@@ -96,6 +120,8 @@ Deno.test("workerd-e2e: gateway proxies hello + echo through workerd", E2E_OPTS,
       String(port),
       "--host",
       "127.0.0.1",
+      "--workerd-base-port",
+      String(workerdBasePort),
       "--dev",
     ],
     cwd: PROJECT_ROOT,
@@ -347,6 +373,121 @@ Deno.test("workerd-e2e: gateway proxies hello + echo through workerd", E2E_OPTS,
   }
 });
 
+Deno.test("workerd-e2e: shared module top-level state runs in gateway runtime", E2E_OPTS, async () => {
+  if (!(await workerdAvailable())) {
+    console.log("[skipped: workerd binary not on PATH]");
+    return;
+  }
+
+  const tmp = await Deno.makeTempDir({ prefix: "1tube-workerd-shared-e2e-" });
+  const port = freePort();
+  const workerdBasePort = freeWorkerdBasePort();
+  await Deno.mkdir(join(tmp, "_shared"), { recursive: true });
+  await Deno.mkdir(join(tmp, "needs-profile"), { recursive: true });
+  await Deno.writeTextFile(
+    join(tmp, "_shared", "handler.ts"),
+    `export function serve(handler, opts = {}) {
+  globalThis.__edgeFunctionRegistry.register(handler, { public: opts.public ?? false });
+}
+`,
+  );
+  await Deno.writeTextFile(
+    join(tmp, "_shared", "profile-cache.ts"),
+    `const bootId = crypto.randomUUID();
+let calls = 0;
+export async function getCachedProfile(userId) {
+  calls++;
+  return { userId, bootId, calls };
+}
+export function invalidateProfile() {
+  calls = 0;
+}
+`,
+  );
+  await Deno.writeTextFile(
+    join(tmp, "needs-profile", "index.ts"),
+    `import { serve } from "../_shared/handler.ts";
+import { getCachedProfile } from "../_shared/profile-cache.ts";
+serve(async () => Response.json(await getCachedProfile("u1")), { public: true });
+`,
+  );
+
+  const child = new Deno.Command(Deno.execPath(), {
+    args: [
+      "run",
+      "--quiet",
+      "--allow-all",
+      "src/server.ts",
+      "--backend",
+      "workerd",
+      "--functions",
+      tmp,
+      "--port",
+      String(port),
+      "--host",
+      "127.0.0.1",
+      "--workerd-base-port",
+      String(workerdBasePort),
+      "--dev",
+    ],
+    cwd: PROJECT_ROOT,
+    env: {
+      ...Deno.env.toObject(),
+      "1TUBE_HMR": "0",
+      "1TUBE_LAZY": "0",
+    },
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+
+  const teePump = (async () => {
+    const reader = child.stderr.getReader();
+    const dec = new TextDecoder();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        Deno.stderr.writeSync(new TextEncoder().encode(dec.decode(value).replace(/^/gm, "   ⏵ ")));
+      }
+    } catch { /* */ }
+  })();
+  const stdoutPump = (async () => {
+    const reader = child.stdout.getReader();
+    try { while (true) { const { done } = await reader.read(); if (done) break; } } catch { /* */ }
+  })();
+
+  try {
+    await waitForGateway(port, 60_000);
+    const first = await fetch(`http://127.0.0.1:${port}/functions/v1/needs-profile`, {
+      cache: "no-store",
+    });
+    assertEquals(first.status, 200);
+    const firstBody = await first.json();
+    assertEquals(firstBody.userId, "u1");
+    assertEquals(firstBody.calls, 1);
+
+    const second = await fetch(`http://127.0.0.1:${port}/functions/v1/needs-profile`, {
+      cache: "no-store",
+    });
+    assertEquals(second.status, 200);
+    const secondBody = await second.json();
+    assertEquals(secondBody.bootId, firstBody.bootId);
+    assertEquals(secondBody.calls, 2);
+  } finally {
+    try { child.kill(Deno.build.os === "windows" ? "SIGKILL" : "SIGTERM"); } catch { /* */ }
+    try {
+      await Promise.race([
+        child.status,
+        new Promise((r) => setTimeout(r, 2_000)),
+      ]);
+    } catch { /* */ }
+    try { child.kill("SIGKILL"); } catch { /* */ }
+    await teePump.catch(() => {});
+    await stdoutPump.catch(() => {});
+    await Deno.remove(tmp, { recursive: true }).catch(() => {});
+  }
+});
+
 /**
  * M4: end-to-end HMR test against a real workerd subprocess.
  *
@@ -370,7 +511,8 @@ Deno.test("workerd-e2e: HMR rebundles + swaps without dropping requests", E2E_OP
     return;
   }
 
-  const port = await freePort();
+  const port = freePort();
+  const workerdBasePort = freeWorkerdBasePort();
   // Build a minimal playground copy with just `hello` and the
   // shared handler — keeps the workerd boot under 5s on warm caches
   // by avoiding the full bundle sweep we do in the main e2e test.
@@ -405,6 +547,8 @@ Deno.test("workerd-e2e: HMR rebundles + swaps without dropping requests", E2E_OP
       String(port),
       "--host",
       "127.0.0.1",
+      "--workerd-base-port",
+      String(workerdBasePort),
       "--dev",
       "--hmr",
     ],
@@ -521,7 +665,8 @@ Deno.test("workerd-e2e: gateway auto-recovers when workerd is killed externally"
     return;
   }
 
-  const port = await freePort();
+  const port = freePort();
+  const workerdBasePort = freeWorkerdBasePort();
   const playgroundDir = join(PROJECT_ROOT, "playground");
   const internalKey = "test-internal-key-deadbeef";
 
@@ -539,6 +684,8 @@ Deno.test("workerd-e2e: gateway auto-recovers when workerd is killed externally"
       String(port),
       "--host",
       "127.0.0.1",
+      "--workerd-base-port",
+      String(workerdBasePort),
       "--dev",
     ],
     cwd: PROJECT_ROOT,

@@ -36,16 +36,25 @@ import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
 import { type AuthContext } from "../../registry.ts";
 import { type FunctionManifest, loadManifest } from "../../manifest.ts";
 import {
+  bundleSharedModule,
   type BundleResult,
   type Bundler,
   createBundler,
   discoverEntrypoints,
+  discoverSharedModules,
 } from "./bundler.ts";
 import {
   parsePrebuiltManifest,
   type PrebuiltManifest,
 } from "./prebuilt.ts";
 import { type CapnpRoute, generateCapnp } from "./capnp.ts";
+import {
+  SHARED_RUNTIME_TOKEN_ENV,
+  SHARED_RUNTIME_URL_ENV,
+  startWorkerdSharedRuntime,
+  type SharedRuntimeModule,
+  type WorkerdSharedRuntime,
+} from "./shared-runtime.ts";
 import {
   createWorkerdProcess,
   isCompatDateAtMost,
@@ -134,6 +143,14 @@ export interface WorkerdBackendOptions {
    * error rather than silently running modified code.
    */
   prebuiltDir?: string;
+  /**
+   * Source modules that should run once in the gateway process and be
+   * consumed from workerd isolates via generated RPC stubs. Paths are
+   * resolved relative to `functionsDir` unless absolute. The
+   * Supabase-style `_shared/profile-cache.ts` module is included by
+   * convention when present, even if this list is empty.
+   */
+  sharedModulePaths?: readonly string[];
   /**
    * Names of env vars to forward to every function via workerd's
    * `fromEnvironment` bindings. Each listed name appears under
@@ -402,33 +419,6 @@ export function probeSocketsFree(
   return conflicts;
 }
 
-/**
- * Try to kill leftover `workerd` processes by image name and return
- * the result for the caller to log + decide whether to retry the
- * preflight. We deliberately use a name-based hammer (`taskkill /F /IM
- * workerd.exe` on Windows, `pkill -9 workerd` on Unix) instead of
- * resolving port → PID and `kill`-ing that PID specifically.
- *
- * Why the broad-but-typed approach is the safer one:
- *   - Resolving port → PID requires either parsing `netstat`/`lsof`
- *     output (brittle across platforms and locales) or shelling out
- *     to PowerShell on Windows (slow first-run cost). Both can return
- *     stale or empty results during the small window the kernel keeps
- *     a `TIME_WAIT` socket bound.
- *   - "Kill anything by PID that holds this port" is the dangerous
- *     primitive. We'd happily kill `nginx`, `node`, or another team's
- *     container if their port mapping happened to collide with our
- *     8800. That's a worse outcome than failing the preflight loudly.
- *   - "Kill by image name `workerd`" can only ever affect processes
- *     the operator already owns and named `workerd`. If it's the wrong
- *     workerd (e.g. another 1tube gateway in the same dev box), the
- *     operator has explicitly opted in and asked for it — that's a
- *     conscious tradeoff for "make it Just Work in dev".
- *
- * Always opt-in. Off by default everywhere. When off, the preflight
- * just throws and the operator runs the kill command from the error
- * message themselves.
- */
 export interface KillStaleResult {
   /** Whether we attempted a kill at all (false ⇒ no platform support). */
   attempted: boolean;
@@ -438,7 +428,80 @@ export interface KillStaleResult {
   code?: number;
   /** Captured stderr (truncated), useful when the kill failed. */
   stderr?: string;
+  /** Human-readable stdout for targeted port cleanup. */
+  stdout?: string;
 }
+
+/**
+ * Kill only workerd processes that own the specific conflicted ports.
+ * This is the safe first choice for flashing: if a zombie candidate
+ * still owns 8800, remove that exact process; if nginx/node/etc. owns
+ * the port, leave it alone and let the preflight error explain the
+ * non-workerd conflict.
+ */
+export async function killWorkerdOwnersOfPorts(
+  conflicts: readonly PortConflict[],
+): Promise<KillStaleResult> {
+  if (conflicts.length === 0) return { attempted: false };
+  if (Deno.build.os !== "windows") {
+    // Keep POSIX on the existing typed name-based path; resolving
+    // port->pid portably needs lsof/ss/netstat variants that are not
+    // guaranteed on minimal server images.
+    return { attempted: false };
+  }
+
+  const ports = [...new Set(conflicts.map((c) => c.port))].map(String);
+  const script = `
+$ErrorActionPreference = 'Continue'
+$ports = @(${ports.map((p) => `'${p.replaceAll("'", "''")}'`).join(",")})
+$killed = @()
+$skipped = @()
+foreach ($port in $ports) {
+  $conns = Get-NetTCPConnection -LocalPort ([int]$port) -ErrorAction SilentlyContinue |
+    Where-Object { $_.State -eq 'Listen' }
+  foreach ($conn in $conns) {
+    $proc = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+    if ($null -eq $proc) { continue }
+    if ($proc.ProcessName -ieq 'workerd') {
+      Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+      $killed += "$($proc.Id):$($proc.ProcessName):$port"
+    } else {
+      $skipped += "$($proc.Id):$($proc.ProcessName):$port"
+    }
+  }
+}
+Write-Output ("killed=" + ($killed -join ","))
+if ($skipped.Count -gt 0) { Write-Output ("skipped=" + ($skipped -join ",")) }
+`;
+
+  const cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script];
+  try {
+    const { code, stdout, stderr } = await new Deno.Command(cmd[0], {
+      args: cmd.slice(1),
+      stdout: "piped",
+      stderr: "piped",
+    }).output();
+    return {
+      attempted: true,
+      command: cmd.slice(0, 4),
+      code,
+      stdout: new TextDecoder().decode(stdout).slice(0, 800),
+      stderr: new TextDecoder().decode(stderr).slice(0, 800),
+    };
+  } catch (err) {
+    return {
+      attempted: false,
+      command: cmd.slice(0, 4),
+      stderr: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Fallback: kill leftover `workerd` processes by image name. This is
+ * still opt-in via --kill-stale-workerd, and only runs after targeted
+ * port-owner cleanup fails to clear the conflict.
+ */
 
 export async function killStaleWorkerd(): Promise<KillStaleResult> {
   // Windows ships taskkill in System32, available on every supported
@@ -796,6 +859,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       : resolvePath(cwd, opts.prebuiltDir))
     : null;
   let prebuiltManifest: PrebuiltManifest | null = null;
+  let sharedRuntime: WorkerdSharedRuntime | null = null;
 
   /**
    * Shared boot pipeline used by both `start()` and `reload()`.
@@ -824,7 +888,13 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     gen: number;
     rebundleOnly?: ReadonlySet<string>;
   }): Promise<{
-    process: WorkerdProcess;
+    /**
+     * `null` only on the "empty functions dir" boot path. The gateway
+     * is still healthy and serving — every /functions/v1/* request
+     * gets a 503 from `dispatch` until functions appear (typically
+     * via a firmware upload promoting a new prebuilt artifact).
+     */
+    process: WorkerdProcess | null;
     routesByName: Map<string, CapnpRoute>;
     names: string[];
     manifests: Map<string, FunctionManifest>;
@@ -848,6 +918,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     }
 
     let bundleResults: BundleResult[];
+    const sharedModules: SharedRuntimeModule[] = [];
     // Names of functions that were actually rebuilt this pass (vs.
     // passed-through from a previous bundle on disk). Reported back
     // to the caller for the WorkerdReloadResult; prebuilt mode never
@@ -887,6 +958,13 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         byteLength: e.bundleBytes,
         durationMs: 0,
       }));
+      for (const shared of prebuiltManifest.sharedModules) {
+        sharedModules.push({
+          id: shared.id,
+          bundlePath: join(cacheDir!, shared.bundleFile),
+          exportNames: shared.exportNames,
+        });
+      }
     } else {
       let inputs = await discoverEntrypoints(resolvedFunctionsDir);
       if (opts.only && opts.only.length > 0) {
@@ -899,14 +977,44 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         }
       }
       if (inputs.length === 0) {
-        throw new Error(`workerd backend: no functions found under ${resolvedFunctionsDir}`);
+        // Empty functions dir is a legitimate state — typically a
+        // fresh deployment that hasn't received its first firmware
+        // upload yet. Booting the gateway with an empty function set
+        // (no workerd subprocess, no capnp config, no bundles) lets
+        // /1tube/api/firmware/upload accept the first artifact while
+        // /functions/v1/* responds with a clear 503 instead of the
+        // host crash-looping. A subsequent firmware promote spawns a
+        // new gateway with --prebuilt pointing at the unpacked
+        // artifact, so this instance never has to "transition" out
+        // of empty mode — it just gets retired by the side-by-side
+        // swap.
+        if (args.gen === 0) {
+          console.log(
+            `[1tube] workerd backend: no functions found under ${resolvedFunctionsDir} — ` +
+              `gateway will return 503 for /functions/v1/* until a firmware artifact is promoted`,
+          );
+        }
+        return {
+          process: null,
+          routesByName: new Map(),
+          names: [],
+          manifests: new Map(),
+          rebundled: [],
+          bundleResults: [],
+        };
       }
+
+      const discoveredSharedModules = await discoverSharedModules(
+        resolvedFunctionsDir,
+        opts.sharedModulePaths ?? [],
+      );
 
       if (!bundler) {
         bundler = createBundler({
           outDir: cacheDir,
           configPath,
           sourcemap: opts.sourcemap ?? "linked",
+          sharedModules: discoveredSharedModules,
         });
       }
 
@@ -945,6 +1053,14 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
           byteLength: 0,
           durationMs: 0,
         });
+      }
+      for (const module of discoveredSharedModules) {
+        const shared = await bundleSharedModule({
+          module,
+          outDir: join(cacheDir, "shared"),
+          configPath,
+        });
+        sharedModules.push(shared);
       }
     }
 
@@ -1070,14 +1186,31 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       // and avoids surprising operators who flip enforcement on after
       // shipping for a while.
       const enforceManifest = (Deno.env.get("1TUBE_ENFORCE_MANIFEST") ?? "") === "1";
+      const prebuiltBundleFiles = prebuiltManifest
+        ? new Map(prebuiltManifest.functions.map((e) => [e.name, e.bundleFile]))
+        : null;
+      if (!sharedRuntime && sharedModules.length > 0) {
+        sharedRuntime = await startWorkerdSharedRuntime(sharedModules);
+      }
+      const internalEnvBindings = sharedRuntime
+        ? [SHARED_RUNTIME_URL_ENV, SHARED_RUNTIME_TOKEN_ENV]
+        : [];
       const capnpInputs = bundleResults.map((r) => {
         const m = newManifests.get(r.name)!;
+        const bundleEmbedPath = prebuiltBundleFiles?.get(r.name) ??
+          r.bundlePath.split(/[\\/]/).pop()!;
+        const fnEnvBindings = intersectEnvForFunction(envBindings, m.permissions.env, enforceManifest);
+        for (const internalName of internalEnvBindings) {
+          if (!fnEnvBindings.includes(internalName)) fnEnvBindings.push(internalName);
+        }
         return {
           name: r.name,
-          // bundlePath is absolute; capnp embeds use a basename relative
-          // to the capnp file, which we write next to the bundles.
-          bundleBasename: r.bundlePath.split(/[\\/]/).pop()!,
-          envBindings: intersectEnvForFunction(envBindings, m.permissions.env, enforceManifest),
+          // Live mode writes capnp next to the bundles, so basename is
+          // enough. Prebuilt artifacts keep bundles under dist/functions/
+          // and capnp is written at dist/, so use the manifest-relative
+          // path ("functions/<fn>.js") or workerd cannot resolve embeds.
+          bundleBasename: bundleEmbedPath,
+          envBindings: fnEnvBindings,
         };
       });
 
@@ -1095,6 +1228,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         basePort: shiftedBasePort,
         compatibilityDate: effectiveCompatDate,
         compatibilityFlags: opts.compatibilityFlags,
+        allowLocalOutbound: sharedRuntime !== null,
       });
       // Per-generation capnp filename so a crashed reload can't leave
       // an old process pointed at a half-written config.
@@ -1116,17 +1250,42 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       if (args.gen === 0) {
         let conflicts = probeSocketsFree(capnp.routes);
         if (conflicts.length > 0 && opts.killStaleWorkerd) {
-          // Operator opted in. Try the name-based hammer, give the
-          // kernel a moment to release the sockets (TIME_WAIT etc.),
-          // and re-probe. We only retry once: a second conflict after
-          // a successful kill means the offender wasn't a workerd we
-          // could clean up — and the operator wants the original
-          // error in that case, not an infinite loop.
           console.log(
             `[1tube] port preflight found ${conflicts.length} conflict(s); ` +
               `--kill-stale-workerd is set, attempting cleanup...`,
           );
-          const result = await killStaleWorkerd();
+
+          // First try the precise fix: resolve the conflicted port(s)
+          // to their owning PID(s), and kill only owners named workerd.
+          // That is the behavior we want during firmware flashing:
+          // remove the stale candidate that owns 8800, but never kill
+          // a random non-workerd process that happens to be there.
+          const targeted = await killWorkerdOwnersOfPorts(conflicts);
+          if (targeted.attempted) {
+            if (targeted.code === 0) {
+              const details = targeted.stdout?.trim();
+              console.log(
+                `[1tube] targeted stale-workerd cleanup by port complete` +
+                  (details ? ` (${details})` : "") +
+                  `; re-probing...`,
+              );
+            } else {
+              console.warn(
+                `[1tube] targeted stale-workerd cleanup exited ${targeted.code}` +
+                  (targeted.stderr ? `: ${targeted.stderr.trim()}` : ""),
+              );
+            }
+            await new Promise((r) => setTimeout(r, 250));
+            conflicts = probeSocketsFree(capnp.routes);
+          }
+
+          // If targeted cleanup did not exist on this platform, or it
+          // found no matching workerd owner, fall back to the old typed
+          // process-name cleanup.
+          const result = conflicts.length > 0 ? await killStaleWorkerd() : null;
+          if (result === null) {
+            // Already clear.
+          } else
           if (result.attempted) {
             // taskkill returns 128 when no matching image is running —
             // that's not an error in our context (means the offender
@@ -1184,6 +1343,13 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         capnpPath,
         routes: capnp.routes,
         extraArgs,
+        env: sharedRuntime
+          ? {
+            ...Deno.env.toObject(),
+            [SHARED_RUNTIME_URL_ENV]: sharedRuntime.url,
+            [SHARED_RUNTIME_TOKEN_ENV]: sharedRuntime.token,
+          }
+          : undefined,
         logLineSink: opts.logLineSink,
       });
       try {
@@ -1332,8 +1498,10 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
 
       // Subscribe to the new process's onExit AFTER it's installed
       // so the crash handler's `process !== proc` guard sees a
-      // consistent state.
-      wireCrashHandler(result.process);
+      // consistent state. (Empty-mode reload is a contradiction in
+      // terms — reload presupposes a previous non-empty boot — but
+      // we null-guard anyway for symmetry with start().)
+      if (result.process) wireCrashHandler(result.process);
 
       const newSet = new Set(result.names);
       const added = result.names.filter((n) => !oldNames.has(n));
@@ -1470,6 +1638,31 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
             );
           }
         }
+        for (const e of prebuiltManifest.sharedModules) {
+          const bundlePath = join(prebuiltDir, e.bundleFile);
+          let bytes: Uint8Array;
+          try {
+            bytes = await Deno.readFile(bundlePath);
+          } catch (err) {
+            started = false;
+            const msg = err instanceof Error ? err.message : String(err);
+            throw new Error(
+              `workerd backend cannot start: prebuilt shared module ${bundlePath} unreadable (${msg}). ` +
+                `Re-run \`1tube build\`.`,
+            );
+          }
+          const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+          const view = new Uint8Array(digest);
+          let got = "";
+          for (let i = 0; i < view.length; i++) got += view[i].toString(16).padStart(2, "0");
+          if (got !== e.bundleSha256) {
+            started = false;
+            throw new Error(
+              `workerd backend cannot start: prebuilt shared module "${e.id}" failed integrity check ` +
+                `(expected ${e.bundleSha256}, got ${got}). Bundle has been modified or is corrupt.`,
+            );
+          }
+        }
         console.log(
           `[1tube] prebuilt artifact: ${prebuiltManifest.functions.length} function(s), ` +
             `${prebuiltManifest.builtBy}, built ${prebuiltManifest.builtAt} (schema ${prebuiltManifest.schema})`,
@@ -1505,13 +1698,19 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
           bundleBytes.set(r.name, r.byteLength);
         }
         generation = 0;
-        wireCrashHandler(result.process);
+        // `result.process` is null on the "empty functions dir" boot
+        // path; nothing to crash, nothing to wire.
+        if (result.process) wireCrashHandler(result.process);
       } catch (err) {
         // Initial boot failed — we never reached a started state, so
         // tear down whatever we did create (the bundler) and rethrow.
         if (bundler) {
           await bundler.dispose().catch(() => {});
           bundler = null;
+        }
+        if (sharedRuntime) {
+          await sharedRuntime.stop().catch(() => {});
+          sharedRuntime = null;
         }
         process = null;
         started = false;
@@ -1538,7 +1737,24 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
 
     async dispatch(req, fnName, auth, signal) {
       if (!process) {
-        throw new Error("workerd backend not started");
+        // Empty-mode: gateway started without a workerd subprocess
+        // because the functions dir was empty. Tell the caller that
+        // the surface is not yet provisioned — distinct from a
+        // routing 404 (function genuinely doesn't exist) so the
+        // operator can see the difference in logs.
+        return new Response(
+          JSON.stringify({
+            error:
+              "1tube: no functions are currently loaded. Upload a firmware artifact via /1tube/api/firmware/upload to provision the gateway.",
+          }),
+          {
+            status: 503,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": "30",
+            },
+          },
+        );
       }
       const route = routesByName.get(fnName);
       if (!route) {
@@ -1566,9 +1782,13 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       try {
         if (process) await process.stop();
       } finally {
+        if (sharedRuntime) {
+          await sharedRuntime.stop().catch(() => {});
+        }
         if (bundler) {
           await bundler.dispose().catch(() => {});
         }
+        sharedRuntime = null;
         bundler = null;
         process = null;
         manifests.clear();

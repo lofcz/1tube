@@ -12,10 +12,10 @@
  *    auto-allocated from a configurable base. The 1tube gateway uses the
  *    returned route map to proxy `/functions/v1/<name>` to the right
  *    socket; user traffic never reaches workerd directly.
- *  - Embeds each function's bundle by basename (`embed "<name>.js"`),
- *    so the caller is responsible for writing the capnp file in the
- *    same directory as the bundles. We assert that contract instead of
- *    silently producing broken paths.
+ *  - Embeds each function's bundle by a path relative to the capnp file
+ *    (`embed "<name>.js"` in live mode, `embed "functions/<name>.js"` for
+ *    prebuilt artifacts). We assert that contract instead of silently
+ *    producing broken paths.
  *  - Pins `compatibilityDate = "2024-09-23"` by default — the date when
  *    `nodejs_compat_v2` became the default flag. This is stable across
  *    every modern workerd build and gives function code the broadest
@@ -46,17 +46,16 @@ const ENV_VAR_NAME_RX = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * binary is older than this date.
  */
 const DEFAULT_COMPAT_DATE = "2026-04-25";
-const DEFAULT_COMPAT_FLAGS = ["nodejs_compat"] as const;
+const DEFAULT_COMPAT_FLAGS = ["nodejs_compat", "nodejs_compat_populate_process_env"] as const;
 
 export interface CapnpFunctionInput {
   /** Function name. Must match `[A-Za-z][A-Za-z0-9_-]*`. */
   name: string;
   /**
-   * Relative basename of the bundle file, as the capnp file will see it
-   * after being written to disk (e.g. `"hello.js"`). Must not contain
-   * path separators, double quotes, or backslashes — workerd's `embed`
-   * directive interprets the value as a path relative to the capnp
-   * file, not as an arbitrary string.
+   * Relative path of the bundle file, as the capnp file will see it
+   * after being written to disk (e.g. `"hello.js"` or
+   * `"functions/hello.js"`). Must stay inside the capnp directory tree:
+   * no absolute paths, backslashes, quotes, empty segments, or `..`.
    */
   bundleBasename: string;
   /**
@@ -102,6 +101,12 @@ export interface CapnpOptions {
   compatibilityDate?: string;
   /** Compatibility flags applied to every service. */
   compatibilityFlags?: readonly string[];
+  /**
+   * Permit global fetch/connect to loopback addresses in addition to
+   * public internet. Used when function bundles need to call the
+   * gateway-owned shared runtime over 127.0.0.1.
+   */
+  allowLocalOutbound?: boolean;
 }
 
 export interface CapnpRoute {
@@ -143,25 +148,25 @@ function validateServiceName(name: string): string {
 }
 
 /**
- * Validate a bundle basename for use in `embed "..."`. Workerd's capnp
- * parser interprets the value as a filesystem path, so any character
- * that would break shell-style path resolution (`"`, `\`) or any path
- * separator is rejected. The basename must also be non-empty and not
- * traverse upwards.
+ * Validate a bundle path for use in `embed "..."`. Workerd's capnp
+ * parser interprets the value as a filesystem path relative to the
+ * capnp file, so reject anything that could escape that directory or
+ * depend on platform-specific path separators.
  */
-function validateBundleBasename(basename: string): string {
-  if (!basename || basename.includes("/") || basename.includes("\\")) {
+function validateBundleEmbedPath(path: string): string {
+  if (!path || path.includes("\\") || path.includes('"')) {
     throw new Error(
-      `bundle basename must be a plain filename, got ${JSON.stringify(basename)}`,
+      `bundle embed path must be a relative POSIX path, got ${JSON.stringify(path)}`,
     );
   }
-  if (basename.includes('"')) {
-    throw new Error(`bundle basename must not contain '"': ${JSON.stringify(basename)}`);
+  if (path.startsWith("/") || path.startsWith("./") || path.endsWith("/")) {
+    throw new Error(`bundle embed path must be relative, got ${JSON.stringify(path)}`);
   }
-  if (basename === "." || basename === "..") {
-    throw new Error(`bundle basename must not be '.' or '..'`);
+  const segments = path.split("/");
+  if (segments.some((s) => s === "" || s === "." || s === "..")) {
+    throw new Error(`bundle embed path must not contain empty, '.' or '..' segments: ${JSON.stringify(path)}`);
   }
-  return basename;
+  return path;
 }
 
 /**
@@ -288,9 +293,19 @@ export function generateCapnp(
     };
   });
 
+  const outboundService = opts.allowLocalOutbound
+    ? `  (
+    name = "internet",
+    network = (
+      allow = ["public", "local"],
+      tlsOptions = (trustBrowserCas = true)
+    )
+  )`
+    : null;
+
   const serviceBlocks: string[] = inputs.map((input, idx) => {
     const route = routes[idx];
-    const basename = validateBundleBasename(input.bundleBasename);
+    const bundlePath = validateBundleEmbedPath(input.bundleBasename);
     const compatDate = input.compatibilityDate
       ? validateCompatDate(input.compatibilityDate)
       : globalDate;
@@ -319,7 +334,7 @@ export function generateCapnp(
     name = "${route.service}",
     worker = (
       modules = [
-        (name = "worker", esModule = embed "${basename}")
+        (name = "worker", esModule = embed "${bundlePath}")
       ],
       compatibilityDate = ${capnpString(compatDate)},
       ${flagsLine}${bindingsLine}
@@ -348,7 +363,7 @@ using Workerd = import "/workerd/workerd.capnp";
 
 const config :Workerd.Config = (
   services = [
-${serviceBlocks.join(",\n")}
+${[outboundService, ...serviceBlocks].filter(Boolean).join(",\n")}
   ],
   sockets = [
 ${socketBlocks.join(",\n")}

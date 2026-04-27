@@ -430,8 +430,17 @@ Add the `OneTube` NuGet package to your ASP.NET project:
 ```csharp
 services.AddOneTube(options =>
 {
-    options.ProjectPath = "/path/to/1tube";
-    options.FunctionsPath = "/path/to/supabase/functions";
+    // Path to the edge functions directory. Absolute, or relative
+    // to AppContext.BaseDirectory (the host's bin/).
+    options.FunctionsPath = "supabase/functions";
+
+    // Binaries — absolute, relative to AppContext.BaseDirectory,
+    // or bare names (PATH lookup). On servers, drop deno/workerd
+    // next to the published host and use relative paths so the
+    // deploy is reproducible.
+    options.DenoBinary = "onetube-bin/deno.exe";
+    options.WorkerdBinary = "onetube-bin/workerd.exe";
+
     options.Port = 3100;
     options.EnvVars = new()
     {
@@ -443,5 +452,7 @@ services.AddOneTube(options =>
 // In the pipeline, after UseRouting:
 app.MapOneTube(port: 3100);
 ```
+
+The OneTube package ships the gateway TypeScript sources alongside the DLL (under `OneTubeGateway/` in the host's output directory), so you do **not** need a 1tube checkout on the production host — only the `deno` and `workerd` binaries you point at via `DenoBinary` / `WorkerdBinary`.
 
 This spawns the Deno gateway as a managed child process with health monitoring and auto-restart, and forwards `/functions/v1/*` via YARP zero-copy proxying.

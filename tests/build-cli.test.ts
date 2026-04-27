@@ -94,6 +94,54 @@ Deno.test("build() bakes envAllowlist + compatibility settings into the manifest
   assertEquals(m.envAllowlist, ["MY_VAR", "OTHER"]);
 });
 
+Deno.test("build() packages default shared profile module metadata", TEST_OPTS, async () => {
+  const root = await Deno.makeTempDir({ prefix: "1tube-build-shared-src-" });
+  const out = await tmpOutDir("shared");
+  try {
+    await Deno.mkdir(join(root, "_shared"), { recursive: true });
+    await Deno.mkdir(join(root, "needs-profile"), { recursive: true });
+    await Deno.writeTextFile(
+      join(root, "_shared", "profile-cache.ts"),
+      `const bootId = crypto.randomUUID();
+export async function getCachedProfile(userId: string) {
+  return { userId, bootId };
+}
+export function invalidateProfile(_userId: string) {}
+`,
+    );
+    await Deno.writeTextFile(
+      join(root, "_shared", "handler.ts"),
+      `export function serve(handler: (req: Request) => Response | Promise<Response>) {
+  (globalThis as { __edgeFunctionRegistry: { register: (h: unknown, m: unknown) => void } })
+    .__edgeFunctionRegistry.register(handler, { public: true });
+}
+`,
+    );
+    await Deno.writeTextFile(
+      join(root, "needs-profile", "index.ts"),
+      `import { serve } from "../_shared/handler.ts";
+import { getCachedProfile } from "../_shared/profile-cache.ts";
+serve(async () => Response.json(await getCachedProfile("u1")));
+`,
+    );
+
+    await build({
+      functionsDir: root,
+      outDir: out,
+      only: ["needs-profile"],
+      sourcemap: false,
+    });
+    const m = parsePrebuiltManifest(JSON.parse(await Deno.readTextFile(join(out, "manifest.json"))));
+    assertEquals(m.sharedModules.length, 1);
+    assertEquals(m.sharedModules[0].id, "profile-cache");
+    assertEquals(m.sharedModules[0].exportNames, ["getCachedProfile", "invalidateProfile"]);
+    await Deno.stat(join(out, m.sharedModules[0].bundleFile));
+  } finally {
+    await Deno.remove(root, { recursive: true }).catch(() => {});
+    await Deno.remove(out, { recursive: true }).catch(() => {});
+  }
+});
+
 Deno.test("build() throws on unknown function name in --only", TEST_OPTS, async () => {
   const out = await tmpOutDir("only-miss");
   await assertRejects(

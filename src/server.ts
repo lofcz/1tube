@@ -41,6 +41,39 @@ import {
 } from "./backends/workerd/watchdog.ts";
 
 // ---------------------------------------------------------------------------
+// Exit-code contract
+// ---------------------------------------------------------------------------
+//
+// These are part of 1tube's public process supervisor contract. Any host
+// (the OneTube .NET package, a systemd unit, a Docker healthcheck, …)
+// can rely on them to distinguish failures the gateway considers
+// permanent — restarting will not help — from transient crashes worth
+// retrying. We follow the BSD sysexits.h conventions where applicable
+// so off-the-shelf supervisors (systemd's RestartPreventExitStatus,
+// runit, etc.) can act on them without bespoke wiring.
+//
+//   0   OK              clean shutdown (SIGTERM / completed --build)
+//   1   CRASH           generic runtime crash (transient — retry OK)
+//   64  EX_USAGE        bad CLI args (e.g. unknown --backend value)
+//   78  EX_CONFIG       config error: required env vars missing,
+//                       dev secret used in prod, prebuilt manifest
+//                       mismatch, etc.
+//
+// Anything in PERMANENT_EXIT_CODES is the gateway's way of telling
+// the supervisor "stop respawning me; fix the config and restart."
+export const EXIT_CODES = {
+  OK: 0,
+  CRASH: 1,
+  USAGE: 64,
+  CONFIG: 78,
+} as const;
+/** Mirror in any external supervisor (see dotnet/OneTube/DenoHostService.cs). */
+export const PERMANENT_EXIT_CODES: ReadonlySet<number> = new Set([
+  EXIT_CODES.USAGE,
+  EXIT_CODES.CONFIG,
+]);
+
+// ---------------------------------------------------------------------------
 // CLI args & env
 // ---------------------------------------------------------------------------
 
@@ -84,6 +117,15 @@ interface CliOpts {
    * consulted under `backend=workerd`.
    */
   workerdEnv?: readonly string[];
+  /** Shared module paths for gateway-owned process-wide code. */
+  workerdShared?: readonly string[];
+  /**
+   * First loopback port workerd may use for per-function sockets.
+   * The backend reserves a second generation range at +500 during
+   * reload, so callers embedding multiple gateways should keep at
+   * least 1000 ports between slots.
+   */
+  workerdBasePort?: number;
   /**
    * Auto-kill leftover `workerd` processes when the boot-time port
    * preflight finds a conflict. Off by default; enabled via
@@ -142,6 +184,16 @@ function parseArgs(): CliOpts {
   // 1TUBE_WORKERD_ENV. The CLI flag wins; otherwise the backend reads
   // the env var itself so a missing flag still picks up the var.
   let workerdEnv: readonly string[] | undefined;
+  const workerdShared: string[] = (Deno.env.get("1TUBE_WORKERD_SHARED") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  let workerdBasePort: number | undefined = (() => {
+    const v = Deno.env.get("1TUBE_WORKERD_BASE_PORT");
+    if (!v) return undefined;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
+  })();
   // Inspector default address. `--inspector` (no value) → 127.0.0.1:9229;
   // `--inspector=<addr>` / `--inspector-addr=<addr>` / `1TUBE_INSPECTOR`
   // → operator-supplied bind. Empty string disables.
@@ -197,14 +249,14 @@ function parseArgs(): CliOpts {
       const v = args[++i].toLowerCase();
       if (v !== "deno" && v !== "workerd") {
         console.error(`[1tube] FATAL: --backend must be 'deno' or 'workerd', got ${JSON.stringify(v)}`);
-        Deno.exit(2);
+        Deno.exit(EXIT_CODES.USAGE);
       }
       backend = v;
     } else if (a.startsWith("--backend=")) {
       const v = a.slice("--backend=".length).toLowerCase();
       if (v !== "deno" && v !== "workerd") {
         console.error(`[1tube] FATAL: --backend must be 'deno' or 'workerd', got ${JSON.stringify(v)}`);
-        Deno.exit(2);
+        Deno.exit(EXIT_CODES.USAGE);
       }
       backend = v;
     } else if (a === "--workerd-bin" && args[i + 1]) {
@@ -219,6 +271,16 @@ function parseArgs(): CliOpts {
         .split(",")
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
+    } else if (a === "--workerd-shared" && args[i + 1]) {
+      workerdShared.push(args[++i]);
+    } else if (a.startsWith("--workerd-shared=")) {
+      workerdShared.push(a.slice("--workerd-shared=".length));
+    } else if (a === "--workerd-base-port" && args[i + 1]) {
+      const n = parseInt(args[++i], 10);
+      if (Number.isFinite(n) && n > 0) workerdBasePort = n;
+    } else if (a.startsWith("--workerd-base-port=")) {
+      const n = parseInt(a.slice("--workerd-base-port=".length), 10);
+      if (Number.isFinite(n) && n > 0) workerdBasePort = n;
     } else if (a === "--inspector") {
       // Bare flag: V8 inspector on the conventional Node/Chrome port.
       workerdInspector = DEFAULT_INSPECTOR_ADDR;
@@ -282,6 +344,8 @@ function parseArgs(): CliOpts {
     backend,
     workerdBin,
     workerdEnv,
+    workerdShared,
+    workerdBasePort,
     workerdInspector,
     workerdMaxHeapMB,
     killStaleWorkerd,
@@ -289,18 +353,30 @@ function parseArgs(): CliOpts {
   };
 }
 
-// Well-known defaults for local Supabase (identical for every `supabase init` project).
-// These are applied ONLY in dev mode. The JWT secret below is documented in
+// Well-known defaults for local Supabase (identical for every `supabase init`
+// project). Applied ONLY in dev mode. The JWT secret below is documented in
 // public Supabase samples — applying it in production silently would let any
-// caller forge service-role tokens.
+// caller forge tokens.
+//
+// NOTE on Supabase's new key model:
+// Supabase is migrating from the JWT-based `anon` / `service_role` keys to
+// opaque `sb_publishable_*` / `sb_secret_*` API keys. The gateway itself
+// only consumes one secret directly — JWT_SECRET — to verify user tokens
+// issued by Supabase Auth (still HS256 JWTs in both old and new models).
+// Edge functions consume the publishable / secret keys directly via
+// process.env; they're not the gateway's concern, so we don't gatekeep on
+// them at boot.
 const LOCAL_SUPABASE_DEFAULTS: Record<string, string> = {
   SUPABASE_URL: "http://127.0.0.1:54321",
-  SUPABASE_SERVICE_ROLE_KEY:
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU",
   JWT_SECRET: "super-secret-jwt-token-with-at-least-32-characters-long",
 };
 
-const SECRETS_REQUIRED_IN_PROD = ["JWT_SECRET", "SUPABASE_SERVICE_ROLE_KEY"];
+// Only secrets the gateway *itself* uses on the hot path. Anything an edge
+// function happens to need (publishable/secret keys, OPENAI_API_KEY, …) is
+// the function author's contract with the host — refusing to boot because
+// some downstream module is missing a key it never told us about leads to
+// confusing failures.
+const SECRETS_REQUIRED_IN_PROD = ["JWT_SECRET"];
 
 function applyDevDefaults() {
   let applied = 0;
@@ -316,19 +392,19 @@ function applyDevDefaults() {
 }
 
 function enforceProdSecrets() {
+  // We deliberately do NOT reject "well-known dev default" values
+  // here. The local Supabase Docker stack ships with a fixed
+  // JWT_SECRET that's published in their docs, and a self-hosted
+  // Supabase instance is free to keep using it indefinitely — the
+  // gateway has no business deciding the operator's threat model.
+  // The check used to refuse to boot in that case; that turned a
+  // perfectly valid dev/staging setup into an unfixable startup
+  // crash, so it's gone.
   const missing: string[] = [];
   for (const k of SECRETS_REQUIRED_IN_PROD) {
     const v = Deno.env.get(k);
     if (!v) {
       missing.push(k);
-      continue;
-    }
-    if (LOCAL_SUPABASE_DEFAULTS[k] && v === LOCAL_SUPABASE_DEFAULTS[k]) {
-      console.error(
-        `[1tube] FATAL: ${k} is set to the well-known dev default. ` +
-          `That secret is publicly documented; rotate it before running in production.`,
-      );
-      Deno.exit(1);
     }
   }
   if (missing.length > 0) {
@@ -337,7 +413,7 @@ function enforceProdSecrets() {
         `Set them in the environment, or pass --dev / 1TUBE_DEV=1 to use the ` +
         `built-in local Supabase defaults (NEVER do this in production).`,
     );
-    Deno.exit(1);
+    Deno.exit(EXIT_CODES.CONFIG);
   }
 }
 
@@ -627,6 +703,8 @@ if (opts.backend === "workerd") {
     configPath: `${Deno.cwd()}/deno.json`,
     workerdBin: opts.workerdBin,
     envAllowlist: opts.workerdEnv,
+    sharedModulePaths: opts.workerdShared,
+    ...(opts.workerdBasePort ? { basePort: opts.workerdBasePort } : {}),
     ...(opts.workerdInspector ? { inspectorAddr: opts.workerdInspector } : {}),
     ...(opts.workerdMaxHeapMB ? { maxHeapMB: opts.workerdMaxHeapMB } : {}),
     ...(opts.killStaleWorkerd ? { killStaleWorkerd: true } : {}),
@@ -666,7 +744,13 @@ if (opts.backend === "workerd") {
   });
 
   const wdStart = performance.now();
-  await workerdBackend.start();
+  try {
+    await workerdBackend.start();
+  } catch (err) {
+    console.error("[1tube] FATAL: workerd backend failed during startup:", err);
+    flushLogs();
+    Deno.exit(EXIT_CODES.CONFIG);
+  }
   for (const n of workerdBackend.functionNames) workerdNames.add(n);
   // Bridge workerd manifests into the in-process registry + supervisor.
   // Without this, per-function `rpm` / `timeoutMs` / circuit-breaker

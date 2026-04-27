@@ -8,6 +8,8 @@
     "jsr:@std/internal@^1.0.12": "1.0.12",
     "jsr:@std/path@1": "1.1.4",
     "jsr:@std/path@^1.1.1": "1.1.4",
+    "jsr:@std/path@^1.1.4": "1.1.4",
+    "jsr:@zip-js/zip-js@^2.8.0": "2.8.26",
     "npm:@ai-sdk/mcp@0": "0.0.15_zod@3.25.76",
     "npm:@google/genai@1.39.0": "1.39.0",
     "npm:@supabase/supabase-js@2": "2.93.3",
@@ -38,7 +40,10 @@
       ]
     },
     "@std/fs@1.0.22": {
-      "integrity": "de0f277a58a867147a8a01bc1b181d0dfa80bfddba8c9cf2bacd6747bcec9308"
+      "integrity": "de0f277a58a867147a8a01bc1b181d0dfa80bfddba8c9cf2bacd6747bcec9308",
+      "dependencies": [
+        "jsr:@std/path@^1.1.4"
+      ]
     },
     "@std/internal@1.0.12": {
       "integrity": "972a634fd5bc34b242024402972cd5143eac68d8dffaca5eaa4dba30ce17b027"
@@ -48,6 +53,9 @@
       "dependencies": [
         "jsr:@std/internal"
       ]
+    },
+    "@zip-js/zip-js@2.8.26": {
+      "integrity": "2b78bfa2c5d43766c9a487fc0274981d45732de41bb5b82433d29d235be67191"
     }
   },
   "npm": {
@@ -851,6 +859,7 @@
       "jsr:@deno/esbuild-plugin@^1.2.0",
       "jsr:@std/assert@1",
       "jsr:@std/path@1",
+      "jsr:@zip-js/zip-js@^2.8.0",
       "npm:esbuild@0.28",
       "npm:hono@4"
     ],
