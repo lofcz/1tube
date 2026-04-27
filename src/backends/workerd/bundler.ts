@@ -288,6 +288,10 @@ export interface SharedBundleResult extends SharedRuntimeModule {
   durationMs: number;
 }
 
+export async function disposeBundlerResources(): Promise<void> {
+  await esbuild.stop();
+}
+
 function sharedModuleStubSource(module: WorkerdSharedModuleInput): string {
   const exports = module.exportNames.map((name) =>
     `export async function ${name}(...args) {

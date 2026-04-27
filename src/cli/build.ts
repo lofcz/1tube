@@ -38,6 +38,7 @@ import {
   bundleSharedModule,
   discoverEntrypoints,
   discoverSharedModules,
+  disposeBundlerResources,
 } from "../backends/workerd/bundler.ts";
 import { loadManifest } from "../manifest.ts";
 import {
@@ -156,7 +157,7 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
  * returning, even on failure — important on Windows where esbuild's
  * worker subprocess otherwise lingers and prevents `dist/` deletion.
  */
-export async function build(opts: BuildOptions): Promise<BuildResult> {
+async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
   const startedAt = performance.now();
   const cwd = Deno.cwd();
   const functionsDir = isAbsolute(opts.functionsDir)
@@ -355,6 +356,14 @@ Schema: ${PREBUILT_SCHEMA}.  Built by: ${manifest.builtBy} at ${manifest.builtAt
     chunkMinification: chunked.chunkMinification,
     sharedMinification,
   };
+}
+
+export async function build(opts: BuildOptions): Promise<BuildResult> {
+  try {
+    return await buildOnce(opts);
+  } finally {
+    await disposeBundlerResources().catch(() => {});
+  }
 }
 
 /**
