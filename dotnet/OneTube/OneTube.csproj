@@ -55,6 +55,9 @@
       <Pack>true</Pack>
       <PackagePath>contentFiles\any\any\OneTubeGateway\deno.json;content\OneTubeGateway\deno.json</PackagePath>
     </Content>
+    <None Include="buildTransitive\OneTube.targets"
+          Pack="true"
+          PackagePath="buildTransitive\OneTube.targets" />
     <None Include="..\..\README.md"
           Pack="true"
           PackagePath="\" />

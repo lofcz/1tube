@@ -1,0 +1,21 @@
+<Project>
+  <ItemGroup>
+    <_OneTubeGatewayFiles Include="$(MSBuildThisFileDirectory)..\contentFiles\any\any\OneTubeGateway\**\*.*" />
+  </ItemGroup>
+
+  <Target Name="CopyOneTubeGatewayToOutput"
+          AfterTargets="Build"
+          Condition="'@(_OneTubeGatewayFiles)' != '' and '$(TargetDir)' != ''">
+    <Copy SourceFiles="@(_OneTubeGatewayFiles)"
+          DestinationFiles="@(_OneTubeGatewayFiles->'$(TargetDir)OneTubeGateway\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyOneTubeGatewayToPublish"
+          AfterTargets="Publish"
+          Condition="'@(_OneTubeGatewayFiles)' != '' and '$(PublishDir)' != ''">
+    <Copy SourceFiles="@(_OneTubeGatewayFiles)"
+          DestinationFiles="@(_OneTubeGatewayFiles->'$(PublishDir)OneTubeGateway\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>

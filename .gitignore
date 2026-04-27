@@ -4,3 +4,4 @@ node_modules/
 /dotnet/OneTube/bin
 /dotnet/OneTube/obj
 /dotnet/OneTube/.idea
+/artifacts
