@@ -1,16 +1,19 @@
 name: Release
+run-name: Release ${{ inputs.publish_npm && inputs.publish_onetube_cs && 'npm + OneTube.cs' || inputs.publish_npm && 'npm' || inputs.publish_onetube_cs && 'OneTube.cs' || 'nothing selected' }} (${{ inputs.release_type }})
 
 on:
   workflow_dispatch:
     inputs:
-      target:
-        description: Release target
+      publish_npm:
+        description: Publish npm package
         required: true
-        default: npm
-        type: choice
-        options:
-          - npm
-          - onetube-cs
+        default: true
+        type: boolean
+      publish_onetube_cs:
+        description: Publish OneTube.cs NuGet package
+        required: true
+        default: false
+        type: boolean
       release_type:
         description: Release type
         required: true
@@ -22,12 +25,15 @@ on:
           - major
 
 jobs:
-  npm:
-    if: github.event.inputs.target == 'npm'
+  release:
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
+
+    env:
+      ONETUBE_CS_PROJECT_PATH: dotnet/OneTube/OneTube.csproj
+      ONETUBE_CS_TAG_PREFIX: onetube-cs-v
 
     steps:
       - name: Checkout
@@ -35,89 +41,68 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Validate target selection
+        if: ${{ !inputs.publish_npm && !inputs.publish_onetube_cs }}
+        run: |
+          echo "Select at least one release target."
+          exit 1
+
       - name: Setup Node.js
+        if: inputs.publish_npm
         uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
       - name: Setup Bun
+        if: inputs.publish_npm
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
       - name: Setup Deno
+        if: inputs.publish_npm
         uses: denoland/setup-deno@v2
         with:
           deno-version: "2.7.13"
 
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Typecheck
-        run: bun run typecheck
-
-      - name: Smoke test
-        run: bun run check
-
-      - name: Bump package version
-        id: version
-        run: |
-          npm version "${{ github.event.inputs.release_type }}" --no-git-tag-version
-          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
-
-      - name: Commit release version and create tag
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add package.json
-          git commit -m "chore: release v${{ steps.version.outputs.version }}"
-          git tag -a "v${{ steps.version.outputs.version }}" -m "Release v${{ steps.version.outputs.version }}"
-
-      - name: Publish to npm
-        run: npm publish --provenance --access public
-
-      - name: Push release commit and tag
-        run: git push --follow-tags
-
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          generate_release_notes: true
-
-  onetube-cs:
-    if: github.event.inputs.target == 'onetube-cs'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    env:
-      PROJECT_PATH: dotnet/OneTube/OneTube.csproj
-      PACKAGE_ID: OneTube
-      TAG_PREFIX: onetube-cs-v
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
       - name: Setup .NET
+        if: inputs.publish_onetube_cs
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.100"
 
-      - name: Bump package version
-        id: version
+      - name: Install npm dependencies
+        if: inputs.publish_npm
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck npm package
+        if: inputs.publish_npm
+        run: bun run typecheck
+
+      - name: Smoke test npm package
+        if: inputs.publish_npm
+        run: bun run check
+
+      - name: Bump npm package version
+        if: inputs.publish_npm
+        id: npm_version
+        run: |
+          npm version "${{ inputs.release_type }}" --no-git-tag-version
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "tag=v$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Bump OneTube.cs package version
+        if: inputs.publish_onetube_cs
+        id: onetube_cs_version
         shell: python
         run: |
           import os
           import re
           from pathlib import Path
 
-          project = Path(os.environ["PROJECT_PATH"])
-          release_type = "${{ github.event.inputs.release_type }}"
+          project = Path(os.environ["ONETUBE_CS_PROJECT_PATH"])
+          release_type = "${{ inputs.release_type }}"
           text = project.read_text(encoding="utf-8")
           match = re.search(r"<Version>([^<]+)</Version>", text)
           if not match:
@@ -144,35 +129,69 @@ jobs:
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
               fh.write(f"version={new_version}\n")
-              fh.write(f"tag={os.environ['TAG_PREFIX']}{new_version}\n")
+              fh.write(f"tag={os.environ['ONETUBE_CS_TAG_PREFIX']}{new_version}\n")
 
-      - name: Restore
-        run: dotnet restore "$PROJECT_PATH"
+      - name: Restore OneTube.cs
+        if: inputs.publish_onetube_cs
+        run: dotnet restore "$ONETUBE_CS_PROJECT_PATH"
 
-      - name: Build
-        run: dotnet build "$PROJECT_PATH" --configuration Release --no-restore
+      - name: Build OneTube.cs
+        if: inputs.publish_onetube_cs
+        run: dotnet build "$ONETUBE_CS_PROJECT_PATH" --configuration Release --no-restore
 
-      - name: Pack
-        run: dotnet pack "$PROJECT_PATH" --configuration Release --no-build --output nupkgs
+      - name: Pack OneTube.cs
+        if: inputs.publish_onetube_cs
+        run: dotnet pack "$ONETUBE_CS_PROJECT_PATH" --configuration Release --no-build --output nupkgs
 
       - name: Commit release version and create tag
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add "$PROJECT_PATH"
-          git commit -m "chore: release OneTube.cs v${{ steps.version.outputs.version }}"
-          git tag -a "${{ steps.version.outputs.tag }}" -m "Release OneTube.cs v${{ steps.version.outputs.version }}"
+          SUMMARY=""
+          if [ "${{ inputs.publish_npm }}" = "true" ]; then
+            git add package.json
+            SUMMARY="npm v${{ steps.npm_version.outputs.version }}"
+          fi
+          if [ "${{ inputs.publish_onetube_cs }}" = "true" ]; then
+            git add "$ONETUBE_CS_PROJECT_PATH"
+            if [ -n "$SUMMARY" ]; then
+              SUMMARY="$SUMMARY and OneTube.cs v${{ steps.onetube_cs_version.outputs.version }}"
+            else
+              SUMMARY="OneTube.cs v${{ steps.onetube_cs_version.outputs.version }}"
+            fi
+          fi
+          git commit -m "chore: release $SUMMARY"
+          if [ "${{ inputs.publish_npm }}" = "true" ]; then
+            git tag -a "${{ steps.npm_version.outputs.tag }}" -m "Release npm v${{ steps.npm_version.outputs.version }}"
+          fi
+          if [ "${{ inputs.publish_onetube_cs }}" = "true" ]; then
+            git tag -a "${{ steps.onetube_cs_version.outputs.tag }}" -m "Release OneTube.cs v${{ steps.onetube_cs_version.outputs.version }}"
+          fi
+
+      - name: Publish to npm
+        if: inputs.publish_npm
+        run: npm publish --provenance --access public
 
       - name: Publish to NuGet
+        if: inputs.publish_onetube_cs
         run: dotnet nuget push "nupkgs/*.nupkg" --source "https://api.nuget.org/v3/index.json" --api-key "${{ secrets.NUGET_API_KEY }}" --skip-duplicate
 
       - name: Push release commit and tag
         run: git push --follow-tags
 
-      - name: Create GitHub release
+      - name: Create npm GitHub release
+        if: inputs.publish_npm
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: OneTube.cs v${{ steps.version.outputs.version }}
+          tag_name: ${{ steps.npm_version.outputs.tag }}
+          name: npm v${{ steps.npm_version.outputs.version }}
+          generate_release_notes: true
+
+      - name: Create OneTube.cs GitHub release
+        if: inputs.publish_onetube_cs
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.onetube_cs_version.outputs.tag }}
+          name: OneTube.cs v${{ steps.onetube_cs_version.outputs.version }}
           files: nupkgs/*.nupkg
           generate_release_notes: true
