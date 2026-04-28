@@ -35,13 +35,29 @@ public static class FirmwareEndpoints
             }
 
             var actor = ctx.User?.Identity?.Name ?? "anon";
+            var force = IsTruthy(ctx.Request.Query["force"].ToString());
             try
             {
+                var contentSha = ctx.Request.Headers["X-1Tube-Content-Sha256"].ToString();
+                var packageSha = ctx.Request.Headers["X-1Tube-Package-Sha256"].ToString();
+                if (!force && (!string.IsNullOrWhiteSpace(contentSha) || !string.IsNullOrWhiteSpace(packageSha)))
+                {
+                    var skippedJobId = supervisor.CreateSkippedDuplicateJob(actor, contentSha, packageSha);
+                    if (skippedJobId is not null)
+                    {
+                        ctx.Response.StatusCode = StatusCodes.Status202Accepted;
+                        await ctx.Response.WriteAsJsonAsync(new { jobId = skippedJobId, skipped = true });
+                        return;
+                    }
+                }
+
                 var jobId = await supervisor.StageAsync(
                     ctx.Request.Body,
                     actor,
                     ctx.RequestAborted,
-                    ctx.Request.ContentLength);
+                    ctx.Request.ContentLength,
+                    force,
+                    contentSha);
                 ctx.Response.StatusCode = StatusCodes.Status202Accepted;
                 await ctx.Response.WriteAsJsonAsync(new { jobId });
             }
@@ -101,6 +117,69 @@ public static class FirmwareEndpoints
             return state is null ? Results.Ok(new { current = (string?)null, previous = (string?)null, history = Array.Empty<object>() }) : Results.Ok(state);
         });
 
+        group.MapGet("/diagnostics", async (
+            IGatewayDestinationProvider destinationProvider,
+            DenoHostService activeHost,
+            CancellationToken ct) =>
+        {
+            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var snapshot = host.GetProcessSnapshot();
+            return Results.Ok(new
+            {
+                gateway = GatewaySnapshot(host, snapshot),
+                binaries = await host.GetBinaryDiagnosticsAsync(ct),
+            });
+        });
+
+        group.MapPost("/gateway/start", async (
+            IGatewayDestinationProvider destinationProvider,
+            DenoHostService activeHost,
+            CancellationToken ct) =>
+        {
+            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            await host.StartAsync(ct);
+            return Results.Ok(new
+            {
+                gateway = GatewaySnapshot(host, host.GetProcessSnapshot()),
+            });
+        });
+
+        group.MapPost("/gateway/stop", async (
+            IGatewayDestinationProvider destinationProvider,
+            DenoHostService activeHost,
+            CancellationToken ct) =>
+        {
+            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            await host.StopAsync(ct);
+            return Results.Ok(new
+            {
+                gateway = GatewaySnapshot(host, host.GetProcessSnapshot()),
+            });
+        });
+
+        group.MapPost("/gateway/recycle", async (
+            IGatewayDestinationProvider destinationProvider,
+            DenoHostService activeHost,
+            CancellationToken ct) =>
+        {
+            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            if (!host.IsRunning)
+            {
+                return Results.Conflict(new { error = "gateway is not running" });
+            }
+
+            if (!await host.ProbeHealthAsync(ct))
+            {
+                return Results.Conflict(new { error = "gateway is not healthy" });
+            }
+
+            await host.RecycleAsync(ct);
+            return Results.Ok(new
+            {
+                gateway = GatewaySnapshot(host, host.GetProcessSnapshot()),
+            });
+        });
+
         // ── POST rollback ─────────────────────────────────────────
         group.MapPost("/rollback", async (HttpContext ctx, FirmwareSupervisor supervisor) =>
         {
@@ -128,6 +207,40 @@ public static class FirmwareEndpoints
 
         return endpoints;
     }
+
+    private static bool IsTruthy(string? value)
+        => string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+
+    private static DenoHostService ResolveActiveDenoHost(
+        IGatewayDestinationProvider destinationProvider,
+        DenoHostService fallback)
+        => destinationProvider.GetActive() as DenoHostService ?? fallback;
+
+    private static object GatewaySnapshot(DenoHostService host, GatewayProcessSnapshot? snapshot)
+        => new
+        {
+            label = host.Label,
+            host.Port,
+            host.Host,
+            host.DestinationBaseUrl,
+            host.IsRunning,
+            host.StartedAt,
+            host.RestartCount,
+            host.IsPermanentlyUnavailable,
+            process = snapshot is null
+                ? null
+                : new
+                {
+                    snapshot.Pid,
+                    snapshot.Name,
+                    snapshot.WorkingSetBytes,
+                    snapshot.PrivateMemoryBytes,
+                    totalProcessorTimeMs = snapshot.TotalProcessorTime.TotalMilliseconds,
+                    snapshot.SampledAtUtc,
+                },
+        };
 
     private static async IAsyncEnumerable<SseItem<object>> StreamJobAsync(
         string jobId,

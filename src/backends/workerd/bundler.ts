@@ -290,6 +290,12 @@ export interface SharedBundleResult extends SharedRuntimeModule {
 
 export async function disposeBundlerResources(): Promise<void> {
   await esbuild.stop();
+  // esbuild.stop() tears down the service process synchronously from
+  // esbuild's point of view, but Deno's node:child_process shim settles
+  // the underlying spawn wait op on the next turn. Let that completion
+  // run before sanitizer-enabled tests assert that no child process
+  // resources remain.
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function sharedModuleStubSource(module: WorkerdSharedModuleInput): string {

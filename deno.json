@@ -16,6 +16,7 @@
     "@std/assert": "jsr:@std/assert@^1",
     "hono": "npm:hono@4",
     "esbuild": "npm:esbuild@^0.28",
+    "es-module-lexer": "npm:es-module-lexer@^2",
     "@deno/esbuild-plugin": "jsr:@deno/esbuild-plugin@^1.2",
     "@zip-js/zip-js": "jsr:@zip-js/zip-js@^2.8"
   },

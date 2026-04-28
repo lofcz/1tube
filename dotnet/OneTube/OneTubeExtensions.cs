@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Console;
 using Microsoft.Extensions.Options;
 using OneTube.Firmware;
 using OneTube.Secrets;
@@ -50,6 +51,23 @@ public static class OneTubeExtensions
         // safe default for any deployment that doesn't use firmware.
         services.TryAddSingleton<IGatewayDestinationProvider>(sp =>
             new SingleHostDestinationProvider(sp.GetRequiredService<IGatewayHost>()));
+
+        // YARP's direct forwarder logs every proxied request/response
+        // at Information. OneTube emits a shorter operator-facing
+        // request line below, so keep YARP internals quiet unless
+        // something is actually wrong.
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<ILoggerProvider, OneTubeConsoleLoggerProvider>());
+        services.AddLogging(builder =>
+        {
+            builder.AddFilter("Yarp.ReverseProxy.Forwarder.HttpForwarder", LogLevel.Warning);
+            builder.AddFilter<ConsoleLoggerProvider>(typeof(DenoHostService).FullName!, LogLevel.None);
+            builder.AddFilter<ConsoleLoggerProvider>("OneTube.Proxy", LogLevel.None);
+        });
+        services.Configure<SimpleConsoleFormatterOptions>(options =>
+        {
+            options.SingleLine = true;
+            options.TimestampFormat = "";
+        });
 
         services.AddHttpForwarder();
         return services;
@@ -192,6 +210,7 @@ public static class OneTubeExtensions
     {
         var forwarder = app.Services.GetRequiredService<IHttpForwarder>();
         var destinationProvider = app.Services.GetRequiredService<IGatewayDestinationProvider>();
+        var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("OneTube.Proxy");
 
         var httpClient = new HttpMessageInvoker(new SocketsHttpHandler
         {
@@ -222,6 +241,12 @@ public static class OneTubeExtensions
                 });
                 return;
             }
+
+            logger.LogInformation(
+                "[1tube] {Method} {Path}{QueryString}",
+                context.Request.Method,
+                context.Request.Path,
+                context.Request.QueryString);
 
             var error = await forwarder.SendAsync(
                 context,

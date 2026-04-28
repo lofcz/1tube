@@ -40,6 +40,9 @@ namespace OneTube.Firmware;
 /// </summary>
 public sealed class FirmwareSupervisor : IHostedService
 {
+    private const int FileSystemRetryCount = 24;
+    private const int FileSystemInitialRetryDelayMs = 50;
+
     private readonly OneTubeOptions _oneTubeOptions;
     private readonly FirmwareOptions _firmwareOptions;
     private readonly ILogger<FirmwareSupervisor> _logger;
@@ -50,6 +53,8 @@ public sealed class FirmwareSupervisor : IHostedService
     private readonly byte[] _signingKey;
     private readonly SemaphoreSlim _stagingLock = new(1, 1);
     private readonly ConcurrentDictionary<string, FirmwareJob> _jobs = new();
+
+    public event Action<FirmwareJob>? JobChanged;
 
     /// <summary>
     /// The currently in-flight (non-terminal) job. Mutated only by
@@ -162,11 +167,15 @@ public sealed class FirmwareSupervisor : IHostedService
         {
             foreach (var stale in Directory.EnumerateDirectories(_layout.IncomingDir))
             {
-                try { Directory.Delete(stale, recursive: true); }
+                try { DeleteDirectoryBestEffort(stale); }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "[1tube/firmware] failed to wipe orphaned {Dir}", stale);
                 }
+            }
+            foreach (var stale in Directory.EnumerateDirectories(_layout.VersionsDir, "*.staging-*"))
+            {
+                DeleteDirectoryBestEffort(stale);
             }
         }
         catch (DirectoryNotFoundException) { /* fresh install, fine */ }
@@ -206,6 +215,47 @@ public sealed class FirmwareSupervisor : IHostedService
 
     public FirmwareState? GetState() => FirmwareStateStore.TryRead(_layout);
 
+    public string? CreateSkippedDuplicateJob(string actor, string? contentSha256, string? packageSha256)
+    {
+        var state = FirmwareStateStore.TryRead(_layout);
+        if (state?.Current is not { Length: > 0 } current)
+        {
+            return null;
+        }
+
+        var activeContentSha = state.CurrentContentSha256;
+        var activePackageSha = state.CurrentPackageSha256;
+        var duplicateByContent = !string.IsNullOrWhiteSpace(contentSha256) &&
+            !string.IsNullOrWhiteSpace(activeContentSha) &&
+            string.Equals(contentSha256, activeContentSha, StringComparison.OrdinalIgnoreCase);
+        var duplicateByPackage = !string.IsNullOrWhiteSpace(packageSha256) &&
+            !string.IsNullOrWhiteSpace(activePackageSha) &&
+            string.Equals(packageSha256, activePackageSha, StringComparison.OrdinalIgnoreCase);
+        if (!duplicateByContent && !duplicateByPackage) return null;
+
+        var jobId = Guid.NewGuid().ToString("N");
+        var job = new FirmwareJob
+        {
+            JobId = jobId,
+            Actor = actor,
+            Version = current,
+            State = FirmwareJobState.Skipped,
+            PackageSha256 = activePackageSha,
+            ContentSha256 = activeContentSha,
+            UploadedBytes = 0,
+            TotalBytes = 0,
+            Message = duplicateByContent
+                ? $"identical firmware content already active ({activeContentSha})"
+                : $"identical firmware package already active ({activePackageSha})",
+        };
+        job.Timings.ReceivedAtUtc = DateTime.UtcNow.ToString("O");
+        job.Timings.UploadMs = 0;
+        job.Timings.TotalMs = 0;
+        _jobs[jobId] = job;
+        NotifyJobChanged(job);
+        return jobId;
+    }
+
     /// <summary>
     /// Result of attempting to pre-empt an in-flight job with a new
     /// upload. <see cref="StageAsync"/> uses this to decide whether
@@ -244,9 +294,12 @@ public sealed class FirmwareSupervisor : IHostedService
         Stream payloadStream,
         string actor,
         CancellationToken cancellationToken,
-        long? totalBytes = null)
+        long? totalBytes = null,
+        bool force = false,
+        string? contentSha256 = null)
     {
-        var job = CreateStageJob(actor, totalBytes ?? (payloadStream.CanSeek ? payloadStream.Length : null));
+        var job = CreateStageJob(actor, totalBytes ?? (payloadStream.CanSeek ? payloadStream.Length : null), force);
+        job.ContentSha256 = string.IsNullOrWhiteSpace(contentSha256) ? null : contentSha256;
         try
         {
             await CopyPayloadAsync(job, payloadStream, cancellationToken);
@@ -269,9 +322,9 @@ public sealed class FirmwareSupervisor : IHostedService
     /// upload progress immediately instead of waiting for the browser to
     /// finish sending a large .1tube file.
     /// </summary>
-    public string BeginStageAsync(Stream payloadStream, string actor, long? totalBytes, CancellationToken cancellationToken)
+    public string BeginStageAsync(Stream payloadStream, string actor, long? totalBytes, CancellationToken cancellationToken, bool force = false)
     {
-        var job = CreateStageJob(actor, totalBytes);
+        var job = CreateStageJob(actor, totalBytes, force);
         _ = Task.Run(async () =>
         {
             try
@@ -299,7 +352,7 @@ public sealed class FirmwareSupervisor : IHostedService
         return job.JobId;
     }
 
-    private FirmwareJob CreateStageJob(string actor, long? totalBytes)
+    private FirmwareJob CreateStageJob(string actor, long? totalBytes, bool force)
     {
         // Refuse-or-pre-empt decision made BEFORE we touch disk so a
         // mid-promote upload doesn't leave a half-written
@@ -324,11 +377,13 @@ public sealed class FirmwareSupervisor : IHostedService
             Actor = actor,
             TotalBytes = totalBytes,
             UploadedBytes = 0,
+            Force = force,
             Message = "waiting for upload",
         };
         job.Timings.ReceivedAtUtc = DateTime.UtcNow.ToString("O");
         _jobs[jobId] = job;
         Interlocked.Exchange(ref _activeJob, job);
+        NotifyJobChanged(job);
 
         Directory.CreateDirectory(_layout.IncomingDirFor(jobId));
         return job;
@@ -344,25 +399,29 @@ public sealed class FirmwareSupervisor : IHostedService
         var ct = linkedCts.Token;
         var buffer = new byte[1024 * 1024];
         long uploaded = 0;
+        using var hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var lastPublish = Stopwatch.StartNew();
         while (true)
         {
             var read = await payloadStream.ReadAsync(buffer.AsMemory(0, buffer.Length), ct);
             if (read == 0) break;
             await fs.WriteAsync(buffer.AsMemory(0, read), ct);
+            hasher.AppendData(buffer.AsSpan(0, read));
             uploaded += read;
             job.UploadedBytes = uploaded;
             if (lastPublish.ElapsedMilliseconds >= 200)
             {
                 job.UpdatedAtUtc = DateTime.UtcNow;
+                NotifyJobChanged(job);
                 lastPublish.Restart();
             }
         }
         await fs.FlushAsync(ct);
         sw.Stop();
         job.UploadedBytes = uploaded;
+        job.PackageSha256 = Convert.ToHexString(hasher.GetHashAndReset()).ToLowerInvariant();
         job.Timings.UploadMs = sw.ElapsedMilliseconds;
-        Update(job, FirmwareJobState.Uploaded, "upload complete");
+        Update(job, FirmwareJobState.Uploaded, $"upload complete · sha256={job.PackageSha256[..12]}…");
     }
 
     private void CancelUpload(FirmwareJob job)
@@ -372,6 +431,27 @@ public sealed class FirmwareSupervisor : IHostedService
         job.Error = "upload aborted by client";
         job.Message = job.Error;
         job.UpdatedAtUtc = DateTime.UtcNow;
+        NotifyJobChanged(job);
+    }
+
+    private string? TryGetDuplicateActiveVersion(FirmwareJob job)
+    {
+        var state = FirmwareStateStore.TryRead(_layout);
+        if (state?.Current is not { Length: > 0 } current) return null;
+        if (!Directory.Exists(_layout.VersionDir(current))) return null;
+
+        if (!string.IsNullOrWhiteSpace(job.ContentSha256) &&
+            state.CurrentContentSha256 is { Length: > 0 } activeContentSha &&
+            string.Equals(job.ContentSha256, activeContentSha, StringComparison.OrdinalIgnoreCase))
+        {
+            return current;
+        }
+
+        return !string.IsNullOrWhiteSpace(job.PackageSha256) &&
+               state.CurrentPackageSha256 is { Length: > 0 } activePackageSha &&
+               string.Equals(job.PackageSha256, activePackageSha, StringComparison.OrdinalIgnoreCase)
+            ? current
+            : null;
     }
 
     /// <summary>
@@ -430,6 +510,7 @@ public sealed class FirmwareSupervisor : IHostedService
         job.Timings.ReceivedAtUtc = DateTime.UtcNow.ToString("O");
         _jobs[jobId] = job;
         Interlocked.Exchange(ref _activeJob, job);
+        NotifyJobChanged(job);
 
         _ = Task.Run(() => RunRollbackAsync(job, state.Previous), CancellationToken.None);
         await Task.CompletedTask;
@@ -451,56 +532,86 @@ public sealed class FirmwareSupervisor : IHostedService
             // any work on disk.
             if (ct.IsCancellationRequested) { Cancelled(job); return; }
 
-            string version;
-            try
+            string? version = TryGetDuplicateActiveVersion(job);
+            if (version is not null)
             {
-                // ── Unpack ───────────────────────────────────────────
-                Update(job, FirmwareJobState.Unpacking, "unpacking firmware zip");
-                var unpackSw = Stopwatch.StartNew();
-                UnpackPayload(job);
-                unpackSw.Stop();
-                job.Timings.UnpackMs = unpackSw.ElapsedMilliseconds;
-
-                // ── Verify ───────────────────────────────────────────
-                Update(job, FirmwareJobState.Verifying, "verifying envelope and bundle hashes");
-                var verifySw = Stopwatch.StartNew();
-                version = VerifyPayload(job);
-                ct.ThrowIfCancellationRequested();
                 job.Version = version;
-                verifySw.Stop();
-                job.Timings.VerifyMs = verifySw.ElapsedMilliseconds;
-                _logger.LogInformation(
-                    "[1tube/firmware] {JobId} verify ok · version={Version} · {Ms}ms",
-                    job.JobId, version, verifySw.ElapsedMilliseconds);
+                CleanupIncoming(job.JobId);
 
-                // ── Stage ────────────────────────────────────────────
-                Update(job, FirmwareJobState.Staging, "staging verified payload");
-                var stageSw = Stopwatch.StartNew();
-                StagePayload(job, version);
-                stageSw.Stop();
-                job.Timings.StageMs = stageSw.ElapsedMilliseconds;
+                if (!job.Force)
+                {
+                    job.Timings.StageMs = 0;
+                    Update(job, FirmwareJobState.Skipped, DuplicateMessage(job));
+                    _logger.LogInformation(
+                        "[1tube/firmware] {JobId} skipped identical active firmware · version={Version} · contentSha={ContentSha} · packageSha={PackageSha}",
+                        job.JobId, version, job.ContentSha256, job.PackageSha256);
+                    return;
+                }
+
                 _logger.LogInformation(
-                    "[1tube/firmware] {JobId} stage ok · {Ms}ms", job.JobId, stageSw.ElapsedMilliseconds);
-                // After stage, versions/<ver>/ exists on disk. A late
-                // cancellation here is still safe: we leave the
-                // version dir for operator inspection, same policy as
-                // a smoke-test failure.
-                ct.ThrowIfCancellationRequested();
+                    "[1tube/firmware] {JobId} force redeploy of identical active firmware · version={Version} · contentSha={ContentSha} · packageSha={PackageSha}",
+                    job.JobId, version, job.ContentSha256, job.PackageSha256);
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            else
             {
-                CleanupIncoming(job.JobId);
-                Cancelled(job);
-                return;
-            }
-            catch (Exception ex)
-            {
-                // Pre-stage failures clean up incoming/<jobId>/. The
-                // versions/<ver>/ tree is only created during Stage,
-                // so a failure before that point can't leak.
-                CleanupIncoming(job.JobId);
-                Fail(job, ex);
-                return;
+                try
+                {
+                    // ── Unpack ───────────────────────────────────────────
+                    Update(job, FirmwareJobState.Unpacking, "unpacking firmware zip");
+                    var unpackSw = Stopwatch.StartNew();
+                    UnpackPayload(job);
+                    unpackSw.Stop();
+                    job.Timings.UnpackMs = unpackSw.ElapsedMilliseconds;
+
+                    // ── Verify ───────────────────────────────────────────
+                    Update(job, FirmwareJobState.Verifying, "verifying envelope and bundle hashes");
+                    var verifySw = Stopwatch.StartNew();
+                    version = VerifyPayload(job);
+                    ct.ThrowIfCancellationRequested();
+                    job.Version = version;
+                    verifySw.Stop();
+                    job.Timings.VerifyMs = verifySw.ElapsedMilliseconds;
+                    if (!job.Force && TryGetDuplicateActiveVersion(job) is { } duplicateVersion)
+                    {
+                        job.Version = duplicateVersion;
+                        CleanupIncoming(job.JobId);
+                        job.Timings.StageMs = 0;
+                        Update(job, FirmwareJobState.Skipped, DuplicateMessage(job));
+                        return;
+                    }
+                    _logger.LogInformation(
+                        "[1tube/firmware] {JobId} verify ok · version={Version} · {Ms}ms",
+                        job.JobId, version, verifySw.ElapsedMilliseconds);
+
+                    // ── Stage ────────────────────────────────────────────
+                    Update(job, FirmwareJobState.Staging, "staging verified payload");
+                    var stageSw = Stopwatch.StartNew();
+                    StagePayload(job, version);
+                    stageSw.Stop();
+                    job.Timings.StageMs = stageSw.ElapsedMilliseconds;
+                    _logger.LogInformation(
+                        "[1tube/firmware] {JobId} stage ok · {Ms}ms", job.JobId, stageSw.ElapsedMilliseconds);
+                    // After stage, versions/<ver>/ exists on disk. A late
+                    // cancellation here is still safe: we leave the
+                    // version dir for operator inspection, same policy as
+                    // a smoke-test failure.
+                    ct.ThrowIfCancellationRequested();
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    CleanupIncoming(job.JobId);
+                    Cancelled(job);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // Pre-stage failures clean up incoming/<jobId>/. The
+                    // versions/<ver>/ tree is only created during Stage,
+                    // so a failure before that point can't leak.
+                    CleanupIncoming(job.JobId);
+                    Fail(job, ex);
+                    return;
+                }
             }
 
             // ── Smoke test ──────────────────────────────────────────
@@ -576,6 +687,7 @@ public sealed class FirmwareSupervisor : IHostedService
             totalSw.Stop();
             job.Timings.TotalMs = totalSw.ElapsedMilliseconds;
             job.UpdatedAtUtc = DateTime.UtcNow;
+            NotifyJobChanged(job);
             ClearActiveIf(job);
             job.Cts.Dispose();
             _stagingLock.Release();
@@ -640,6 +752,7 @@ public sealed class FirmwareSupervisor : IHostedService
             totalSw.Stop();
             job.Timings.TotalMs = totalSw.ElapsedMilliseconds;
             job.UpdatedAtUtc = DateTime.UtcNow;
+            NotifyJobChanged(job);
             ClearActiveIf(job);
             job.Cts.Dispose();
             _stagingLock.Release();
@@ -700,6 +813,10 @@ public sealed class FirmwareSupervisor : IHostedService
         // parse it ad-hoc here to avoid pulling Deno-specific types
         // into the C# package.
         VerifyBundleHashes(unpacked, manifestBytes);
+        if (!string.IsNullOrWhiteSpace(envelope.ContentSha256))
+        {
+            job.ContentSha256 = envelope.ContentSha256;
+        }
 
         return envelope.Version;
     }
@@ -812,12 +929,160 @@ public sealed class FirmwareSupervisor : IHostedService
             _logger.LogWarning(
                 "[1tube/firmware] replacing unpromoted stale versions/{Version} before re-stage",
                 version);
-            Directory.Delete(dest, recursive: true);
+            RemoveUnpromotedVersionDirectory(dest);
         }
 
         var unpacked = _layout.IncomingUnpacked(job.JobId);
-        // Move (rename) the entire unpacked tree. Same volume → atomic.
-        Directory.Move(unpacked, dest);
+        // Prefer a same-volume rename. If Windows/AV/indexers deny the
+        // directory move, copy directly into versions/<ver>/ instead of
+        // using another temp rename — the candidate gateway is spawned
+        // only after staging completes, so a direct copy is still safe.
+        try
+        {
+            RunWithFileSystemRetries(
+                $"move staged payload into versions/{version}",
+                () => Directory.Move(unpacked, dest));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(
+                ex,
+                "[1tube/firmware] direct stage move failed for {Version}; retrying with direct copy",
+                version);
+            RemoveUnpromotedVersionDirectory(dest);
+            CopyStagePayload(unpacked, dest);
+        }
+    }
+
+    private void CopyStagePayload(string unpacked, string dest)
+    {
+        try
+        {
+            CopyDirectory(unpacked, dest);
+            DeleteDirectoryBestEffort(unpacked);
+        }
+        catch
+        {
+            DeleteDirectoryBestEffort(dest);
+            throw;
+        }
+    }
+
+    private void CopyDirectory(string sourceDir, string destDir)
+    {
+        RunWithFileSystemRetries(
+            $"create directory {destDir}",
+            () => Directory.CreateDirectory(destDir));
+
+        foreach (var sourceFile in Directory.EnumerateFiles(sourceDir))
+        {
+            var fileName = Path.GetFileName(sourceFile);
+            var destFile = Path.Combine(destDir, fileName);
+            RunWithFileSystemRetries(
+                $"copy {sourceFile} to {destFile}",
+                () => File.Copy(sourceFile, destFile, overwrite: true));
+        }
+
+        foreach (var sourceSubdir in Directory.EnumerateDirectories(sourceDir))
+        {
+            var dirName = Path.GetFileName(sourceSubdir);
+            CopyDirectory(sourceSubdir, Path.Combine(destDir, dirName));
+        }
+    }
+
+    private void RemoveUnpromotedVersionDirectory(string path)
+    {
+        if (!Directory.Exists(path)) return;
+
+        try
+        {
+            DeleteDirectoryWithRetries(path);
+            return;
+        }
+        catch (Exception deleteEx) when (deleteEx is IOException or UnauthorizedAccessException)
+        {
+            var tombstone = path + ".delete-" + Guid.NewGuid().ToString("N");
+            _logger.LogWarning(
+                deleteEx,
+                "[1tube/firmware] could not delete stale {Path}; trying tombstone rename",
+                path);
+            RunWithFileSystemRetries(
+                $"rename stale version {path} to {tombstone}",
+                () => Directory.Move(path, tombstone));
+            DeleteDirectoryBestEffort(tombstone);
+        }
+    }
+
+    private void DeleteDirectoryBestEffort(string path)
+    {
+        try { DeleteDirectoryWithRetries(path); }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "[1tube/firmware] deferred cleanup for {Path}", path);
+        }
+    }
+
+    private void DeleteDirectoryWithRetries(string path)
+    {
+        if (!Directory.Exists(path)) return;
+        RunWithFileSystemRetries(
+            $"delete directory {path}",
+            () =>
+            {
+                ClearReadOnlyAttributes(path);
+                Directory.Delete(path, recursive: true);
+            });
+    }
+
+    private void RunWithFileSystemRetries(string operation, Action action)
+    {
+        var delayMs = FileSystemInitialRetryDelayMs;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                action();
+                return;
+            }
+            catch (Exception ex) when (
+                attempt < FileSystemRetryCount &&
+                ex is IOException or UnauthorizedAccessException)
+            {
+                if (attempt is 1 or 8 or 16)
+                {
+                    _logger.LogDebug(
+                        ex,
+                        "[1tube/firmware] filesystem operation blocked ({Operation}); retry {Attempt}/{Max}",
+                        operation,
+                        attempt,
+                        FileSystemRetryCount);
+                }
+                Thread.Sleep(delayMs);
+                delayMs = Math.Min(delayMs * 2, 1000);
+            }
+        }
+    }
+
+    private static void ClearReadOnlyAttributes(string path)
+    {
+        if (!Directory.Exists(path)) return;
+
+        foreach (var entry in Directory.EnumerateFileSystemEntries(path, "*", SearchOption.AllDirectories))
+        {
+            try
+            {
+                var attrs = File.GetAttributes(entry);
+                if ((attrs & FileAttributes.ReadOnly) != 0)
+                {
+                    File.SetAttributes(entry, attrs & ~FileAttributes.ReadOnly);
+                }
+            }
+            catch
+            {
+                // Best-effort normalization before delete; the retry
+                // wrapper decides whether the delete itself can proceed.
+            }
+        }
     }
 
     private async Task<DenoHostService> SpawnCandidateAsync(string version)
@@ -912,11 +1177,17 @@ public sealed class FirmwareSupervisor : IHostedService
         // back state.json if the post-write half explodes.
         var previousState = FirmwareStateStore.TryRead(_layout) ?? new FirmwareState();
 
+        var packageSha256 = job.PackageSha256 ?? ReadPackageSha256(version, previousState);
+        var contentSha256 = job.ContentSha256 ?? ReadContentSha256(version, previousState);
         var newState = new FirmwareState
         {
             SchemaVersion = FirmwareState.CurrentSchema,
             Current = version,
-            Previous = previousState.Current, // old current becomes previous
+            CurrentPackageSha256 = packageSha256,
+            CurrentContentSha256 = contentSha256,
+            Previous = string.Equals(previousState.Current, version, StringComparison.Ordinal)
+                ? previousState.Previous
+                : previousState.Current, // old current becomes previous unless this is a force redeploy
             History = new List<FirmwareHistoryEntry>(previousState.History)
             {
                 new()
@@ -924,6 +1195,8 @@ public sealed class FirmwareSupervisor : IHostedService
                     Version = version,
                     PromotedAt = DateTime.UtcNow.ToString("O"),
                     EnvelopeManifestSha256 = ReadEnvelopeManifestSha256(version),
+                    PackageSha256 = packageSha256,
+                    ContentSha256 = contentSha256,
                 },
             },
         };
@@ -1031,6 +1304,7 @@ public sealed class FirmwareSupervisor : IHostedService
         job.Timings.ReceivedAtUtc = DateTime.UtcNow.ToString("O");
         _jobs[jobId] = job;
         Interlocked.Exchange(ref _activeJob, job);
+        NotifyJobChanged(job);
 
         _ = Task.Run(() => RunReloadAsync(job, state.Current), CancellationToken.None);
         await Task.CompletedTask;
@@ -1096,6 +1370,7 @@ public sealed class FirmwareSupervisor : IHostedService
             totalSw.Stop();
             job.Timings.TotalMs = totalSw.ElapsedMilliseconds;
             job.UpdatedAtUtc = DateTime.UtcNow;
+            NotifyJobChanged(job);
             ClearActiveIf(job);
             job.Cts.Dispose();
             _stagingLock.Release();
@@ -1113,6 +1388,37 @@ public sealed class FirmwareSupervisor : IHostedService
         }
         catch { return ""; }
     }
+
+    private static string ReadPackageSha256(string version, FirmwareState state)
+    {
+        if (string.Equals(state.Current, version, StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(state.CurrentPackageSha256))
+        {
+            return state.CurrentPackageSha256;
+        }
+
+        return state.History
+            .LastOrDefault(x => string.Equals(x.Version, version, StringComparison.Ordinal))
+            ?.PackageSha256 ?? "";
+    }
+
+    private static string ReadContentSha256(string version, FirmwareState state)
+    {
+        if (string.Equals(state.Current, version, StringComparison.Ordinal) &&
+            !string.IsNullOrWhiteSpace(state.CurrentContentSha256))
+        {
+            return state.CurrentContentSha256;
+        }
+
+        return state.History
+            .LastOrDefault(x => string.Equals(x.Version, version, StringComparison.Ordinal))
+            ?.ContentSha256 ?? "";
+    }
+
+    private static string DuplicateMessage(FirmwareJob job)
+        => !string.IsNullOrWhiteSpace(job.ContentSha256)
+            ? $"identical firmware content already active ({job.ContentSha256})"
+            : $"identical firmware package already active ({job.PackageSha256})";
 
     // ── GC ──────────────────────────────────────────────────────────
 
@@ -1190,6 +1496,7 @@ public sealed class FirmwareSupervisor : IHostedService
         job.State = state;
         if (message is not null) job.Message = message;
         job.UpdatedAtUtc = DateTime.UtcNow;
+        NotifyJobChanged(job);
     }
 
     private void Cancelled(FirmwareJob job)
@@ -1198,6 +1505,7 @@ public sealed class FirmwareSupervisor : IHostedService
         job.Error = "pre-empted by a later upload or rollback";
         job.Message = job.Error;
         job.UpdatedAtUtc = DateTime.UtcNow;
+        NotifyJobChanged(job);
         _logger.LogInformation(
             "[1tube/firmware] {JobId} cancelled cleanly (pre-empted)", job.JobId);
     }
@@ -1208,8 +1516,26 @@ public sealed class FirmwareSupervisor : IHostedService
         job.Error = ex.Message;
         job.Message = ex.Message;
         job.UpdatedAtUtc = DateTime.UtcNow;
+        NotifyJobChanged(job);
         _logger.LogError(ex,
             "[1tube/firmware] {JobId} failed at {Stage}: {Message}",
             job.JobId, job.State, ex.Message);
+    }
+
+    private void NotifyJobChanged(FirmwareJob job)
+    {
+        var handlers = JobChanged;
+        if (handlers is null) return;
+
+        foreach (var subscriber in handlers.GetInvocationList())
+        {
+            if (subscriber is not Action<FirmwareJob> handler) continue;
+            try { handler(job); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "[1tube/firmware] job change subscriber failed for {JobId}", job.JobId);
+            }
+        }
     }
 }

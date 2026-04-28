@@ -53,6 +53,8 @@ export interface FirmwareEnvelope {
   createdBy: string;
   /** SHA-256 of `dist/manifest.json` bytes, lowercase hex. */
   manifestSha256: string;
+  /** Stable runtime-content fingerprint; excludes package/build metadata. */
+  contentSha256?: string;
   /** Number of functions in the inner manifest. Diagnostic. */
   functionCount: number;
   /** Sum of every bundle's byte length. Diagnostic. */
@@ -163,7 +165,11 @@ export async function signEnvelope(
     false,
     ["sign"],
   );
-  const sig = await crypto.subtle.sign("HMAC", cryptoKey, message as BufferSource);
+  const sig = await crypto.subtle.sign(
+    "HMAC",
+    cryptoKey,
+    message as BufferSource,
+  );
   return {
     ...unsigned,
     signature: {
@@ -252,7 +258,10 @@ export function parseEnvelope(raw: unknown): FirmwareEnvelope {
       throw new Error(`envelope.${k} missing or not a string`);
     }
   }
-  if (typeof o.functionCount !== "number" || typeof o.totalBundleBytes !== "number") {
+  if (
+    typeof o.functionCount !== "number" ||
+    typeof o.totalBundleBytes !== "number"
+  ) {
     throw new Error("envelope.functionCount / .totalBundleBytes missing");
   }
   return {
@@ -261,6 +270,9 @@ export function parseEnvelope(raw: unknown): FirmwareEnvelope {
     createdAt: o.createdAt as string,
     createdBy: o.createdBy as string,
     manifestSha256: o.manifestSha256 as string,
+    ...(typeof o.contentSha256 === "string" && o.contentSha256.length > 0
+      ? { contentSha256: o.contentSha256 }
+      : {}),
     functionCount: o.functionCount as number,
     totalBundleBytes: o.totalBundleBytes as number,
     signature: {

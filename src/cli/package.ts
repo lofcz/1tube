@@ -53,6 +53,7 @@ import {
   parsePrebuiltManifest,
   type PrebuiltManifest,
 } from "../backends/workerd/prebuilt.ts";
+import { computeFirmwareContentFingerprint } from "../firmware-content-hash.ts";
 import { VERSION } from "../version.ts";
 
 /**
@@ -326,6 +327,10 @@ export async function packageDist(
   const files = await collectDistFiles(distDir, manifest, opts.onProgress);
   const manifestEntry = files.find((f) => f.zipPath === "dist/manifest.json")!;
   const manifestSha256 = await sha256Hex(manifestEntry.bytes);
+  const contentFingerprint = await computeFirmwareContentFingerprint(
+    distDir,
+    manifest,
+  );
 
   const totalBundleBytes = manifest.functions.reduce(
     (acc, f) => acc + f.bundleBytes,
@@ -341,6 +346,7 @@ export async function packageDist(
     createdAt,
     createdBy: `1tube@${VERSION}`,
     manifestSha256,
+    contentSha256: contentFingerprint.sha256,
     functionCount: manifest.functions.length,
     totalBundleBytes,
   };
@@ -499,7 +505,12 @@ function makeProgressRenderer(): (e: PackageProgress) => void {
       : e.phase === "compress"
       ? "zipping"
       : "wrote";
-    const namePart = e.name ? ` ${truncateMiddle(e.name, 40)}` : "";
+    const displayName = e.phase === "finalize"
+      ? e.name
+      : e.name
+      ? truncateMiddle(e.name, 40)
+      : "";
+    const namePart = displayName ? ` ${displayName}` : "";
     const line = `[1tube package] ${tag} ${e.current}/${e.total}` +
       (pct ? ` (${pct})` : "") +
       ` ${sizeStr}${namePart}`;
@@ -675,7 +686,10 @@ export async function runPackage(args: string[]): Promise<number> {
     console.log(
       `[1tube package] envelope: ${result.envelope.functionCount} function(s), ` +
         `${fmt(result.envelope.totalBundleBytes)} bundle bytes, ` +
-        `manifest sha256=${result.envelope.manifestSha256.slice(0, 12)}…`,
+        `manifest sha256=${result.envelope.manifestSha256.slice(0, 12)}…, ` +
+        `content sha256=${
+          result.envelope.contentSha256?.slice(0, 12) ?? "<none>"
+        }…`,
     );
     return 0;
   } catch (err) {

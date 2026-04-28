@@ -19,6 +19,7 @@ public enum FirmwareJobState
     SmokeTesting,
     Promoting,
     Done,
+    Skipped,
     Failed,
     RolledBack,
     /// <summary>
@@ -39,6 +40,7 @@ public static class FirmwareJobStateExtensions
     public static bool IsTerminal(this FirmwareJobState s) => s switch
     {
         FirmwareJobState.Done or
+        FirmwareJobState.Skipped or
         FirmwareJobState.Failed or
         FirmwareJobState.RolledBack or
         FirmwareJobState.Cancelled => true,
@@ -54,6 +56,7 @@ public static class FirmwareJobStateExtensions
     /// </summary>
     public static bool IsPastCancellationDeadline(this FirmwareJobState s)
         => s is FirmwareJobState.Promoting or FirmwareJobState.Done
+              or FirmwareJobState.Skipped
               or FirmwareJobState.RolledBack or FirmwareJobState.Failed
               or FirmwareJobState.Cancelled;
 }
@@ -93,6 +96,9 @@ public sealed class FirmwareJob
     public string? Version { get; set; }
     public string? Error { get; set; }
     public string? Message { get; set; }
+    public string? PackageSha256 { get; set; }
+    public string? ContentSha256 { get; set; }
+    public bool Force { get; set; }
     public long? UploadedBytes { get; set; }
     public long? TotalBytes { get; set; }
     public FirmwareJobTimings Timings { get; init; } = new();
@@ -120,6 +126,9 @@ public sealed class FirmwareJob
         version = Version,
         error = Error,
         message = Message,
+        packageSha256 = PackageSha256,
+        contentSha256 = ContentSha256,
+        force = Force,
         uploadedBytes = UploadedBytes,
         totalBytes = TotalBytes,
         uploadPercent = TotalBytes is > 0 && UploadedBytes is long uploaded

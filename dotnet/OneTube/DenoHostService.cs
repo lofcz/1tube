@@ -5,6 +5,24 @@ using Microsoft.Extensions.Logging;
 
 namespace OneTube;
 
+public sealed record GatewayProcessSnapshot(
+    int Pid,
+    string Name,
+    long WorkingSetBytes,
+    long PrivateMemoryBytes,
+    TimeSpan TotalProcessorTime,
+    DateTime SampledAtUtc);
+
+public sealed record GatewayBinaryVersion(
+    string Name,
+    string? Path,
+    string? Version,
+    string? Error);
+
+public sealed record GatewayBinaryDiagnostics(
+    GatewayBinaryVersion Deno,
+    GatewayBinaryVersion Workerd);
+
 /// <summary>
 /// Manages the lifecycle of one OneTube gateway slot. The gateway
 /// itself is always Deno (<c>src/server.ts</c>); when
@@ -112,6 +130,30 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
     public bool IsRunning => _isRunning;
     public DateTime? StartedAt => _startedAt;
     public int RestartCount => _restartCount;
+    public bool IsPermanentlyUnavailable => _permanentlyUnavailable;
+    public GatewayProcessSnapshot? GetProcessSnapshot()
+    {
+        var process = _process;
+        if (process is null) return null;
+
+        try
+        {
+            if (process.HasExited) return null;
+            process.Refresh();
+            return new GatewayProcessSnapshot(
+                process.Id,
+                process.ProcessName,
+                process.WorkingSet64,
+                process.PrivateMemorySize64,
+                process.TotalProcessorTime,
+                DateTime.UtcNow);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public string LastStderrTailForDiagnostics
     {
         get
@@ -187,6 +229,9 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
         // (when used as such) is a no-op.
         if (_isRunning) return Task.CompletedTask;
 
+        _shuttingDown = false;
+        _permanentlyUnavailable = false;
+        InvalidateBinaryCache();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
@@ -217,6 +262,29 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
 
         KillProcess();
         _isRunning = false;
+    }
+
+    public async Task RecycleAsync(CancellationToken cancellationToken)
+    {
+        InvalidateBinaryCache();
+        await StopAsync(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
+        await StartAsync(cancellationToken);
+    }
+
+    public async Task<GatewayBinaryDiagnostics> GetBinaryDiagnosticsAsync(CancellationToken cancellationToken = default)
+    {
+        var denoPath = ResolveDenoBinary();
+        var workerdPath = ResolveWorkerdBinary();
+        return new GatewayBinaryDiagnostics(
+            await ProbeBinaryVersionAsync("deno", denoPath, "--version", cancellationToken),
+            await ProbeBinaryVersionAsync("workerd", workerdPath, "--version", cancellationToken));
+    }
+
+    public void InvalidateBinaryCache()
+    {
+        _denoExe = null;
+        _workerdExe = null;
     }
 
     public async Task<bool> ProbeHealthAsync(CancellationToken cancellationToken)
@@ -374,24 +442,100 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
 
     private bool ResolveBinariesIfNeeded()
     {
-        if (_denoExe is null)
-        {
-            _denoExe = BinaryResolver.Resolve(_options.DenoBinary, "deno", "Deno", _logger);
-            if (_denoExe is null) return false;
-            _logger.LogInformation("[1tube/{Slot}] Resolved deno binary: {Path}", _slot.Label, _denoExe);
-        }
+        if (_denoExe is null && ResolveDenoBinary() is null) return false;
 
         // Workerd is only required when actually running on workerd.
         // Resolving (and validating) it lazily means a Deno-backed
         // deploy doesn't need the binary on the host at all.
-        if (_options.Backend == OneTubeBackend.Workerd && _workerdExe is null)
-        {
-            _workerdExe = BinaryResolver.Resolve(_options.WorkerdBinary, "workerd", "Workerd", _logger);
-            if (_workerdExe is null) return false;
-            _logger.LogInformation("[1tube/{Slot}] Resolved workerd binary: {Path}", _slot.Label, _workerdExe);
-        }
+        if (_options.Backend == OneTubeBackend.Workerd && _workerdExe is null && ResolveWorkerdBinary() is null) return false;
 
         return true;
+    }
+
+    private string? ResolveDenoBinary()
+    {
+        if (_denoExe is not null) return _denoExe;
+
+        _denoExe = BinaryResolver.Resolve(_options.DenoBinary, "deno", "Deno", _logger);
+        if (_denoExe is not null)
+        {
+            _logger.LogInformation("[1tube/{Slot}] Resolved deno binary: {Path}", _slot.Label, _denoExe);
+        }
+        return _denoExe;
+    }
+
+    private string? ResolveWorkerdBinary()
+    {
+        if (_workerdExe is not null) return _workerdExe;
+
+        _workerdExe = BinaryResolver.Resolve(_options.WorkerdBinary, "workerd", "Workerd", _logger);
+        if (_workerdExe is not null)
+        {
+            _logger.LogInformation("[1tube/{Slot}] Resolved workerd binary: {Path}", _slot.Label, _workerdExe);
+        }
+        return _workerdExe;
+    }
+
+    private static async Task<GatewayBinaryVersion> ProbeBinaryVersionAsync(
+        string name,
+        string? path,
+        string arguments,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return new GatewayBinaryVersion(name, null, null, "binary not resolved");
+        }
+
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = path,
+                Arguments = arguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+
+            using var proc = Process.Start(startInfo);
+            if (proc is null)
+            {
+                return new GatewayBinaryVersion(name, path, null, "failed to start process");
+            }
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+
+            string stdout = await proc.StandardOutput.ReadToEndAsync(timeoutCts.Token);
+            string stderr = await proc.StandardError.ReadToEndAsync(timeoutCts.Token);
+            await proc.WaitForExitAsync(timeoutCts.Token);
+
+            string version = FirstNonEmptyLine(stdout) ?? FirstNonEmptyLine(stderr) ?? $"exit {proc.ExitCode}";
+            string? error = proc.ExitCode == 0 ? null : FirstNonEmptyLine(stderr) ?? $"exit {proc.ExitCode}";
+            return new GatewayBinaryVersion(name, path, version, error);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return new GatewayBinaryVersion(name, path, null, "version probe timed out");
+        }
+        catch (Exception ex)
+        {
+            return new GatewayBinaryVersion(name, path, null, ex.Message);
+        }
+    }
+
+    private static string? FirstNonEmptyLine(string value)
+    {
+        using var reader = new StringReader(value);
+        for (string? line = reader.ReadLine(); line is not null; line = reader.ReadLine())
+        {
+            line = line.Trim();
+            if (line.Length > 0) return line;
+        }
+
+        return null;
     }
 
     private void SpawnProcess()
@@ -481,18 +625,26 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
             _process.OutputDataReceived += (_, e) =>
             {
                 if (e.Data is null) return;
-                _logger.LogInformation("[1tube/{Slot}] {Line}", _slot.Label, e.Data);
+                _logger.LogInformation("[1tube] {Line}", NormalizeGatewayLogLine(e.Data));
             };
             _process.ErrorDataReceived += (_, e) =>
             {
                 if (e.Data is null) return;
-                _logger.LogWarning("[1tube/{Slot}] {Line}", _slot.Label, e.Data);
+                string line = NormalizeGatewayLogLine(e.Data);
+                if (IsGatewayErrorLine(line))
+                {
+                    _logger.LogWarning("[1tube] {Line}", line);
+                }
+                else
+                {
+                    _logger.LogInformation("[1tube] {Line}", line);
+                }
                 // Keep a bounded tail so a permanent-failure exit can
                 // re-print the gateway's own FATAL line(s) inline with
                 // our "stopped restarting" announcement.
                 lock (_stderrTailLock)
                 {
-                    _stderrTail.Enqueue(e.Data);
+                    _stderrTail.Enqueue(line);
                     while (_stderrTail.Count > StderrTailCapacity) _stderrTail.Dequeue();
                 }
             };
@@ -519,6 +671,40 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
         {
             _isRunning = false;
             StopOneTubeSlot($"failed to spawn gateway: {ex.Message}", null, ex);
+        }
+    }
+
+    private static bool IsGatewayErrorLine(string line)
+    {
+        return line.Contains("FATAL", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("ERROR", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("Unhandled", StringComparison.OrdinalIgnoreCase)
+            || line.Contains("panic", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeGatewayLogLine(string line)
+    {
+        var value = line;
+        while (true)
+        {
+            var prefixStart = 0;
+            while (prefixStart < value.Length && char.IsWhiteSpace(value[prefixStart]))
+            {
+                prefixStart++;
+            }
+
+            var prefixCandidate = value[prefixStart..];
+            if (prefixCandidate.StartsWith("[workerd]", StringComparison.OrdinalIgnoreCase))
+            {
+                value = prefixCandidate["[workerd]".Length..].TrimStart();
+                continue;
+            }
+            if (prefixCandidate.StartsWith("[1tube]", StringComparison.OrdinalIgnoreCase))
+            {
+                value = prefixCandidate["[1tube]".Length..].TrimStart();
+                continue;
+            }
+            return value;
         }
     }
 

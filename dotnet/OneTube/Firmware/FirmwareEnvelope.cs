@@ -38,6 +38,9 @@ public sealed class FirmwareEnvelope
     [JsonPropertyName("manifestSha256")]
     public string ManifestSha256 { get; set; } = "";
 
+    [JsonPropertyName("contentSha256")]
+    public string? ContentSha256 { get; set; }
+
     [JsonPropertyName("functionCount")]
     public int FunctionCount { get; set; }
 
@@ -158,6 +161,7 @@ public static class FirmwareEnvelopeVerifier
         // readable form.
         var node = new JsonObject
         {
+            ["contentSha256"]   = string.IsNullOrWhiteSpace(envelope.ContentSha256) ? null : envelope.ContentSha256,
             ["createdAt"]        = envelope.CreatedAt,
             ["createdBy"]        = envelope.CreatedBy,
             ["envelopeSchema"]   = envelope.EnvelopeSchema,
@@ -166,6 +170,10 @@ public static class FirmwareEnvelopeVerifier
             ["totalBundleBytes"] = envelope.TotalBundleBytes,
             ["version"]          = envelope.Version,
         };
+        if (node["contentSha256"] is null)
+        {
+            node.Remove("contentSha256");
+        }
         return node.ToJsonString(s_canonicalOpts);
     }
 

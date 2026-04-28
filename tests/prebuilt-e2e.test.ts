@@ -28,7 +28,7 @@ const PLAYGROUND = join(PROJECT_ROOT, "playground");
 const DENO_JSON = join(PROJECT_ROOT, "deno.json");
 const E2E_OPTS = { sanitizeOps: false, sanitizeResources: false } as const;
 
-async function freePort(): Promise<number> {
+function freePort(): number {
   const l = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const port = (l.addr as Deno.NetAddr).port;
   l.close();
@@ -42,7 +42,9 @@ function freeWorkerdBasePort(): number {
     const listeners: Deno.Listener[] = [];
     try {
       for (let offset = 0; offset < span; offset++) {
-        listeners.push(Deno.listen({ hostname: "127.0.0.1", port: base + offset }));
+        listeners.push(
+          Deno.listen({ hostname: "127.0.0.1", port: base + offset }),
+        );
       }
       return base;
     } catch {
@@ -58,7 +60,9 @@ async function waitForGateway(port: number, timeoutMs: number): Promise<void> {
   const deadline = performance.now() + timeoutMs;
   while (performance.now() < deadline) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/`, { cache: "no-store" });
+      const res = await fetch(`http://127.0.0.1:${port}/`, {
+        cache: "no-store",
+      });
       await res.body?.cancel();
       if (res.status > 0) return;
     } catch {
@@ -66,7 +70,9 @@ async function waitForGateway(port: number, timeoutMs: number): Promise<void> {
     }
     await new Promise((r) => setTimeout(r, 100));
   }
-  throw new Error(`gateway on :${port} did not become ready within ${timeoutMs}ms`);
+  throw new Error(
+    `gateway on :${port} did not become ready within ${timeoutMs}ms`,
+  );
 }
 
 async function workerdAvailable(): Promise<boolean> {
@@ -97,7 +103,8 @@ Deno.test(
       sourcemap: false,
     });
 
-    const port = await freePort();
+    const port = freePort();
+    const workerdBasePort = freeWorkerdBasePort();
     const child = new Deno.Command(Deno.execPath(), {
       args: [
         "run",
@@ -112,6 +119,8 @@ Deno.test(
         String(port),
         "--host",
         "127.0.0.1",
+        "--workerd-base-port",
+        String(workerdBasePort),
         "--dev",
       ],
       cwd: PROJECT_ROOT,
@@ -136,7 +145,9 @@ Deno.test(
           if (done) break;
           const chunk = dec.decode(value);
           bootLog += chunk;
-          Deno.stderr.writeSync(new TextEncoder().encode(chunk.replace(/^/gm, "   ⏵ ")));
+          Deno.stderr.writeSync(
+            new TextEncoder().encode(chunk.replace(/^/gm, "   ⏵ ")),
+          );
         }
       } catch { /* */ }
     })();
@@ -155,19 +166,25 @@ Deno.test(
     try {
       await waitForGateway(port, 30_000);
 
-      const helloRes = await fetch(`http://127.0.0.1:${port}/functions/v1/hello`, {
-        cache: "no-store",
-      });
+      const helloRes = await fetch(
+        `http://127.0.0.1:${port}/functions/v1/hello`,
+        {
+          cache: "no-store",
+        },
+      );
       assertEquals(helloRes.status, 200);
       const helloBody = await helloRes.json();
       assertEquals(helloBody.message, "hello, hello");
 
-      const echoRes = await fetch(`http://127.0.0.1:${port}/functions/v1/echo`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ a: 1 }),
-        cache: "no-store",
-      });
+      const echoRes = await fetch(
+        `http://127.0.0.1:${port}/functions/v1/echo`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ a: 1 }),
+          cache: "no-store",
+        },
+      );
       assertEquals(echoRes.status, 200);
       const echoed = await echoRes.json();
       assertEquals(echoed.body, { a: 1 });
@@ -207,8 +224,12 @@ Deno.test(
       return;
     }
 
-    const root = await Deno.makeTempDir({ prefix: "1tube-prebuilt-chunk-src-" });
-    const dist = await Deno.makeTempDir({ prefix: "1tube-prebuilt-chunk-dist-" });
+    const root = await Deno.makeTempDir({
+      prefix: "1tube-prebuilt-chunk-src-",
+    });
+    const dist = await Deno.makeTempDir({
+      prefix: "1tube-prebuilt-chunk-dist-",
+    });
     await Deno.mkdir(join(root, "_shared"), { recursive: true });
     await Deno.mkdir(join(root, "alpha"), { recursive: true });
     await Deno.mkdir(join(root, "beta"), { recursive: true });
@@ -221,7 +242,9 @@ Deno.test(
     );
     await Deno.writeTextFile(
       join(root, "_shared", "large-dep.ts"),
-      `export const payload = ${JSON.stringify("chunked-dependency-" + "x".repeat(4096))};
+      `export const payload = ${
+        JSON.stringify("chunked-dependency-" + "x".repeat(4096))
+      };
 export function answer(name) {
   return name + ":" + payload.slice(0, 18);
 }
@@ -232,7 +255,9 @@ export function answer(name) {
         join(root, name, "index.ts"),
         `import { serve } from "../_shared/handler.ts";
 import { answer } from "../_shared/large-dep.ts";
-serve(() => Response.json({ value: answer(${JSON.stringify(name)}) }), { public: true });
+serve(() => Response.json({ value: answer(${
+          JSON.stringify(name)
+        }) }), { public: true });
 `,
       );
     }
@@ -243,10 +268,12 @@ serve(() => Response.json({ value: answer(${JSON.stringify(name)}) }), { public:
       only: ["alpha", "beta"],
       sourcemap: false,
     });
-    const manifest = JSON.parse(await Deno.readTextFile(join(dist, "manifest.json")));
+    const manifest = JSON.parse(
+      await Deno.readTextFile(join(dist, "manifest.json")),
+    );
     assert(manifest.chunks.length > 0, "expected build to emit shared chunks");
 
-    const port = await freePort();
+    const port = freePort();
     const workerdBasePort = freeWorkerdBasePort();
     const child = new Deno.Command(Deno.execPath(), {
       args: [
@@ -287,7 +314,10 @@ serve(() => Response.json({ value: answer(${JSON.stringify(name)}) }), { public:
     try {
       await waitForGateway(port, 30_000);
       for (const name of ["alpha", "beta"]) {
-        const res = await fetch(`http://127.0.0.1:${port}/functions/v1/${name}`, { cache: "no-store" });
+        const res = await fetch(
+          `http://127.0.0.1:${port}/functions/v1/${name}`,
+          { cache: "no-store" },
+        );
         assertEquals(res.status, 200);
         const body = await res.json();
         assertEquals(body.value, `${name}:chunked-dependency`);

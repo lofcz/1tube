@@ -62,6 +62,19 @@ async function buildFixture(label: string): Promise<string> {
   return out;
 }
 
+async function copyDir(src: string, dest: string): Promise<void> {
+  await Deno.mkdir(dest, { recursive: true });
+  for await (const entry of Deno.readDir(src)) {
+    const from = join(src, entry.name);
+    const to = join(dest, entry.name);
+    if (entry.isDirectory) {
+      await copyDir(from, to);
+    } else if (entry.isFile) {
+      await Deno.copyFile(from, to);
+    }
+  }
+}
+
 async function buildSharedFixture(label: string): Promise<string> {
   const root = await Deno.makeTempDir({
     prefix: `1tube-pkg-shared-src-${label}-`,
@@ -103,6 +116,41 @@ serve(async () => Response.json(await getCachedProfile("u1")));
   });
   await Deno.remove(root, { recursive: true }).catch(() => {});
   return out;
+}
+
+async function buildMutableFixture(
+  label: string,
+  responseText: string,
+): Promise<{ root: string; dist: string }> {
+  const root = await Deno.makeTempDir({
+    prefix: `1tube-pkg-mutable-src-${label}-`,
+  });
+  const dist = await Deno.makeTempDir({
+    prefix: `1tube-pkg-mutable-build-${label}-`,
+  });
+  await Deno.mkdir(join(root, "_shared"), { recursive: true });
+  await Deno.mkdir(join(root, "hello"), { recursive: true });
+  await Deno.writeTextFile(
+    join(root, "_shared", "handler.ts"),
+    `export function serve(handler: (req: Request) => Response | Promise<Response>) {
+  (globalThis as { __edgeFunctionRegistry: { register: (h: unknown, m: unknown) => void } })
+    .__edgeFunctionRegistry.register(handler, { public: true });
+}
+`,
+  );
+  await Deno.writeTextFile(
+    join(root, "hello", "index.ts"),
+    `import { serve } from "../_shared/handler.ts";
+serve(() => new Response(${JSON.stringify(responseText)}));
+`,
+  );
+  await build({
+    functionsDir: root,
+    outDir: dist,
+    only: ["hello"],
+    sourcemap: false,
+  });
+  return { root, dist };
 }
 
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
@@ -256,6 +304,139 @@ Deno.test(
         `missing entry dist/${chunk.file}`,
       );
     }
+  },
+);
+
+Deno.test(
+  "package contentSha256 is stable across package metadata changes",
+  TEST_OPTS,
+  async () => {
+    const dist = await buildFixture("stable-content");
+    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-content-stable-" });
+
+    const first = await packageDist({
+      distDir: dist,
+      outFile: join(out, "first.1tube"),
+      key: KEY,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      version: "first-version",
+    });
+    const second = await packageDist({
+      distDir: dist,
+      outFile: join(out, "second.1tube"),
+      key: KEY,
+      createdAt: "2026-01-02T00:00:00.000Z",
+      version: "second-version",
+    });
+
+    assert(first.envelope.contentSha256);
+    assertEquals(first.envelope.contentSha256, second.envelope.contentSha256);
+    assert(first.envelope.signature.value !== second.envelope.signature.value);
+  },
+);
+
+Deno.test(
+  "package contentSha256 changes when function runtime content changes",
+  TEST_OPTS,
+  async () => {
+    const first = await buildMutableFixture("content-a", "hello v1");
+    const second = await buildMutableFixture("content-b", "hello v2");
+    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-content-change-" });
+
+    try {
+      const firstPkg = await packageDist({
+        distDir: first.dist,
+        outFile: join(out, "first.1tube"),
+        key: KEY,
+      });
+      const secondPkg = await packageDist({
+        distDir: second.dist,
+        outFile: join(out, "second.1tube"),
+        key: KEY,
+      });
+
+      assert(firstPkg.envelope.contentSha256);
+      assert(secondPkg.envelope.contentSha256);
+      assert(
+        firstPkg.envelope.contentSha256 !== secondPkg.envelope.contentSha256,
+      );
+    } finally {
+      await Deno.remove(first.root, { recursive: true }).catch(() => {});
+      await Deno.remove(second.root, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
+  "package contentSha256 ignores chunk filename-only changes",
+  TEST_OPTS,
+  async () => {
+    const originalDist = await buildFixture("chunk-rename-original");
+    const renamedDist = await Deno.makeTempDir({
+      prefix: "1tube-pkg-chunk-rename-",
+    });
+    await copyDir(originalDist, renamedDist);
+
+    const manifestPath = join(renamedDist, "manifest.json");
+    const manifest = JSON.parse(await Deno.readTextFile(manifestPath));
+    assert(
+      manifest.chunks.length > 0,
+      "fixture should emit at least one shared chunk",
+    );
+
+    const oldChunk = manifest.chunks[0].file as string;
+    const oldBase = oldChunk.split("/").pop()!;
+    const newChunk = "chunks/renamed-runtime-chunk.js";
+    const newBase = newChunk.split("/").pop()!;
+    await Deno.rename(join(renamedDist, oldChunk), join(renamedDist, newChunk));
+
+    manifest.builtAt = "2030-01-01T00:00:00.000Z";
+    manifest.chunks[0].file = newChunk;
+    for (const chunk of manifest.chunks) {
+      if (chunk.file === oldChunk) chunk.file = newChunk;
+      const chunkPath = join(renamedDist, chunk.file);
+      const chunkSource = await Deno.readTextFile(chunkPath);
+      const rewritten = chunkSource.replaceAll(oldBase, newBase);
+      if (rewritten !== chunkSource) {
+        await Deno.writeTextFile(chunkPath, rewritten);
+        chunk.sha256 = await sha256Hex(new TextEncoder().encode(rewritten));
+        chunk.bytes = new TextEncoder().encode(rewritten).byteLength;
+      }
+    }
+    for (const fn of manifest.functions) {
+      fn.moduleFiles = fn.moduleFiles.map((file: string) =>
+        file === oldChunk ? newChunk : file
+      );
+      const bundlePath = join(renamedDist, fn.bundleFile);
+      const bundle = await Deno.readTextFile(bundlePath);
+      const rewritten = bundle.replaceAll(oldBase, newBase);
+      if (rewritten !== bundle) {
+        await Deno.writeTextFile(bundlePath, rewritten);
+        fn.bundleSha256 = await sha256Hex(new TextEncoder().encode(rewritten));
+        fn.bundleBytes = new TextEncoder().encode(rewritten).byteLength;
+      }
+    }
+    await Deno.writeTextFile(
+      manifestPath,
+      JSON.stringify(manifest, null, 2) + "\n",
+    );
+
+    const out = await Deno.makeTempDir({
+      prefix: "1tube-pkg-chunk-rename-out-",
+    });
+    const first = await packageDist({
+      distDir: originalDist,
+      outFile: join(out, "first.1tube"),
+      key: KEY,
+    });
+    const second = await packageDist({
+      distDir: renamedDist,
+      outFile: join(out, "second.1tube"),
+      key: KEY,
+    });
+
+    assert(first.envelope.contentSha256);
+    assertEquals(first.envelope.contentSha256, second.envelope.contentSha256);
   },
 );
 

@@ -29,6 +29,21 @@ public sealed class FirmwareState
     public string? Current { get; set; }
 
     /// <summary>
+    /// SHA-256 over the exact .1tube package bytes that produced
+    /// <see cref="Current"/>. Kept for audit/debugging of the exact
+    /// artifact that was uploaded.
+    /// </summary>
+    [JsonPropertyName("currentPackageSha256")]
+    public string? CurrentPackageSha256 { get; set; }
+
+    /// <summary>
+    /// Stable fingerprint of runtime content, excluding volatile
+    /// package/build metadata. Used for no-op firmware skipping.
+    /// </summary>
+    [JsonPropertyName("currentContentSha256")]
+    public string? CurrentContentSha256 { get; set; }
+
+    /// <summary>
     /// Previous version id, populated on every successful promote.
     /// Used by <c>POST /1tube/api/firmware/rollback</c>. We keep
     /// exactly one previous slot — older versions are trim history,
@@ -51,4 +66,10 @@ public sealed class FirmwareHistoryEntry
 
     [JsonPropertyName("envelopeManifestSha256")]
     public string EnvelopeManifestSha256 { get; set; } = "";
+
+    [JsonPropertyName("packageSha256")]
+    public string PackageSha256 { get; set; } = "";
+
+    [JsonPropertyName("contentSha256")]
+    public string ContentSha256 { get; set; } = "";
 }
