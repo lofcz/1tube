@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
+using OneTube.Diagnostics;
 
 namespace OneTube.Firmware;
 
@@ -131,6 +132,88 @@ public static class FirmwareEndpoints
             });
         });
 
+        // Run the configured workerd binary directly under the host's
+        // identity, against either a minimal "hello world" capnp or a
+        // caller-supplied path (e.g. the candidate's generated
+        // config.gen-0.capnp). This is a debugging tool for
+        // environments where the operator can hit the bearer-protected
+        // firmware API but cannot open Event Viewer to see why workerd
+        // std::terminate's during gateway startup.
+        // List the experiment catalog: built-ins + whatever the
+        // operator dropped into <DataRoot>/onetube/experiments/*.json.
+        // The list is recomputed on every call so editing a JSON file
+        // doesn't require restarting the host.
+        group.MapGet("/diagnostics/experiments", (
+            IGatewayDestinationProvider destinationProvider,
+            DenoHostService activeHost,
+            ExperimentRunner runner,
+            FirmwareSupervisor? supervisor) =>
+        {
+            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var ctx = host.BuildExperimentContext(ResolveActiveCapnp(host, supervisor));
+            runner.EnsureStarterFiles(ctx);
+            return Results.Ok(new
+            {
+                experiments = runner.Discover(ctx),
+                tokens = runner.BuildTokens(ctx),
+            });
+        });
+
+        group.MapPost("/diagnostics/experiments/{id}/run", async (
+            string id,
+            IGatewayDestinationProvider destinationProvider,
+            DenoHostService activeHost,
+            ExperimentRunner runner,
+            FirmwareSupervisor? supervisor,
+            CancellationToken ct) =>
+        {
+            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var ctx = host.BuildExperimentContext(ResolveActiveCapnp(host, supervisor));
+            var spec = runner.Discover(ctx).FirstOrDefault(x => string.Equals(x.Id, id, StringComparison.OrdinalIgnoreCase));
+            if (spec is null)
+            {
+                return Results.NotFound(new { error = $"unknown experiment '{id}'" });
+            }
+            var result = await runner.RunAsync(spec, ctx, ct);
+            return Results.Ok(result);
+        }).DisableAntiforgery();
+
+        group.MapGet("/diagnostics/event-log", (
+            HttpContext ctx,
+            WindowsEventLogReader reader) =>
+        {
+            int windowMin = int.TryParse(ctx.Request.Query["windowMinutes"].ToString(), out var m) && m is > 0 and <= 1440
+                ? m
+                : 30;
+            int max = int.TryParse(ctx.Request.Query["max"].ToString(), out var n) && n is > 0 and <= 1000
+                ? n
+                : 200;
+            string filter = ctx.Request.Query["filter"].ToString();
+            string[]? tokens = string.IsNullOrWhiteSpace(filter)
+                ? null
+                : filter.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var result = reader.Query(TimeSpan.FromMinutes(windowMin), tokens, max);
+            return Results.Ok(result);
+        });
+
+        group.MapPost("/diagnostics/workerd-probe", async (
+            HttpContext ctx,
+            IGatewayDestinationProvider destinationProvider,
+            DenoHostService activeHost,
+            CancellationToken ct) =>
+        {
+            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var capnp = ctx.Request.Query["capnp"].ToString();
+            var timeoutSec = int.TryParse(ctx.Request.Query["timeoutSec"].ToString(), out var t) && t is > 0 and <= 30
+                ? t
+                : 5;
+            var result = await host.ProbeWorkerdAsync(
+                string.IsNullOrWhiteSpace(capnp) ? null : capnp,
+                TimeSpan.FromSeconds(timeoutSec),
+                ct);
+            return Results.Ok(result);
+        }).DisableAntiforgery();
+
         group.MapPost("/gateway/start", async (
             IGatewayDestinationProvider destinationProvider,
             DenoHostService activeHost,
@@ -217,6 +300,30 @@ public static class FirmwareEndpoints
         IGatewayDestinationProvider destinationProvider,
         DenoHostService fallback)
         => destinationProvider.GetActive() as DenoHostService ?? fallback;
+
+    private static string? ResolveActiveCapnp(DenoHostService host, FirmwareSupervisor? supervisor)
+    {
+        // Mirrors the page's helper but lives here so HTTP callers
+        // (curl, the deploy CI, etc.) get the same default. Picks the
+        // highest-numbered config.gen-*.capnp because the workerd
+        // backend bumps that suffix on every reload.
+        try
+        {
+            var ctx = host.BuildExperimentContext();
+            var state = supervisor?.GetState();
+            if (state?.Current is null or "") return null;
+            var layout = new FirmwareLayout(ctx.DataRoot);
+            var distDir = layout.VersionDistDir(state.Current);
+            if (!Directory.Exists(distDir)) return null;
+            return Directory.EnumerateFiles(distDir, "config.gen-*.capnp")
+                .OrderByDescending(p => p, StringComparer.Ordinal)
+                .FirstOrDefault();
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     private static object GatewaySnapshot(DenoHostService host, GatewayProcessSnapshot? snapshot)
         => new

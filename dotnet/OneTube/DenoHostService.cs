@@ -24,6 +24,19 @@ public sealed record GatewayBinaryDiagnostics(
     GatewayBinaryVersion Deno,
     GatewayBinaryVersion Workerd);
 
+public sealed record WorkerdProbeResult(
+    string? WorkerdPath,
+    string CapnpPath,
+    string Command,
+    string WorkingDirectory,
+    int? ExitCode,
+    bool TimedOut,
+    bool Killed,
+    long DurationMs,
+    string Stdout,
+    string Stderr,
+    string? Error);
+
 /// <summary>
 /// Manages the lifecycle of one OneTube gateway slot. The gateway
 /// itself is always Deno (<c>src/server.ts</c>); when
@@ -288,6 +301,199 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
         _denoExe = null;
         _workerdExe = null;
     }
+
+    /// <summary>
+    /// Builds the diagnostic context the experiment runner expects.
+    /// Centralised here so callers (the admin UI, tests, future
+    /// CLI surfaces) don't reach into private path logic.
+    /// </summary>
+    public OneTube.Diagnostics.ExperimentContext BuildExperimentContext(string? activeCapnpPath = null)
+    {
+        var dataRoot = ResolveRuntimeDataRoot();
+        var diagDir = Path.Combine(dataRoot, "onetube", "diagnostics");
+        var experimentsDir = Path.Combine(dataRoot, "onetube", "experiments");
+        Directory.CreateDirectory(diagDir);
+        Directory.CreateDirectory(experimentsDir);
+        return new OneTube.Diagnostics.ExperimentContext(
+            WorkerdPath: ResolveWorkerdBinary(),
+            DenoPath: ResolveDenoBinary(),
+            GatewayRoot: Path.Combine(AppContext.BaseDirectory, "OneTubeGateway"),
+            DataRoot: dataRoot,
+            DiagnosticsDir: diagDir,
+            ExperimentsDir: experimentsDir,
+            DenoCacheDir: DenoCacheDir,
+            ActiveCapnpPath: activeCapnpPath,
+            RandomPort1: PickEphemeralPort(),
+            RandomPort2: PickEphemeralPort());
+    }
+
+    /// <summary>
+    /// Runs the configured <c>workerd</c> binary under the host's own
+    /// identity against either a caller-supplied capnp config or a
+    /// minimal "hello world" config and captures stdout/stderr/exit
+    /// code. This exists so an operator who can hit the firmware
+    /// bearer endpoint can reproduce a workerd startup crash on a
+    /// locked-down box (e.g. an IIS-hosted app running as a domain
+    /// account that cannot open Event Viewer) without needing shell
+    /// access. The probe always terminates the child after
+    /// <paramref name="timeout"/> elapses; a clean boot will simply
+    /// be killed and reported as <c>Killed=true</c>.
+    /// </summary>
+    public async Task<WorkerdProbeResult> ProbeWorkerdAsync(
+        string? capnpPathOverride,
+        TimeSpan? timeout = null,
+        CancellationToken cancellationToken = default)
+    {
+        var sw = Stopwatch.StartNew();
+        var workerdPath = ResolveWorkerdBinary();
+        var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(5);
+
+        // Where to write probe artifacts: same writable area we use
+        // for the deno cache — guaranteed writable by the host
+        // identity, never under c:\windows\system32 or the IIS site
+        // root.
+        var probeDir = Path.Combine(ResolveRuntimeDataRoot(), "onetube", "diagnostics");
+        Directory.CreateDirectory(probeDir);
+
+        string capnpPath;
+        if (!string.IsNullOrWhiteSpace(capnpPathOverride))
+        {
+            capnpPath = Path.GetFullPath(capnpPathOverride);
+        }
+        else
+        {
+            capnpPath = Path.Combine(probeDir, "workerd-probe.capnp");
+            var port = PickEphemeralPort();
+            await File.WriteAllTextAsync(capnpPath, MinimalProbeCapnp.Replace("__PORT__", port.ToString()), cancellationToken);
+        }
+
+        var workingDir = probeDir;
+        var arguments = $"serve \"{capnpPath}\"";
+        var command = workerdPath is null ? $"<unresolved> {arguments}" : $"\"{workerdPath}\" {arguments}";
+
+        if (string.IsNullOrWhiteSpace(workerdPath))
+        {
+            sw.Stop();
+            return new WorkerdProbeResult(
+                null, capnpPath, command, workingDir,
+                ExitCode: null, TimedOut: false, Killed: false,
+                DurationMs: sw.ElapsedMilliseconds,
+                Stdout: "", Stderr: "",
+                Error: "workerd binary not resolved");
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = workerdPath,
+            Arguments = arguments,
+            WorkingDirectory = workingDir,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+
+        var stdout = new System.Text.StringBuilder();
+        var stderr = new System.Text.StringBuilder();
+        Process? proc = null;
+        var killed = false;
+        var timedOut = false;
+        string? error = null;
+
+        try
+        {
+            proc = Process.Start(startInfo);
+            if (proc is null)
+            {
+                sw.Stop();
+                return new WorkerdProbeResult(
+                    workerdPath, capnpPath, command, workingDir,
+                    ExitCode: null, TimedOut: false, Killed: false,
+                    DurationMs: sw.ElapsedMilliseconds,
+                    Stdout: "", Stderr: "",
+                    Error: "failed to start process");
+            }
+
+            proc.OutputDataReceived += (_, e) => { if (e.Data is not null) lock (stdout) stdout.AppendLine(e.Data); };
+            proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (stderr) stderr.AppendLine(e.Data); };
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(effectiveTimeout);
+
+            try
+            {
+                await proc.WaitForExitAsync(timeoutCts.Token);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                timedOut = true;
+            }
+
+            if (!proc.HasExited)
+            {
+                try { proc.Kill(entireProcessTree: true); killed = true; } catch { /* race */ }
+                try { await proc.WaitForExitAsync(CancellationToken.None); } catch { /* swallow */ }
+            }
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+
+        sw.Stop();
+        int? exitCode = null;
+        try { if (proc is not null && proc.HasExited) exitCode = proc.ExitCode; } catch { /* ignore */ }
+        proc?.Dispose();
+
+        return new WorkerdProbeResult(
+            workerdPath,
+            capnpPath,
+            command,
+            workingDir,
+            ExitCode: exitCode,
+            TimedOut: timedOut,
+            Killed: killed,
+            DurationMs: sw.ElapsedMilliseconds,
+            Stdout: stdout.ToString(),
+            Stderr: stderr.ToString(),
+            Error: error);
+    }
+
+    private static int PickEphemeralPort()
+    {
+        using var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
+    }
+
+    private const string MinimalProbeCapnp = """
+using Workerd = import "/workerd/workerd.capnp";
+
+const config :Workerd.Config = (
+  services = [
+    ( name = "probe",
+      worker = (
+        compatibilityDate = "2024-09-23",
+        compatibilityFlags = ["nodejs_compat"],
+        modules = [
+          ( name = "worker",
+            esModule = "export default { fetch() { return new Response('ok'); } };" )
+        ]
+      )
+    )
+  ],
+  sockets = [
+    ( name = "http",
+      address = "127.0.0.1:__PORT__",
+      http = (),
+      service = "probe" )
+  ]
+);
+""";
 
     public async Task<bool> ProbeHealthAsync(CancellationToken cancellationToken)
     {

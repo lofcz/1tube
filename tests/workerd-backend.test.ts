@@ -344,7 +344,7 @@ function freePort(): number {
   return port;
 }
 
-Deno.test("probeSocketsFree: returns [] when every port is free", async () => {
+Deno.test("probeSocketsFree: returns [] when every port is free", () => {
   // Two ephemeral ports we just released — overwhelmingly likely to
   // still be free for the few microseconds the test takes. Worst case
   // a flake; if it happens repeatedly we'll widen the range.

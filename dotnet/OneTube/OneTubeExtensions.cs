@@ -45,6 +45,10 @@ public static class OneTubeExtensions
         services.AddSingleton<IGatewayHost>(sp => sp.GetRequiredService<DenoHostService>());
         services.AddHostedService(sp => sp.GetRequiredService<DenoHostService>());
 
+        // Diagnostic surfaces — singleton, no per-request state.
+        services.AddSingleton<OneTube.Diagnostics.ExperimentRunner>();
+        services.AddSingleton<OneTube.Diagnostics.WindowsEventLogReader>();
+
         // TryAdd so a Phase-4 supervisor can pre-register a swappable
         // destination provider before AddOneTube runs (or replace it
         // afterwards via Replace). The single-host fallback is the
