@@ -30,12 +30,11 @@
   </ItemGroup>
 
   <!--
-    Ship the 1tube TypeScript gateway sources alongside the DLL.
+    Ship the 1tube TypeScript gateway sources as package content.
     Consumers (priprava, sciobot-next-host, …) must NOT need a sibling
-    1tube checkout to run the gateway: the OneTube package carries
-    everything Deno needs to spin up the gateway process. At build
-    time these files land in <consumer>/bin/<config>/<tfm>/OneTubeGateway/…
-    and DenoHostService resolves them via AppContext.BaseDirectory.
+    1tube checkout to run the gateway: restore/publish materializes
+    OneTubeGateway/ next to the host output, and DenoHostService resolves
+    it via AppContext.BaseDirectory.
     deno.json travels with the sources so jsr:/npm: specifiers in the
     gateway resolve through 1tube's own import map (not the consumer's).
   -->
@@ -46,20 +45,15 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <Pack>true</Pack>
-      <PackagePath>contentFiles\any\any\OneTubeGateway\src\%(RecursiveDir)%(Filename)%(Extension);content\OneTubeGateway\src\%(RecursiveDir)%(Filename)%(Extension)</PackagePath>
+      <PackagePath>contentFiles\any\any\OneTubeGateway\src\%(RecursiveDir)%(Filename)%(Extension)</PackagePath>
     </Content>
-    <EmbeddedResource Include="..\..\src\**\*.ts"
-                      Exclude="..\..\src\**\*.test.ts"
-                      LogicalName="OneTubeGateway/src/%(RecursiveDir)%(Filename)%(Extension)" />
     <Content Include="..\..\deno.json">
       <Link>OneTubeGateway\deno.json</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <Pack>true</Pack>
-      <PackagePath>contentFiles\any\any\OneTubeGateway\deno.json;content\OneTubeGateway\deno.json</PackagePath>
+      <PackagePath>contentFiles\any\any\OneTubeGateway\deno.json</PackagePath>
     </Content>
-    <EmbeddedResource Include="..\..\deno.json"
-                      LogicalName="OneTubeGateway/deno.json" />
     <None Include="buildTransitive\OneTube.targets"
           Pack="true"
           PackagePath="buildTransitive\OneTube.targets" />
