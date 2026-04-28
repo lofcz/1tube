@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Net.NetworkInformation;
+using System.Text.RegularExpressions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -59,6 +60,7 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
     private const int MaxBackoffMs = 30_000;
     private const string GatewayResourcePrefix = "OneTubeGateway/";
     private static readonly object GatewayExtractionLock = new();
+    private static readonly Regex AnsiEscapeRegex = new(@"\x1B\[[0-?]*[ -/]*[@-~]", RegexOptions.Compiled);
 
     /// <summary>
     /// Exit-code contract published by the gateway (see
@@ -314,13 +316,23 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
     {
         get
         {
-            var dataRoot = string.IsNullOrWhiteSpace(_options.DataRoot)
-                ? AppContext.BaseDirectory
-                : Path.IsPathRooted(_options.DataRoot)
-                    ? _options.DataRoot
-                    : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, _options.DataRoot));
+            var dataRoot = ResolveRuntimeDataRoot();
             return Path.Combine(dataRoot, "onetube", "gateway", "OneTubeGateway");
         }
+    }
+
+    private string DenoCacheDir => Path.Combine(ResolveRuntimeDataRoot(), "onetube", "deno-cache");
+
+    private string ResolveRuntimeDataRoot()
+    {
+        if (string.IsNullOrWhiteSpace(_options.DataRoot))
+        {
+            return AppContext.BaseDirectory;
+        }
+
+        return Path.IsPathRooted(_options.DataRoot)
+            ? _options.DataRoot
+            : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, _options.DataRoot));
     }
 
     private bool TryExtractEmbeddedGateway(string gatewayRoot, string serverScript)
@@ -609,20 +621,17 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
 
         KillProcess();
 
-        // The gateway sources ship inside the OneTube package as
-        // content files that copy to the consumer's bin/ at build
-        // time (see OneTube.csproj <Content Include="..\..\src">).
-        // We resolve them via AppContext.BaseDirectory rather than a
-        // user-supplied "ProjectPath", so the consumer never needs a
-        // sibling 1tube checkout on the host.
+        // The gateway sources ship inside the OneTube package. At runtime,
+        // prefer a writable copy under DataRoot so Deno can create its npm
+        // cache/node_modules without needing write access to the publish dir.
         var expectedGatewayRoot = Path.Combine(AppContext.BaseDirectory, "OneTubeGateway");
-        var gatewayRoot = expectedGatewayRoot;
+        var gatewayRoot = EmbeddedGatewayRoot;
         var serverScript = Path.Combine(gatewayRoot, "src", "server.ts");
-        if (!File.Exists(serverScript))
+        if (!TryExtractEmbeddedGateway(gatewayRoot, serverScript))
         {
-            gatewayRoot = EmbeddedGatewayRoot;
+            gatewayRoot = expectedGatewayRoot;
             serverScript = Path.Combine(gatewayRoot, "src", "server.ts");
-            if (!TryExtractEmbeddedGateway(gatewayRoot, serverScript))
+            if (!File.Exists(serverScript))
             {
                 _logger.LogError(
                     "[1tube/{Slot}] gateway sources not found at {Path}. " +
@@ -688,9 +697,13 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
         {
             startInfo.Environment[key] = value;
         }
+        var denoCacheDir = DenoCacheDir;
+        startInfo.Environment["DENO_DIR"] = denoCacheDir;
+        startInfo.Environment["DENO_NO_UPDATE_CHECK"] = "1";
 
         try
         {
+            Directory.CreateDirectory(denoCacheDir);
             _process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             _process.Exited += OnDenoProcessExited;
             _process.OutputDataReceived += (_, e) =>
@@ -713,10 +726,13 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
                 // Keep a bounded tail so a permanent-failure exit can
                 // re-print the gateway's own FATAL line(s) inline with
                 // our "stopped restarting" announcement.
-                lock (_stderrTailLock)
+                if (!IsNoisyDenoProgressLine(line))
                 {
-                    _stderrTail.Enqueue(line);
-                    while (_stderrTail.Count > StderrTailCapacity) _stderrTail.Dequeue();
+                    lock (_stderrTailLock)
+                    {
+                        _stderrTail.Enqueue(line);
+                        while (_stderrTail.Count > StderrTailCapacity) _stderrTail.Dequeue();
+                    }
                 }
             };
             _process.Start();
@@ -753,9 +769,17 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
             || line.Contains("panic", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsNoisyDenoProgressLine(string line)
+    {
+        var trimmed = line.TrimStart();
+        return trimmed.StartsWith("Download ", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("Check ", StringComparison.OrdinalIgnoreCase)
+            || trimmed.StartsWith("Initialize ", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string NormalizeGatewayLogLine(string line)
     {
-        var value = line;
+        var value = AnsiEscapeRegex.Replace(line, "");
         while (true)
         {
             var prefixStart = 0;
