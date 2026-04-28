@@ -44,6 +44,8 @@ const DEFAULT_READY_TIMEOUT_MS = 15_000;
 const DEFAULT_PROBE_INTERVAL_MS = 50;
 /** Default grace period before escalating from SIGTERM to SIGKILL. */
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
+/** Bounded child-output tail attached to startup failures. */
+const OUTPUT_TAIL_LINES = 800;
 
 export interface WorkerdProcessOptions {
   /** Absolute or PATH-resolvable path to the `workerd` binary. */
@@ -362,6 +364,46 @@ function bestEffortKill(child: Deno.ChildProcess, signal: Deno.Signal): boolean 
   }
 }
 
+function quoteArg(arg: string): string {
+  return /^[A-Za-z0-9_./:=@+-]+$/.test(arg) ? arg : JSON.stringify(arg);
+}
+
+function summarizeRoutes(routes: readonly CapnpRoute[]): string {
+  if (routes.length === 0) return "routes=0";
+  const ports = routes.map((r) => r.port);
+  const min = Math.min(...ports);
+  const max = Math.max(...ports);
+  const hosts = [...new Set(routes.map((r) => r.address))].join(",");
+  return `routes=${routes.length} hosts=${hosts} ports=${min}${min === max ? "" : `-${max}`}`;
+}
+
+function formatStartupFailure(opts: {
+  command: readonly string[];
+  cwd: string;
+  capnpPath: string;
+  routes: readonly CapnpRoute[];
+  exitCode: number | null | undefined;
+  outputTail: readonly string[];
+  cause: unknown;
+}): string {
+  const lines = [
+    "workerd exited before sockets became ready",
+    `  exitCode=${opts.exitCode ?? "<unknown>"}`,
+    `  command=${opts.command.map(quoteArg).join(" ")}`,
+    `  cwd=${opts.cwd}`,
+    `  capnp=${opts.capnpPath}`,
+    `  ${summarizeRoutes(opts.routes)}`,
+  ];
+  if (opts.cause instanceof Error) {
+    lines.push(`  readiness=${opts.cause.message}`);
+  }
+  if (opts.outputTail.length > 0) {
+    lines.push(`  -- last ${opts.outputTail.length} workerd output line(s) --`);
+    for (const line of opts.outputTail) lines.push(`  | ${line}`);
+  }
+  return lines.join("\n");
+}
+
 /** Build the manager. Stateful — caller owns lifecycle. */
 export function createWorkerdProcess(opts: WorkerdProcessOptions): WorkerdProcess {
   const sink = opts.logLineSink ?? defaultLogLineSink;
@@ -402,14 +444,23 @@ export function createWorkerdProcess(opts: WorkerdProcessOptions): WorkerdProces
       // a transitive node-path dependency on this module; the inline
       // separator-aware split is enough for our purposes.
       const cwd = opts.cwd ?? opts.capnpPath.replace(/[\\/][^\\/]+$/, "");
+      const args = [
+        ...(opts.globalArgs ?? []),
+        "serve",
+        opts.capnpPath,
+        ...(opts.extraArgs ?? []),
+      ];
+      const command = [opts.binary, ...args];
+      const outputTail: string[] = [];
+      let exitCode: number | null | undefined;
+      const captureLine = (line: string) => {
+        outputTail.push(line);
+        while (outputTail.length > OUTPUT_TAIL_LINES) outputTail.shift();
+        sink(line);
+      };
 
       const cmd = new Deno.Command(opts.binary, {
-        args: [
-          ...(opts.globalArgs ?? []),
-          "serve",
-          opts.capnpPath,
-          ...(opts.extraArgs ?? []),
-        ],
+        args,
         cwd,
         env: opts.env,
         stdout: "piped",
@@ -421,8 +472,8 @@ export function createWorkerdProcess(opts: WorkerdProcessOptions): WorkerdProces
       // Pump stdout + stderr into the sink. Both pumps are awaited at
       // shutdown so the consumer can be sure no lines are lost.
       pumpsDone = Promise.all([
-        pumpLines(child.stdout, sink),
-        pumpLines(child.stderr, sink),
+        pumpLines(child.stdout, captureLine),
+        pumpLines(child.stderr, captureLine),
       ]).then(() => {});
 
       // Watch for early exit so a workerd that crashes during boot
@@ -430,6 +481,7 @@ export function createWorkerdProcess(opts: WorkerdProcessOptions): WorkerdProces
       // the readiness wait instead of hanging until the timeout.
       const exitAbort = new AbortController();
       const exitWatch = child.status.then((status) => {
+        exitCode = status.code;
         const expected = stopRequested;
         if (!expected) {
           // Crash before ready or during runtime. Abort the readiness
@@ -455,11 +507,17 @@ export function createWorkerdProcess(opts: WorkerdProcessOptions): WorkerdProces
         // (extremely rare with workerd, but defence in depth).
         if (child) bestEffortKill(child, "SIGKILL");
         await exitWatch.catch(() => {}); // swallow — already in failure path
+        if (pumpsDone) await pumpsDone.catch(() => {});
         if (exitAbort.signal.aborted) {
-          throw new Error(
-            `workerd exited before sockets became ready` +
-              (err instanceof Error ? `: ${err.message}` : ""),
-          );
+          throw new Error(formatStartupFailure({
+            command,
+            cwd,
+            capnpPath: opts.capnpPath,
+            routes: opts.routes,
+            exitCode,
+            outputTail,
+            cause: err,
+          }));
         }
         throw err;
       }

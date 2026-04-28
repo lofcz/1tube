@@ -302,11 +302,15 @@ Deno.test("workerd-process: start() throws when child exits before ready", PROC_
       if (!expected) unexpectedExitCode = code;
     });
 
-    await assertRejects(
+    const err = await assertRejects(
       () => proc.start(),
       Error,
       "exited before sockets became ready",
     );
+    assertStringIncludes(err.message, "command=");
+    assertStringIncludes(err.message, "capnp=");
+    assertStringIncludes(err.message, "routes=1");
+    assertStringIncludes(err.message, "exitCode=");
 
     assert(unexpectedExitCode !== null || unexpectedExitCode === 0,
       "exit listener should have fired with the early-exit code");

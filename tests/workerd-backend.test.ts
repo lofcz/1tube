@@ -225,7 +225,7 @@ Deno.test("FunctionRegistry.setExternalManifest: surfaces via manifestFor + has 
   // (We can't await getOrLoad in a sync test; skip directly.)
 });
 
-Deno.test("FunctionRegistry: in-process handler manifest wins over external", async () => {
+Deno.test("FunctionRegistry: in-process handler manifest wins over external", () => {
   // Edge case: a name that exists both as an in-process candidate
   // (Deno path) and as an external workerd manifest. The in-process
   // entry must win — it's the source of truth for that backend.
@@ -337,7 +337,7 @@ Deno.test("buildMaxHeapExtraArgs: emits --v8-max-heap-size in MB, integer-floore
 // ---------------------------------------------------------------------------
 
 /** Pick a free ephemeral port without holding the listener. */
-async function freePort(): Promise<number> {
+function freePort(): number {
   const l = Deno.listen({ hostname: "127.0.0.1", port: 0 });
   const port = (l.addr as Deno.NetAddr).port;
   l.close();
@@ -348,8 +348,8 @@ Deno.test("probeSocketsFree: returns [] when every port is free", async () => {
   // Two ephemeral ports we just released — overwhelmingly likely to
   // still be free for the few microseconds the test takes. Worst case
   // a flake; if it happens repeatedly we'll widen the range.
-  const a = await freePort();
-  const b = await freePort();
+  const a = freePort();
+  const b = freePort();
   const conflicts = probeSocketsFree([
     { name: "hello", address: "127.0.0.1", port: a },
     { name: "echo", address: "127.0.0.1", port: b },

@@ -639,6 +639,15 @@ export function resolveEnvAllowlist(
   return { resolved, missing, mode: "restricted" };
 }
 
+function runtimeSecretNames(envSource: EnvSource = Deno.env): string[] {
+  const raw = envSource.get("1TUBE_SECRET_NAMES") ?? "";
+  const names = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s));
+  return [...new Set(names)].sort();
+}
+
 /**
  * Compute the env vars exposed to a single function as workerd
  * `fromEnvironment` bindings.
@@ -1121,16 +1130,22 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         }
       }
 
-      // Resolve the gateway-wide env allowlist. This is the *maximum*
-      // surface any single function can ask for; per-function manifests
-      // narrow it further via `permissions.env`. Most-restrictive wins
-      // — operator declares what's available, the function declares
-      // what it actually uses, and we hand workerd the intersection.
+      // Resolve the gateway-wide env policy. Workerd gets live secrets
+      // plus the operator's explicit allowlist. We deliberately do not
+      // infer source usage here: dynamic access is common, and secrets
+      // are runtime configuration.
+      const hasConfiguredEnvPolicy = (opts.envAllowlist?.length ?? 0) > 0 ||
+        ((Deno.env.get("1TUBE_WORKERD_ENV") ?? "").trim().length > 0);
+      const secretNames = runtimeSecretNames();
       const {
-        resolved: envBindings,
+        resolved: configuredEnvBindings,
         missing: missingEnv,
-        mode: envMode,
+        mode: configuredEnvMode,
       } = resolveEnvAllowlist(opts.envAllowlist);
+      const gatewayEnvBindings = [...new Set([
+        ...secretNames,
+        ...(hasConfiguredEnvPolicy ? configuredEnvBindings : []),
+      ])].sort();
       if (missingEnv.length > 0) {
         console.warn(
           `[1tube] workerd env allowlist references vars not present in the gateway env: ` +
@@ -1138,17 +1153,20 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
             `Set them before starting the gateway, or remove them from the allowlist.`,
         );
       }
-      if (envBindings.length > 0) {
-        if (envMode === "all") {
+      if (hasConfiguredEnvPolicy && configuredEnvBindings.length > 0) {
+        if (configuredEnvMode === "all") {
           console.log(
-            `[1tube] forwarding all ${envBindings.length} env var(s) to workerd ` +
-              `(default; pass --workerd-env=A,B,C or set 1TUBE_WORKERD_ENV to restrict)`,
+            `[1tube] forwarding all ${configuredEnvBindings.length} env var(s) to workerd ` +
+              `plus ${secretNames.length} runtime secret name(s) (explicit '*')`,
           );
         } else {
           console.log(
-            `[1tube] forwarding ${envBindings.length} env var(s) to workerd: ${envBindings.join(", ")}`,
+            `[1tube] forwarding ${gatewayEnvBindings.length} env var(s) to workerd ` +
+              `(${secretNames.length} secret(s), ${configuredEnvBindings.length} explicit): ${gatewayEnvBindings.join(", ")}`,
           );
         }
+      } else if (secretNames.length > 0) {
+        console.log(`[1tube] forwarding ${secretNames.length} runtime secret env var(s) to workerd: ${secretNames.join(", ")}`);
       }
 
       // Load each function's 1tube.json. Missing files yield
@@ -1202,7 +1220,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         const m = newManifests.get(r.name)!;
         const bundleEmbedPath = prebuiltBundleFiles?.get(r.name) ??
           r.bundlePath.split(/[\\/]/).pop()!;
-        const fnEnvBindings = intersectEnvForFunction(envBindings, m.permissions.env, enforceManifest);
+        const fnEnvBindings = intersectEnvForFunction(gatewayEnvBindings, m.permissions.env, enforceManifest);
         for (const internalName of internalEnvBindings) {
           if (!fnEnvBindings.includes(internalName)) fnEnvBindings.push(internalName);
         }
@@ -1241,6 +1259,21 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
 
       const newRoutesByName = new Map(capnp.routes.map((r) => [r.name, r]));
       const newNames = capnp.routes.map((r) => r.name).sort();
+      if (args.gen === 0) {
+        const ports = capnp.routes.map((r) => r.port);
+        const minPort = Math.min(...ports);
+        const maxPort = Math.max(...ports);
+        const totalEnvBindings = capnpInputs.reduce((sum, input) => sum + (input.envBindings?.length ?? 0), 0);
+        const maxEnvBindings = capnpInputs.reduce((max, input) => Math.max(max, input.envBindings?.length ?? 0), 0);
+        console.log(
+          `[1tube] workerd config: path=${capnpPath} services=${capnp.routes.length} ` +
+            `ports=${minPort}${minPort === maxPort ? "" : `-${maxPort}`} ` +
+            `compat=${effectiveCompatDate ?? "default"} ` +
+            `flags=${(opts.compatibilityFlags ?? ["default"]).join(",")} ` +
+            `envMode=${hasConfiguredEnvPolicy ? configuredEnvMode : "secrets"} ` +
+            `envBindingsTotal=${totalEnvBindings} envBindingsMaxPerFn=${maxEnvBindings}`,
+        );
+      }
 
       // Preflight: refuse to spawn workerd against ports that are
       // already in use. Without this, a leftover workerd from a
@@ -1341,11 +1374,16 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
 
       const maxHeapArgs = buildMaxHeapExtraArgs(opts.maxHeapMB);
       const extraArgs = [...inspectorArgs, ...maxHeapArgs];
+      const verboseWorkerd = (Deno.env.get("1TUBE_WORKERD_VERBOSE") ?? "") === "1";
+      if (verboseWorkerd) {
+        console.log(`[1tube] workerd verbose logging enabled (1TUBE_WORKERD_VERBOSE=1)`);
+      }
 
       const newProcess = createWorkerdProcess({
         binary: workerdBin,
         capnpPath,
         routes: capnp.routes,
+        ...(verboseWorkerd ? { globalArgs: ["-v"] } : {}),
         extraArgs,
         env: sharedRuntime
           ? {

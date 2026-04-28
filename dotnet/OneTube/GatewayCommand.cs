@@ -236,8 +236,25 @@ internal static class GatewayCommand
             {
                 env[k] = v;
             }
+            env["1TUBE_SECRET_NAMES"] = string.Join(
+                ",",
+                secretsOverlay.Keys
+                    .Where(IsValidEnvName)
+                    .Order(StringComparer.Ordinal));
         }
 
         return env;
+    }
+
+    private static bool IsValidEnvName(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+        if (!(name[0] == '_' || char.IsAsciiLetter(name[0]))) return false;
+        for (var i = 1; i < name.Length; i++)
+        {
+            var c = name[i];
+            if (!(c == '_' || char.IsAsciiLetterOrDigit(c))) return false;
+        }
+        return true;
     }
 }
