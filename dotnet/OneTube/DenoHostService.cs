@@ -57,6 +57,8 @@ public sealed record GatewayBinaryDiagnostics(
 public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
 {
     private const int MaxBackoffMs = 30_000;
+    private const string GatewayResourcePrefix = "OneTubeGateway/";
+    private static readonly object GatewayExtractionLock = new();
 
     /// <summary>
     /// Exit-code contract published by the gateway (see
@@ -308,6 +310,69 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
         }
     }
 
+    private string EmbeddedGatewayRoot
+    {
+        get
+        {
+            var dataRoot = string.IsNullOrWhiteSpace(_options.DataRoot)
+                ? AppContext.BaseDirectory
+                : Path.IsPathRooted(_options.DataRoot)
+                    ? _options.DataRoot
+                    : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, _options.DataRoot));
+            return Path.Combine(dataRoot, "onetube", "gateway", "OneTubeGateway");
+        }
+    }
+
+    private bool TryExtractEmbeddedGateway(string gatewayRoot, string serverScript)
+    {
+        lock (GatewayExtractionLock)
+        {
+            var assembly = typeof(DenoHostService).Assembly;
+            var resources = assembly.GetManifestResourceNames()
+                .Where(name => name.StartsWith(GatewayResourcePrefix, StringComparison.Ordinal))
+                .ToArray();
+            if (resources.Length == 0) return false;
+
+            try
+            {
+                foreach (var resourceName in resources)
+                {
+                    var relativePath = resourceName[GatewayResourcePrefix.Length..]
+                        .Replace('/', Path.DirectorySeparatorChar)
+                        .Replace('\\', Path.DirectorySeparatorChar);
+                    var parts = relativePath.Split(Path.DirectorySeparatorChar);
+                    if (relativePath.Length == 0 || parts.Any(part => part is "" or "." or ".."))
+                    {
+                        continue;
+                    }
+
+                    var targetPath = Path.Combine(gatewayRoot, relativePath);
+                    Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+                    using var input = assembly.GetManifestResourceStream(resourceName);
+                    if (input is null) continue;
+                    using var output = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+                    input.CopyTo(output);
+                }
+
+                if (File.Exists(serverScript))
+                {
+                    _logger.LogWarning(
+                        "[1tube/{Slot}] gateway sources were missing from publish output; restored {Count} embedded file(s) to {Root}",
+                        _slot.Label, resources.Length, gatewayRoot);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "[1tube/{Slot}] failed to restore embedded gateway sources to {Root}",
+                    _slot.Label, gatewayRoot);
+            }
+
+            return false;
+        }
+    }
+
     public void Dispose()
     {
         _shuttingDown = true;
@@ -550,18 +615,24 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
         // We resolve them via AppContext.BaseDirectory rather than a
         // user-supplied "ProjectPath", so the consumer never needs a
         // sibling 1tube checkout on the host.
-        var gatewayRoot = Path.Combine(AppContext.BaseDirectory, "OneTubeGateway");
+        var expectedGatewayRoot = Path.Combine(AppContext.BaseDirectory, "OneTubeGateway");
+        var gatewayRoot = expectedGatewayRoot;
         var serverScript = Path.Combine(gatewayRoot, "src", "server.ts");
         if (!File.Exists(serverScript))
         {
-            _logger.LogError(
-                "[1tube/{Slot}] gateway sources not found at {Path}. " +
-                "The OneTube package should ship src/ + deno.json under " +
-                "OneTubeGateway/ in the host's output directory; check that " +
-                "the consumer's build copied content from this package.",
-                _slot.Label, serverScript);
-            _permanentlyUnavailable = true;
-            return;
+            gatewayRoot = EmbeddedGatewayRoot;
+            serverScript = Path.Combine(gatewayRoot, "src", "server.ts");
+            if (!TryExtractEmbeddedGateway(gatewayRoot, serverScript))
+            {
+                _logger.LogError(
+                    "[1tube/{Slot}] gateway sources not found at {Path}. " +
+                    "The OneTube package should ship src/ + deno.json under " +
+                    "OneTubeGateway/ in the host's output directory; check that " +
+                    "the consumer's build copied content from this package.",
+                    _slot.Label, Path.Combine(expectedGatewayRoot, "src", "server.ts"));
+                _permanentlyUnavailable = true;
+                return;
+            }
         }
 
         if (!ResolveBinariesIfNeeded())

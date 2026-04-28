@@ -48,6 +48,9 @@
       <Pack>true</Pack>
       <PackagePath>contentFiles\any\any\OneTubeGateway\src\%(RecursiveDir)%(Filename)%(Extension);content\OneTubeGateway\src\%(RecursiveDir)%(Filename)%(Extension)</PackagePath>
     </Content>
+    <EmbeddedResource Include="..\..\src\**\*.ts"
+                      Exclude="..\..\src\**\*.test.ts"
+                      LogicalName="OneTubeGateway/src/%(RecursiveDir)%(Filename)%(Extension)" />
     <Content Include="..\..\deno.json">
       <Link>OneTubeGateway\deno.json</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -55,6 +58,8 @@
       <Pack>true</Pack>
       <PackagePath>contentFiles\any\any\OneTubeGateway\deno.json;content\OneTubeGateway\deno.json</PackagePath>
     </Content>
+    <EmbeddedResource Include="..\..\deno.json"
+                      LogicalName="OneTubeGateway/deno.json" />
     <None Include="buildTransitive\OneTube.targets"
           Pack="true"
           PackagePath="buildTransitive\OneTube.targets" />

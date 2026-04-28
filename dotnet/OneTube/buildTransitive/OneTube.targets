@@ -3,6 +3,17 @@
     <_OneTubeGatewayFiles Include="$(MSBuildThisFileDirectory)..\contentFiles\any\any\OneTubeGateway\**\*.*" />
   </ItemGroup>
 
+  <Target Name="AddOneTubeGatewayToPublishItems"
+          BeforeTargets="ComputeFilesToPublish"
+          Condition="'@(_OneTubeGatewayFiles)' != ''">
+    <ItemGroup>
+      <ResolvedFileToPublish Include="@(_OneTubeGatewayFiles)">
+        <RelativePath>OneTubeGateway\%(RecursiveDir)%(Filename)%(Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
+
   <Target Name="CopyOneTubeGatewayToOutput"
           AfterTargets="Build"
           Condition="'@(_OneTubeGatewayFiles)' != '' and '$(TargetDir)' != ''">
