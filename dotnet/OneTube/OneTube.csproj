@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>OneTube</RootNamespace>
     <PackageId>OneTube</PackageId>
-    <Version>0.2.2</Version>
+    <Version>0.2.3</Version>
     <Authors>OneTube contributors</Authors>
     <Description>Host Supabase-compatible edge functions inside ASP.NET with zero-copy YARP proxying. Supports the deno and workerd backends; operator supplies explicit binary paths.</Description>
     <PackageProjectUrl>https://github.com/lofcz/1tube</PackageProjectUrl>
