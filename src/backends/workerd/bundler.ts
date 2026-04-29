@@ -37,8 +37,8 @@
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
-import * as esbuild from "esbuild";
-import { denoPlugin } from "@deno/esbuild-plugin";
+import * as esbuild from "npm:esbuild@^0.28";
+import { denoPlugin } from "jsr:@deno/esbuild-plugin@^1.2";
 import {
   SHARED_RUNTIME_TOKEN_ENV,
   SHARED_RUNTIME_URL_ENV,
