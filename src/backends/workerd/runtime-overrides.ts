@@ -484,13 +484,23 @@ export class RuntimeOverrideStore {
       if (extracted.length > 0) return { source: "sourcemap", files: extracted };
     }
 
-    const bundleFile = entry.moduleFiles[0] ?? entry.bundleFile;
-    const bundle = await readTextIfExists(join(prebuiltDir, bundleFile));
-    if (bundle !== null) {
+    const emittedFiles = [...new Set(entry.moduleFiles.length ? entry.moduleFiles : [entry.bundleFile])];
+    const emittedSources: EditableSourceFile[] = [];
+    for (const moduleFile of emittedFiles) {
+      const bundle = await readTextIfExists(join(prebuiltDir, moduleFile));
+      if (bundle !== null) {
+        emittedSources.push({
+          path: moduleFile,
+          content: bundle,
+          language: langFor(moduleFile),
+        });
+      }
+    }
+    if (emittedSources.length > 0) {
       return {
         source: "bundle",
-        files: [{ path: basename(bundleFile), content: bundle, language: "javascript" }],
-        warning: "Authored source was not packaged with this firmware; showing emitted JS fallback.",
+        files: emittedSources.sort((a, b) => emittedSortKey(entry.bundleFile, a.path).localeCompare(emittedSortKey(entry.bundleFile, b.path))),
+        warning: "Authored source was not packaged with this firmware; showing emitted JS fallback modules.",
       };
     }
     return {
@@ -550,6 +560,12 @@ function extractSourcesContent(rawMap: string): EditableSourceFile[] {
 function sourceSortKey(path: string): string {
   if (path === "index.ts" || path === "index.js") return `0:${path}`;
   if (path === MANIFEST_FILENAME) return `9:${path}`;
+  return `5:${path}`;
+}
+
+function emittedSortKey(entryFile: string, path: string): string {
+  if (path === entryFile) return `0:${path}`;
+  if (basename(path) === basename(entryFile)) return `1:${path}`;
   return `5:${path}`;
 }
 
