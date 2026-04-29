@@ -398,6 +398,15 @@ const LOCAL_SUPABASE_DEFAULTS: Record<string, string> = {
   JWT_SECRET: "super-secret-jwt-token-with-at-least-32-characters-long",
 };
 
+const LOCAL_SUPABASE_STATUS_KEYS: Record<string, string[]> = {
+  SUPABASE_URL: ["API_URL"],
+  JWT_SECRET: ["JWT_SECRET"],
+  SUPABASE_ANON_KEY: ["ANON_KEY"],
+  SUPABASE_PUBLISHABLE_KEY: ["PUBLISHABLE_KEY"],
+  SUPABASE_SECRET_KEY: ["SECRET_KEY"],
+  SUPABASE_SERVICE_ROLE_KEY: ["SERVICE_ROLE_KEY"],
+};
+
 // Only secrets the gateway *itself* uses on the hot path. Anything an edge
 // function happens to need (publishable/secret keys, OPENAI_API_KEY, …) is
 // the function author's contract with the host — refusing to boot because
@@ -405,8 +414,24 @@ const LOCAL_SUPABASE_DEFAULTS: Record<string, string> = {
 // confusing failures.
 const SECRETS_REQUIRED_IN_PROD = ["JWT_SECRET"];
 
-function applyDevDefaults() {
+async function applyDevDefaults() {
   let applied = 0;
+  const statusEnv = await readLocalSupabaseStatusEnv();
+  for (const [target, sources] of Object.entries(LOCAL_SUPABASE_STATUS_KEYS)) {
+    if (Deno.env.get(target)) continue;
+    const value = sources
+      .map((source) => statusEnv[source])
+      .find((candidate) => typeof candidate === "string" && candidate.length > 0);
+    if (!value) continue;
+    Deno.env.set(target, value);
+    applied++;
+  }
+
+  if (!Deno.env.get("SUPABASE_URL") && Deno.env.get("VITE_SUPABASE_URL")) {
+    Deno.env.set("SUPABASE_URL", Deno.env.get("VITE_SUPABASE_URL")!);
+    applied++;
+  }
+
   for (const [key, value] of Object.entries(LOCAL_SUPABASE_DEFAULTS)) {
     if (!Deno.env.get(key)) {
       Deno.env.set(key, value);
@@ -416,6 +441,48 @@ function applyDevDefaults() {
   if (applied > 0) {
     console.log(`[1tube] Applied ${applied} dev default(s) (1TUBE_DEV=1)`);
   }
+}
+
+async function readLocalSupabaseStatusEnv(): Promise<Record<string, string>> {
+  const runners: Array<{ command: string; args: string[] }> = [
+    { command: "supabase", args: ["status", "-o", "env"] },
+    { command: "bunx", args: ["supabase", "status", "-o", "env"] },
+  ];
+
+  for (const runner of runners) {
+    try {
+      const output = await new Deno.Command(runner.command, {
+        args: runner.args,
+        stdout: "piped",
+        stderr: "null",
+      }).output();
+      if (!output.success) continue;
+      return parseSupabaseStatusEnv(new TextDecoder().decode(output.stdout));
+    } catch {
+      // CLI not installed on PATH (or bunx unavailable). Try the next runner.
+    }
+  }
+  return {};
+}
+
+function parseSupabaseStatusEnv(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    out[key] = value;
+  }
+  return out;
 }
 
 function enforceProdSecrets() {
@@ -463,7 +530,7 @@ function requireInternal(c: Context): Response | null {
 }
 
 if (opts.dev) {
-  applyDevDefaults();
+  await applyDevDefaults();
 } else {
   enforceProdSecrets();
 }
