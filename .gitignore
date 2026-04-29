@@ -6,3 +6,4 @@ node_modules/
 /dotnet/OneTube/.idea
 /artifacts
 /.artifacts
+/.1tube-cache

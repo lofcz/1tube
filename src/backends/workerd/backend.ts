@@ -1872,9 +1872,17 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     },
 
     reload(changed) {
-      // Prebuilt firmware remains immutable; reload now means "compose
-      // the same base artifact plus runtime overlays into a fresh
-      // workerd generation".
+      // Keep the public API contract: prebuilt firmware is immutable
+      // from HMR/test callers. Runtime editor admin methods below use
+      // doReload() directly after mutating the overlay store.
+      if (prebuiltDir !== null) {
+        return Promise.reject(
+          new Error(
+            "workerd backend is in prebuilt mode; public reload is not supported. " +
+              "Use the runtime editor APIs for overlay hot-swaps, or promote new firmware.",
+          ),
+        );
+      }
       return doReload(changed);
     },
 

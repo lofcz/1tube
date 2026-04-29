@@ -613,9 +613,11 @@ Deno.test(
 
     const { entries } = await readPayload(payload);
     const filenames = [...entries.keys()].sort();
-    // Exact set: envelope at root, manifest under dist/, runtime bundles
-    // under dist/functions/ or dist/shared/. No README, no .gitignore — those are
-    // build-time conveniences, not part of the runtime contract.
+    // Exact top-level shape: envelope at root, manifest under dist/,
+    // runtime bundles under dist/functions|shared|chunks, and optional
+    // inspectable source snapshots under dist/sources for the runtime
+    // editor. No README, no .gitignore — those are build-time
+    // conveniences, not part of the payload contract.
     assert(filenames.includes("envelope.json"));
     assert(filenames.includes("dist/manifest.json"));
     for (const f of filenames) {
@@ -623,7 +625,7 @@ Deno.test(
       if (f === "dist/manifest.json") continue;
       assert(
         f.startsWith("dist/functions/") || f.startsWith("dist/shared/") ||
-          f.startsWith("dist/chunks/"),
+          f.startsWith("dist/chunks/") || f.startsWith("dist/sources/"),
         `unexpected entry in payload: ${f}`,
       );
     }
