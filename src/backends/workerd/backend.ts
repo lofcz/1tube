@@ -1352,89 +1352,85 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
 
       // Preflight: refuse to spawn workerd against ports that are
       // already in use. Without this, a leftover workerd from a
-      // previous run silently steals our traffic and the failure
-      // surfaces only as wrong-looking response bodies. See
-      // `probeSocketsFree` doc comment for the full rationale.
-      // We skip the check on reload because the still-serving old
-      // generation occupies the OTHER slot's ports by design — the
-      // even/odd `slot` shift above guarantees no overlap, and
-      // probing here would race against that intentional overlap.
-      if (args.gen === 0) {
-        let conflicts = probeSocketsFree(capnp.routes);
-        if (conflicts.length > 0 && opts.killStaleWorkerd) {
-          console.log(
-            `[1tube] port preflight found ${conflicts.length} conflict(s); ` +
-              `--kill-stale-workerd is set, attempting cleanup...`,
-          );
+      // previous run can satisfy the readiness probe and silently
+      // steal our traffic; the failure then surfaces only as stale
+      // response bodies. On reload the still-serving current process
+      // occupies the OTHER slot's ports by design, so probing the next
+      // slot is safe and catches orphaned older generations.
+      let conflicts = probeSocketsFree(capnp.routes);
+      if (conflicts.length > 0 && opts.killStaleWorkerd) {
+        console.log(
+          `[1tube] port preflight found ${conflicts.length} conflict(s)` +
+            (args.gen > 0 ? ` for reload gen=${args.gen}` : "") +
+            `; --kill-stale-workerd is set, attempting cleanup...`,
+        );
 
-          // First try the precise fix: resolve the conflicted port(s)
-          // to their owning PID(s), and kill only owners named workerd.
-          // That is the behavior we want during firmware flashing:
-          // remove the stale candidate that owns 8800, but never kill
-          // a random non-workerd process that happens to be there.
-          const targeted = await killWorkerdOwnersOfPorts(conflicts);
-          if (targeted.attempted) {
-            if (targeted.code === 0) {
-              const details = targeted.stdout?.trim();
-              console.log(
-                `[1tube] targeted stale-workerd cleanup by port complete` +
-                  (details ? ` (${details})` : "") +
-                  `; re-probing...`,
-              );
-            } else {
-              console.warn(
-                `[1tube] targeted stale-workerd cleanup exited ${targeted.code}` +
-                  (targeted.stderr ? `: ${targeted.stderr.trim()}` : ""),
-              );
-            }
-            await new Promise((r) => setTimeout(r, 250));
-            conflicts = probeSocketsFree(capnp.routes);
-          }
-
-          // If targeted cleanup did not exist on this platform, or it
-          // found no matching workerd owner, fall back to the old typed
-          // process-name cleanup.
-          const result = conflicts.length > 0 ? await killStaleWorkerd() : null;
-          if (result === null) {
-            // Already clear.
-          } else
-          if (result.attempted) {
-            // taskkill returns 128 when no matching image is running —
-            // that's not an error in our context (means the offender
-            // wasn't workerd, which is fine; preflight will catch it).
-            // pkill returns 1 in the same case.
-            const noMatch = (Deno.build.os === "windows" && result.code === 128) ||
-              (Deno.build.os !== "windows" && result.code === 1);
-            if (result.code === 0) {
-              console.log(`[1tube] killed leftover workerd process(es); re-probing...`);
-            } else if (noMatch) {
-              console.log(
-                `[1tube] no leftover workerd processes found; the conflict is held ` +
-                  `by something else (re-probing to confirm)...`,
-              );
-            } else {
-              console.warn(
-                `[1tube] ${result.command?.join(" ")} exited ${result.code}` +
-                  (result.stderr ? `: ${result.stderr.trim()}` : ""),
-              );
-            }
-            // Brief settle time: Windows TCP sockets in CLOSE_WAIT can
-            // hold the port for a fraction of a second after the owner
-            // process is killed. 250ms is empirically enough on the
-            // dev boxes we've tested without making the boot path feel
-            // sluggish.
-            await new Promise((r) => setTimeout(r, 250));
-            conflicts = probeSocketsFree(capnp.routes);
+        // First try the precise fix: resolve the conflicted port(s)
+        // to their owning PID(s), and kill only owners named workerd.
+        // That is the behavior we want during firmware flashing:
+        // remove the stale candidate that owns 8800, but never kill
+        // a random non-workerd process that happens to be there.
+        const targeted = await killWorkerdOwnersOfPorts(conflicts);
+        if (targeted.attempted) {
+          if (targeted.code === 0) {
+            const details = targeted.stdout?.trim();
+            console.log(
+              `[1tube] targeted stale-workerd cleanup by port complete` +
+                (details ? ` (${details})` : "") +
+                `; re-probing...`,
+            );
           } else {
             console.warn(
-              `[1tube] could not run ${result.command?.join(" ")}: ` +
-                `${result.stderr ?? "unknown error"}`,
+              `[1tube] targeted stale-workerd cleanup exited ${targeted.code}` +
+                (targeted.stderr ? `: ${targeted.stderr.trim()}` : ""),
             );
           }
+          await new Promise((r) => setTimeout(r, 250));
+          conflicts = probeSocketsFree(capnp.routes);
         }
-        if (conflicts.length > 0) {
-          throw new Error(formatPortConflictError(conflicts));
+
+        // If targeted cleanup did not exist on this platform, or it
+        // found no matching workerd owner, fall back to the old typed
+        // process-name cleanup.
+        const result = conflicts.length > 0 ? await killStaleWorkerd() : null;
+        if (result === null) {
+          // Already clear.
+        } else if (result.attempted) {
+          // taskkill returns 128 when no matching image is running —
+          // that's not an error in our context (means the offender
+          // wasn't workerd, which is fine; preflight will catch it).
+          // pkill returns 1 in the same case.
+          const noMatch = (Deno.build.os === "windows" && result.code === 128) ||
+            (Deno.build.os !== "windows" && result.code === 1);
+          if (result.code === 0) {
+            console.log(`[1tube] killed leftover workerd process(es); re-probing...`);
+          } else if (noMatch) {
+            console.log(
+              `[1tube] no leftover workerd processes found; the conflict is held ` +
+                `by something else (re-probing to confirm)...`,
+            );
+          } else {
+            console.warn(
+              `[1tube] ${result.command?.join(" ")} exited ${result.code}` +
+                (result.stderr ? `: ${result.stderr.trim()}` : ""),
+            );
+          }
+          // Brief settle time: Windows TCP sockets in CLOSE_WAIT can
+          // hold the port for a fraction of a second after the owner
+          // process is killed. 250ms is empirically enough on the
+          // dev boxes we've tested without making the boot path feel
+          // sluggish.
+          await new Promise((r) => setTimeout(r, 250));
+          conflicts = probeSocketsFree(capnp.routes);
+        } else {
+          console.warn(
+            `[1tube] could not run ${result.command?.join(" ")}: ` +
+              `${result.stderr ?? "unknown error"}`,
+          );
         }
+      }
+      if (conflicts.length > 0) {
+        throw new Error(formatPortConflictError(conflicts));
       }
 
       const inspectorArgs = buildInspectorExtraArgs(opts.inspectorAddr, slot);
