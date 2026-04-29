@@ -1,0 +1,14 @@
+{
+  "id": "workerd-dbg-firstchance",
+  "name": "workerd DBG first-chance kj dump",
+  "description": "Runs locally-built debug workerd under procdump and dumps on first kj::ExceptionImpl.",
+  "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  "args": [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "$ErrorActionPreference='Continue'; $bin=Split-Path '${WorkerdPath}'; $w=Join-Path $bin 'workerd-dbg.exe'; $probe='${ProbeCapnp}'; $diag='${DiagDir}'; $dumps=\"$diag\\dumps\"; New-Item -ItemType Directory -Force -Path $dumps | Out-Null; $procdump = Join-Path $bin 'procdump.exe'; if (-not (Test-Path $w)) { Write-Error \"debug workerd not found: $w\"; exit 2 }; if (-not (Test-Path (Join-Path $bin 'workerd-dbg.pdb'))) { Write-Error \"debug pdb not found next to exe\"; exit 3 }; if (-not (Test-Path $procdump)) { Write-Error \"procdump not found: $procdump\"; exit 4 }; if (-not (Test-Path $probe)) { Write-Error \"probe capnp missing: $probe\"; exit 5 }; Write-Output \"workerd: $w\"; Write-Output \"pdb    : $(Join-Path $bin 'workerd-dbg.pdb')\"; Write-Output \"probe  : $probe\"; Write-Output \"dumps  : $dumps\"; & $procdump -accepteula -ma -e 1 -f 'ExceptionImpl@kj' -n 1 -x $dumps $w serve $probe 2>&1 | Out-String; Write-Output '== resulting dumps =='; Get-ChildItem $dumps -File -Filter 'workerd-dbg*.dmp' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 5 FullName, Length, LastWriteTime | Format-Table -AutoSize | Out-String"
+  ],
+  "cwd": "${DiagDir}",
+  "timeoutSec": 60
+}

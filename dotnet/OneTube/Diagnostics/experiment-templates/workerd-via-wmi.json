@@ -1,0 +1,23 @@
+// Spawns workerd via WMI (Win32_Process.Create). WMI-launched
+// processes are children of WmiPrvSE.exe, NOT of our host process,
+// so they break away from the IIS app pool's Job Object. This is
+// the definitive Job-Object disambiguator:
+//
+//   workerd-minimal   crashes  + workerd-via-wmi  crashes  => binary or env (CRT, AV, missing DLL)
+//   workerd-minimal   crashes  + workerd-via-wmi  works    => Job Object kill — needs CREATE_BREAKAWAY_FROM_JOB
+//   workerd-minimal   works    + workerd-via-wmi  works    => unrelated path
+//
+// Stdout/stderr can't ride back through WMI, so the cmd.exe wrapper
+// redirects both to files in ${DiagDir} which we read after the
+// child is killed.
+{
+  "id": "workerd-via-wmi",
+  "name": "workerd serve <minimal capnp> via WMI (Job-Object breakaway)",
+  "description": "Like workerd-minimal but spawned via Win32_Process.Create so the child is reparented under WmiPrvSE and escapes the IIS Job Object. Compare result with workerd-minimal.",
+  "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  "args": [
+    "-NoProfile", "-NonInteractive", "-Command",
+    "$ErrorActionPreference='Continue'; $diag='${DiagDir}'; $probe='${ProbeCapnp}'; $w='${WorkerdPath}'; $out=\"$diag\\via-wmi.stdout.log\"; $err=\"$diag\\via-wmi.stderr.log\"; Remove-Item -Force $out,$err -ErrorAction SilentlyContinue; if (-not (Test-Path $probe)) { Write-Error \"probe capnp missing: $probe (run workerd-minimal once first to materialize it)\"; exit 2 }; $cmd = ('cmd.exe /c \"\"{0}\" serve \"{1}\" 1>\"{2}\" 2>\"{3}\"\"' -f $w,$probe,$out,$err); Write-Host \"command: $cmd\"; $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine=$cmd}; \"WMI ProcessId=$($r.ProcessId) ReturnValue=$($r.ReturnValue)\"; if ($r.ReturnValue -ne 0 -or -not $r.ProcessId) { Write-Error 'WMI Create failed (ReturnValue!=0). 0=ok 2=denied 3=insufficient privilege 8=unknown 9=path not found 21=invalid param'; exit 3 }; Start-Sleep -Seconds 4; $proc = Get-Process -Id $r.ProcessId -ErrorAction SilentlyContinue; if ($proc) { Write-Host \"workerd PID $($r.ProcessId) still alive after 4s — alive=$true\"; Stop-Process -Id $r.ProcessId -Force -ErrorAction SilentlyContinue } else { Write-Host \"workerd PID $($r.ProcessId) already exited within 4s — alive=$false\" }; Write-Host '== STDOUT =='; if (Test-Path $out) { Get-Content $out -Raw } else { '(no stdout file)' }; Write-Host '== STDERR =='; if (Test-Path $err) { Get-Content $err -Raw } else { '(no stderr file)' }"
+  ],
+  "timeoutSec": 15
+}

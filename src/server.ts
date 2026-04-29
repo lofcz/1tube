@@ -16,7 +16,7 @@
 // cleanly when launched from a host project's node_modules — bare
 // specifiers would otherwise require the host's deno.json to mirror our
 // import map. Same convention applies to every src/ file.
-import { Hono } from "npm:hono@4";
+import { Hono, type Context } from "npm:hono@4";
 import { bodyLimit } from "npm:hono@4/body-limit";
 import { relative, sep as SEPARATOR } from "node:path";
 import { currentRequestStorage, FunctionRegistry } from "./registry.ts";
@@ -149,6 +149,12 @@ interface CliOpts {
    * Off by default — workerd uses V8's defaults.
    */
   workerdMaxHeapMB?: number;
+  /** Workerd compatibility date passed to generated config.capnp files. */
+  workerdCompatibilityDate?: string;
+  /** Workerd compatibility flags passed to generated config.capnp files. */
+  workerdCompatibilityFlags?: readonly string[];
+  /** Pass `--experimental` to the workerd process itself. */
+  workerdExperimental?: boolean;
   /**
    * Path to a `1tube build`-produced artifact directory. When set,
    * the workerd backend skips esbuild entirely and serves the
@@ -219,6 +225,12 @@ function parseArgs(): CliOpts {
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n > 0 ? n : undefined;
   })();
+  let workerdCompatibilityDate: string | undefined = Deno.env.get("1TUBE_WORKERD_COMPAT_DATE") || undefined;
+  const workerdCompatibilityFlags: string[] = (Deno.env.get("1TUBE_WORKERD_COMPAT_FLAGS") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  let workerdExperimental = envFlag("1TUBE_WORKERD_EXPERIMENTAL");
   let port = parseInt(Deno.env.get("PORT") || "3100", 10);
   let host = (Deno.env.get("1TUBE_HOST") || "127.0.0.1").trim();
   let functionsPath = Deno.env.get("FUNCTIONS_PATH") || "./supabase/functions";
@@ -302,6 +314,18 @@ function parseArgs(): CliOpts {
     } else if (a.startsWith("--workerd-max-heap-mb=")) {
       const n = parseInt(a.slice("--workerd-max-heap-mb=".length), 10);
       if (Number.isFinite(n) && n > 0) workerdMaxHeapMB = n;
+    } else if (a === "--compat-date" && args[i + 1]) {
+      workerdCompatibilityDate = args[++i];
+    } else if (a.startsWith("--compat-date=")) {
+      workerdCompatibilityDate = a.slice("--compat-date=".length);
+    } else if (a === "--compat-flag" && args[i + 1]) {
+      workerdCompatibilityFlags.push(args[++i]);
+    } else if (a.startsWith("--compat-flag=")) {
+      workerdCompatibilityFlags.push(a.slice("--compat-flag=".length));
+    } else if (a === "--workerd-experimental" || a === "--workerd-experimental=true") {
+      workerdExperimental = true;
+    } else if (a === "--workerd-experimental=false" || a === "--no-workerd-experimental") {
+      workerdExperimental = false;
     } else if (a === "--kill-stale-workerd" || a === "--kill-stale-workerd=true") {
       // Boolean flag — accept both bare-flag and explicit `=true` forms
       // so we don't surprise scripts that programmatically generate
@@ -348,6 +372,9 @@ function parseArgs(): CliOpts {
     workerdBasePort,
     workerdInspector,
     workerdMaxHeapMB,
+    workerdCompatibilityDate,
+    workerdCompatibilityFlags,
+    workerdExperimental,
     killStaleWorkerd,
     prebuiltDir,
   };
@@ -423,6 +450,17 @@ function enforceProdSecrets() {
 
 const opts = parseArgs();
 const internalKey = Deno.env.get("INTERNAL_KEY")?.trim() || undefined;
+
+function isInternalRequest(req: Request): boolean {
+  if (!internalKey) return false;
+  const header = req.headers.get("Authorization");
+  const match = header?.match(/^Bearer\s+(.+)$/i);
+  return match?.[1]?.trim() === internalKey;
+}
+
+function requireInternal(c: Context): Response | null {
+  return isInternalRequest(c.req.raw) ? null : c.json({ error: "Forbidden" }, 403);
+}
 
 if (opts.dev) {
   applyDevDefaults();
@@ -703,6 +741,15 @@ if (opts.backend === "workerd") {
       `[1tube] auto-kill leftover workerd: ON (--kill-stale-workerd)`,
     );
   }
+  if (opts.workerdCompatibilityDate || (opts.workerdCompatibilityFlags?.length ?? 0) > 0) {
+    console.log(
+      `[1tube] workerd compatibility: date=${opts.workerdCompatibilityDate ?? "default"} ` +
+        `flags=${(opts.workerdCompatibilityFlags ?? []).join(",") || "default"}`,
+    );
+  }
+  if (opts.workerdExperimental) {
+    console.log(`[1tube] workerd process experimental mode: ON (--experimental)`);
+  }
   workerdBackend = createWorkerdBackend({
     functionsDir: opts.functionsPath,
     // The bundler resolves npm: / jsr: / https: specifiers via Deno's
@@ -716,6 +763,11 @@ if (opts.backend === "workerd") {
     ...(opts.workerdBasePort ? { basePort: opts.workerdBasePort } : {}),
     ...(opts.workerdInspector ? { inspectorAddr: opts.workerdInspector } : {}),
     ...(opts.workerdMaxHeapMB ? { maxHeapMB: opts.workerdMaxHeapMB } : {}),
+    ...(opts.workerdCompatibilityDate ? { compatibilityDate: opts.workerdCompatibilityDate } : {}),
+    ...((opts.workerdCompatibilityFlags?.length ?? 0) > 0
+      ? { compatibilityFlags: opts.workerdCompatibilityFlags }
+      : {}),
+    ...(opts.workerdExperimental ? { experimental: true } : {}),
     ...(opts.killStaleWorkerd ? { killStaleWorkerd: true } : {}),
     ...(opts.prebuiltDir ? { prebuiltDir: opts.prebuiltDir } : {}),
     sourcemap: opts.dev ? "inline" : "linked",
@@ -1305,6 +1357,69 @@ app.get(
     }
     return extras;
   }),
+);
+
+async function runFunctionAdmin(c: Context, action: (backend: WorkerdBackend) => Promise<Response>): Promise<Response> {
+  const forbidden = requireInternal(c);
+  if (forbidden) return forbidden;
+  if (!workerdBackend) {
+    return c.json({ error: "Edge function editor is available only with backend=workerd" }, 503);
+  }
+  try {
+    return await action(workerdBackend);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return c.json({ error: message }, 400);
+  }
+}
+
+app.get("/1tube/api/functions", (c) =>
+  runFunctionAdmin(c, async (backend) => c.json({
+    functions: await backend.listEditableFunctions(),
+  }))
+);
+
+app.get("/1tube/api/functions/:name/source", (c) =>
+  runFunctionAdmin(c, async (backend) => c.json(await backend.readEditableSource(c.req.param("name"))))
+);
+
+app.post("/1tube/api/functions", (c) =>
+  runFunctionAdmin(c, async (backend) => {
+    const body = await c.req.json().catch(() => ({})) as { name?: unknown };
+    if (typeof body.name !== "string" || body.name.trim().length === 0) {
+      return c.json({ error: "Missing function name" }, 400);
+    }
+    const source = await backend.createEditableFunction(body.name);
+    return c.json({ source, functions: await backend.listEditableFunctions() }, 201);
+  })
+);
+
+app.put("/1tube/api/functions/:name/source", (c) =>
+  runFunctionAdmin(c, async (backend) => {
+    const body = await c.req.json().catch(() => ({})) as { files?: unknown };
+    if (!body.files || typeof body.files !== "object" || Array.isArray(body.files)) {
+      return c.json({ error: "Expected JSON body { files: { path: content } }" }, 400);
+    }
+    const reload = await backend.saveEditableSource(
+      c.req.param("name"),
+      { files: body.files as Record<string, string> },
+    );
+    return c.json({ reload, functions: await backend.listEditableFunctions() });
+  })
+);
+
+app.delete("/1tube/api/functions/:name", (c) =>
+  runFunctionAdmin(c, async (backend) => {
+    const reload = await backend.deleteEditableFunction(c.req.param("name"));
+    return c.json({ reload, functions: await backend.listEditableFunctions() });
+  })
+);
+
+app.post("/1tube/api/functions/:name/revert", (c) =>
+  runFunctionAdmin(c, async (backend) => {
+    const reload = await backend.revertEditableFunction(c.req.param("name"));
+    return c.json({ reload, functions: await backend.listEditableFunctions() });
+  })
 );
 
 // Root liveness probe — intentionally minimal so we don't leak the registered

@@ -110,6 +110,26 @@ internal static class GatewayCommand
                 args.Add($"--workerd-max-heap-mb={heap}");
             }
 
+            if (!string.IsNullOrWhiteSpace(opts.WorkerdCompatibilityDate))
+            {
+                args.Add("--compat-date");
+                args.Add(opts.WorkerdCompatibilityDate.Trim());
+            }
+
+            if (opts.WorkerdCompatibilityFlags is { Count: > 0 } compatFlags)
+            {
+                foreach (var flag in compatFlags.Where(s => !string.IsNullOrWhiteSpace(s)))
+                {
+                    args.Add("--compat-flag");
+                    args.Add(flag.Trim());
+                }
+            }
+
+            if (opts.WorkerdExperimental)
+            {
+                args.Add("--workerd-experimental");
+            }
+
             if (opts.KillStaleWorkerd)
             {
                 args.Add("--kill-stale-workerd");

@@ -9,6 +9,7 @@ using Microsoft.Extensions.Logging.Console;
 using Microsoft.Extensions.Options;
 using OneTube.Firmware;
 using OneTube.Secrets;
+using OneTube.Workerd;
 using Yarp.ReverseProxy.Forwarder;
 
 namespace OneTube;
@@ -117,6 +118,7 @@ public static class OneTubeExtensions
             var oneTubeOpts = sp.GetRequiredService<IOptions<OneTubeOptions>>().Value;
             var supervisor = sp.GetRequiredService<FirmwareSupervisor>();
             var logger = sp.GetRequiredService<ILogger<DenoHostService>>();
+            _ = sp.GetService<WorkerdCompatibilityStore>();
 
             // SecretsStore is registered iff AddOneTubeSecrets was
             // called. Resolve via GetService (not Required) so the
@@ -180,6 +182,26 @@ public static class OneTubeExtensions
     }
 
     /// <summary>
+    /// Enable runtime editing of workerd compatibility date, flags,
+    /// and process-level experimental mode. Applying edits reuses the
+    /// firmware supervisor's side-by-side gateway swap, same as
+    /// live secrets.
+    /// </summary>
+    public static IServiceCollection AddOneTubeWorkerdCompatibility(
+        this IServiceCollection services,
+        Action<WorkerdCompatibilityOptions>? configure = null)
+    {
+        if (configure is not null) services.Configure(configure);
+        else services.AddOptions<WorkerdCompatibilityOptions>();
+
+        services.AddSingleton<WorkerdCompatibilityStore>();
+        services.AddSingleton<WorkerdCompatibilityHotSwapWatcher>();
+        services.AddHostedService(sp => sp.GetRequiredService<WorkerdCompatibilityHotSwapWatcher>());
+
+        return services;
+    }
+
+    /// <summary>
     /// Map the live-secrets editor endpoints. Returns the underlying
     /// route group so the consumer can attach their own auth filter
     /// (<c>RequireAuthorization</c>, a custom <c>EndpointFilter</c>,
@@ -187,6 +209,9 @@ public static class OneTubeExtensions
     /// </summary>
     public static RouteGroupBuilder MapOneTubeSecrets(this IEndpointRouteBuilder endpoints)
         => SecretsEndpoints.MapOneTubeSecrets(endpoints);
+
+    public static RouteGroupBuilder MapOneTubeWorkerdCompatibility(this IEndpointRouteBuilder endpoints)
+        => WorkerdCompatibilityEndpoints.MapOneTubeWorkerdCompatibility(endpoints);
 
     /// <summary>
     /// Map the firmware admin endpoints under the configured

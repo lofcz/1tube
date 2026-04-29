@@ -1,0 +1,13 @@
+// Sanity check: does workerd survive past --help? --version is
+// often handled before any heavy runtime init; --help triggers the
+// full cmdline parser. If --version works (workerd-version) but
+// --help std::terminate's, the binary's runtime is broken
+// regardless of config.
+{
+  "id": "workerd-help",
+  "name": "workerd --help",
+  "description": "Distinguishes a broken binary runtime from a broken serve codepath.",
+  "executable": "${WorkerdPath}",
+  "args": ["--help"],
+  "timeoutSec": 5
+}

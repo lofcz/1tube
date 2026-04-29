@@ -39,6 +39,8 @@ export interface PrebuiltFunctionEntry {
   moduleFiles: string[];
   /** Per-function `1tube.json` parsed at build time. */
   manifest: FunctionManifest;
+  /** Optional inspectable authored source files under `sources/<name>/`. */
+  sourceFiles?: string[];
 }
 
 export interface PrebuiltChunkEntry {
@@ -128,6 +130,9 @@ export function parsePrebuiltManifest(raw: unknown): PrebuiltManifest {
       bundleSha256,
       moduleFiles: moduleFiles.length > 0 ? moduleFiles : [bundleFile],
       manifest: parseManifest(e.manifest, /* fromFile */ true),
+      sourceFiles: Array.isArray(e.sourceFiles)
+        ? e.sourceFiles.filter((n): n is string => typeof n === "string")
+        : undefined,
     };
   });
   const chunks: PrebuiltChunkEntry[] = Array.isArray(obj.chunks)

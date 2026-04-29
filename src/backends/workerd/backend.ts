@@ -31,7 +31,7 @@
  * braces guarantee.
  */
 
-import { isAbsolute, join, resolve as resolvePath } from "node:path";
+import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
 import { type AuthContext } from "../../registry.ts";
 import { type FunctionManifest, loadManifest } from "../../manifest.ts";
@@ -47,6 +47,14 @@ import {
   parsePrebuiltManifest,
   type PrebuiltManifest,
 } from "./prebuilt.ts";
+import {
+  copyPrebuiltRuntimeFiles,
+  defaultRuntimeOverrideRoot,
+  RuntimeOverrideStore,
+  type EditableSourceResponse,
+  type EditableFunctionSummary,
+  type SaveEditableSourceInput,
+} from "./runtime-overrides.ts";
 import { type CapnpRoute, generateCapnp } from "./capnp.ts";
 import {
   SHARED_RUNTIME_TOKEN_ENV,
@@ -76,6 +84,8 @@ export interface WorkerdBackendOptions {
    * `node_modules/` exists, else `.1tube-cache/workerd/`.
    */
   cacheDir?: string;
+  /** Writable runtime source/bundle overlay used by the admin edge editor. */
+  runtimeOverrideDir?: string;
   /** Loopback address for workerd sockets. Defaults to `"127.0.0.1"`. */
   bindAddress?: string;
   /** First port to assign to a function. Defaults to `8800`. */
@@ -84,6 +94,8 @@ export interface WorkerdBackendOptions {
   compatibilityDate?: string;
   /** Compatibility flags applied to every service. */
   compatibilityFlags?: readonly string[];
+  /** Pass `--experimental` to the workerd process. */
+  experimental?: boolean;
   /** Sourcemap mode passed to the bundler. */
   sourcemap?: boolean | "linked" | "inline";
   /** Sink for workerd's [workerd]-prefixed log lines. Defaults to stderr. */
@@ -135,8 +147,8 @@ export interface WorkerdBackendOptions {
    *
    * In this mode `functionsDir` is ignored, no bundler is created (so
    * the operator does not need esbuild's worker subprocess on the box),
-   * and `reload()` is unsupported — the artifact is sealed. HMR must
-   * not be enabled by the gateway when this is set.
+   * and runtime reloads compose the sealed artifact with admin
+   * overlays. HMR must not be enabled by the gateway when this is set.
    *
    * Bundle integrity is verified against the manifest's recorded
    * sha-256 at boot, so a tampered bundle fails fast with a clear
@@ -329,6 +341,12 @@ export interface WorkerdBackend {
    * exactly what the e2e tests assert on.
    */
   readonly lastReloadDurationMs: number | null;
+  listEditableFunctions(): Promise<EditableFunctionSummary[]>;
+  readEditableSource(name: string): Promise<EditableSourceResponse>;
+  saveEditableSource(name: string, input: SaveEditableSourceInput): Promise<WorkerdReloadResult>;
+  createEditableFunction(name: string): Promise<EditableSourceResponse>;
+  deleteEditableFunction(name: string): Promise<WorkerdReloadResult>;
+  revertEditableFunction(name: string): Promise<WorkerdReloadResult>;
   /** Tear down workerd and dispose esbuild's worker. Idempotent. */
   stop(): Promise<void>;
 }
@@ -824,6 +842,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
   // Mutable state set during start(). Kept in closure scope so dispatch()
   // can reach it without an extra indirection layer.
   let bundler: Bundler | null = null;
+  let overlayBundler: Bundler | null = null;
   let process: WorkerdProcess | null = null;
   let routesByName = new Map<string, CapnpRoute>();
   let workerdVersion: string | null = null;
@@ -867,8 +886,19 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       ? opts.prebuiltDir
       : resolvePath(cwd, opts.prebuiltDir))
     : null;
+  const runtimeEditorEnabled = prebuiltDir !== null;
   let prebuiltManifest: PrebuiltManifest | null = null;
   let sharedRuntime: WorkerdSharedRuntime | null = null;
+  const runtimeOverrides = new RuntimeOverrideStore({
+    rootDir: opts.runtimeOverrideDir
+      ? (isAbsolute(opts.runtimeOverrideDir) ? opts.runtimeOverrideDir : resolvePath(cwd, opts.runtimeOverrideDir))
+      : defaultRuntimeOverrideRoot(cwd),
+    sourceFunctionsDir: resolvedFunctionsDir,
+    prebuiltDir,
+    getPrebuiltManifest: () => prebuiltManifest,
+    getLiveManifests: () => manifests,
+    getBundleBytes: () => bundleBytes,
+  });
 
   /**
    * Shared boot pipeline used by both `start()` and `reload()`.
@@ -916,7 +946,11 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     // while live mode allocates the usual node_modules/.cache slot.
     if (cacheDir === null) {
       if (prebuiltDir !== null) {
-        cacheDir = prebuiltDir;
+        cacheDir = opts.cacheDir
+          ? (isAbsolute(opts.cacheDir) ? opts.cacheDir : resolvePath(cwd, opts.cacheDir))
+          : join(await defaultCacheDir(cwd), "prebuilt-runtime");
+        await ensureDir(cacheDir);
+        await writeGitignore(cacheDir);
       } else {
         cacheDir = opts.cacheDir
           ? (isAbsolute(opts.cacheDir) ? opts.cacheDir : resolvePath(cwd, opts.cacheDir))
@@ -933,6 +967,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     // to the caller for the WorkerdReloadResult; prebuilt mode never
     // rebuilds anything so this stays empty there.
     let rebundledNames: string[] = [];
+    const overlayManifests = new Map<string, FunctionManifest>();
     if (prebuiltDir !== null) {
       // Prebuilt mode — every "bundle" already exists on disk. We
       // synthesise BundleResults from the manifest so the rest of
@@ -945,7 +980,14 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         // with a null manifest. Raising hard makes the bug obvious.
         throw new Error("prebuilt manifest not loaded");
       }
-      let entries = prebuiltManifest.functions;
+      await copyPrebuiltRuntimeFiles(prebuiltManifest, prebuiltDir, cacheDir!);
+      const baseNames = new Set(prebuiltManifest.functions.map((e) => e.name));
+      const overlays = runtimeEditorEnabled
+        ? await runtimeOverrides.compose(baseNames)
+        : [];
+      for (const overlay of overlays) overlayManifests.set(overlay.name, overlay.manifest);
+      const patchedNames = new Set(overlays.filter((e) => e.origin === "patched").map((e) => e.name));
+      let entries = prebuiltManifest.functions.filter((e) => !patchedNames.has(e.name));
       if (opts.only && opts.only.length > 0) {
         const allow = new Set(opts.only);
         entries = entries.filter((e) => allow.has(e.name));
@@ -967,6 +1009,22 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         byteLength: e.bundleBytes,
         durationMs: 0,
       }));
+      if (overlays.length > 0) {
+        if (!overlayBundler) {
+          overlayBundler = createBundler({
+            outDir: join(cacheDir!, "runtime-overrides"),
+            configPath,
+            sourcemap: "linked",
+            minify: true,
+          });
+        }
+        const overlayResults = await overlayBundler.bundleAll(
+          overlays.map((entry) => ({ name: entry.name, entrypoint: entry.entrypoint })),
+          { concurrency: opts.bundleConcurrency ?? 4 },
+        );
+        bundleResults.push(...overlayResults);
+        rebundledNames = overlayResults.map((r) => r.name);
+      }
       for (const shared of prebuiltManifest.sharedModules) {
         sharedModules.push({
           id: shared.id,
@@ -984,6 +1042,18 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
             `workerd backend: no functions matched 'only' filter ${JSON.stringify(opts.only)}`,
           );
         }
+      }
+      const baseNames = new Set(inputs.map((i) => i.name));
+      const overlays = runtimeEditorEnabled
+        ? await runtimeOverrides.compose(baseNames)
+        : [];
+      for (const overlay of overlays) overlayManifests.set(overlay.name, overlay.manifest);
+      if (overlays.length > 0) {
+        const overlayNames = new Set(overlays.map((entry) => entry.name));
+        inputs = [
+          ...inputs.filter((input) => !overlayNames.has(input.name)),
+          ...overlays.map((entry) => ({ name: entry.name, entrypoint: entry.entrypoint })),
+        ].sort((a, b) => a.name.localeCompare(b.name));
       }
       if (inputs.length === 0) {
         // Empty functions dir is a legitimate state — typically a
@@ -1183,15 +1253,18 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       const newManifests = new Map<string, FunctionManifest>();
       if (prebuiltDir !== null && prebuiltManifest) {
         for (const e of prebuiltManifest.functions) {
-          newManifests.set(e.name, e.manifest);
+          if (!overlayManifests.has(e.name)) newManifests.set(e.name, e.manifest);
         }
       } else {
         await Promise.all(
           bundleResults.map(async (r) => {
-            const m = await loadManifest(resolvedFunctionsDir, r.name);
+            const m = overlayManifests.get(r.name) ?? await loadManifest(resolvedFunctionsDir, r.name);
             newManifests.set(r.name, m);
           }),
         );
+      }
+      for (const [name, manifest] of overlayManifests) {
+        newManifests.set(name, manifest);
       }
 
       // Mirror the Deno backend's two-mode env story:
@@ -1218,8 +1291,10 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         : [];
       const capnpInputs = bundleResults.map((r) => {
         const m = newManifests.get(r.name)!;
-        const bundleEmbedPath = prebuiltBundleFiles?.get(r.name) ??
-          r.bundlePath.split(/[\\/]/).pop()!;
+        const bundleEmbedPath = overlayManifests.has(r.name)
+          ? relative(cacheDir!, r.bundlePath).replaceAll("\\", "/")
+          : prebuiltBundleFiles?.get(r.name) ??
+            relative(cacheDir!, r.bundlePath).replaceAll("\\", "/");
         const fnEnvBindings = intersectEnvForFunction(gatewayEnvBindings, m.permissions.env, enforceManifest);
         for (const internalName of internalEnvBindings) {
           if (!fnEnvBindings.includes(internalName)) fnEnvBindings.push(internalName);
@@ -1231,7 +1306,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
           // and capnp is written at dist/, so use the manifest-relative
           // path ("functions/<fn>.js") or workerd cannot resolve embeds.
           bundleBasename: bundleEmbedPath,
-          moduleFiles: prebuiltModuleFiles?.get(r.name),
+          moduleFiles: overlayManifests.has(r.name) ? undefined : prebuiltModuleFiles?.get(r.name),
           envBindings: fnEnvBindings,
         };
       });
@@ -1378,12 +1453,16 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       if (verboseWorkerd) {
         console.log(`[1tube] workerd verbose logging enabled (1TUBE_WORKERD_VERBOSE=1)`);
       }
+      const globalArgs = [
+        ...(verboseWorkerd ? ["-v"] : []),
+        ...(opts.experimental ? ["--experimental"] : []),
+      ];
 
       const newProcess = createWorkerdProcess({
         binary: workerdBin,
         capnpPath,
         routes: capnp.routes,
-        ...(verboseWorkerd ? { globalArgs: ["-v"] } : {}),
+        ...(globalArgs.length > 0 ? { globalArgs } : {}),
         extraArgs,
         env: sharedRuntime
           ? {
@@ -1598,6 +1677,15 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     return reloadInFlight;
   }
 
+  function requireRuntimeEditor(): void {
+    if (!runtimeEditorEnabled) {
+      throw new Error(
+        "edge function runtime editor is disabled outside prebuilt workerd mode; " +
+          "use HMR/source files for local development",
+      );
+    }
+  }
+
   return {
     get pid() {
       return process?.pid ?? null;
@@ -1624,6 +1712,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     async start() {
       if (started) throw new Error("workerd backend already started");
       started = true;
+      if (runtimeEditorEnabled) await runtimeOverrides.load();
 
       // Load + verify the prebuilt manifest BEFORE probing workerd, so
       // a stale / tampered artifact fails with a clear error before we
@@ -1783,19 +1872,9 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     },
 
     reload(changed) {
-      // Prebuilt artifacts are sealed — block every public reload
-      // request. Crash-recovery still works because the internal
-      // crash handler calls `doReload` directly (re-spawning workerd
-      // against the same on-disk bundles is legitimate; only
-      // re-bundling is forbidden).
-      if (prebuiltDir !== null) {
-        return Promise.reject(
-          new Error(
-            "workerd backend is in prebuilt mode; reload is not supported. " +
-              "Re-run `1tube build` and restart the gateway to pick up changes.",
-          ),
-        );
-      }
+      // Prebuilt firmware remains immutable; reload now means "compose
+      // the same base artifact plus runtime overlays into a fresh
+      // workerd generation".
       return doReload(changed);
     },
 
@@ -1840,6 +1919,44 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       }
     },
 
+    async listEditableFunctions() {
+      requireRuntimeEditor();
+      return await runtimeOverrides.list(new Set(names));
+    },
+
+    async readEditableSource(name) {
+      requireRuntimeEditor();
+      return await runtimeOverrides.read(name, new Set(names));
+    },
+
+    async createEditableFunction(name) {
+      requireRuntimeEditor();
+      if (names.includes(name.trim())) {
+        throw new Error(`function "${name}" exists in firmware; open Code and save a patch instead`);
+      }
+      const source = await runtimeOverrides.create(name);
+      await doReload(new Set([name]));
+      return source;
+    },
+
+    async saveEditableSource(name, input) {
+      requireRuntimeEditor();
+      await runtimeOverrides.save(name, input, new Set(names));
+      return await doReload(new Set([name]));
+    },
+
+    async deleteEditableFunction(name) {
+      requireRuntimeEditor();
+      await runtimeOverrides.deleteAdded(name);
+      return await doReload("all");
+    },
+
+    async revertEditableFunction(name) {
+      requireRuntimeEditor();
+      await runtimeOverrides.revert(name);
+      return await doReload(new Set([name]));
+    },
+
     async stop() {
       if (stopping) return;
       stopping = true;
@@ -1852,8 +1969,12 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         if (bundler) {
           await bundler.dispose().catch(() => {});
         }
+        if (overlayBundler && overlayBundler !== bundler) {
+          await overlayBundler.dispose().catch(() => {});
+        }
         sharedRuntime = null;
         bundler = null;
+        overlayBundler = null;
         process = null;
         manifests.clear();
       }

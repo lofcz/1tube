@@ -1,0 +1,15 @@
+// Same as workerd-minimal but with --verbose. KJ runtime logs the
+// failing assertion (REQUIRE / ASSERT) before workerd calls
+// std::terminate; without -v those lines are silenced. This is the
+// cheapest next step — no extra binaries, no registry, no admin.
+{
+  "id": "workerd-minimal-verbose",
+  "name": "workerd serve <minimal capnp> --verbose",
+  "description": "workerd-minimal with --verbose. Often surfaces the KJ assertion that fires immediately before std::terminate.",
+  "executable": "${WorkerdPath}",
+  "args": ["serve", "--verbose", "${ProbeCapnp}"],
+  "cwd": "${DiagDir}",
+  "env": { "KJ_LOG_LEVEL": "DEBUG" },
+  "timeoutSec": 5,
+  "daemon": true
+}

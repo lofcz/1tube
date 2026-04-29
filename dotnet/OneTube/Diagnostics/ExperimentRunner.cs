@@ -167,6 +167,16 @@ public sealed class ExperimentRunner
                 DurationMs: sw.ElapsedMilliseconds, Stdout: "", Stderr: "",
                 Error: "executable was empty after token expansion (was " + spec.Executable + ")");
         }
+        // Bare executable names (powershell.exe, cmd.exe, deno) live
+        // on PATH, not as absolute paths — resolve them ourselves so
+        // template authors don't have to hard-code C:\Windows\System32
+        // paths everywhere. We only do PATH lookup when the user
+        // didn't supply a directory separator; absolute/relative paths
+        // are checked literally and reported clearly if missing.
+        if (!Path.IsPathRooted(executable) && !executable.Contains(Path.DirectorySeparatorChar) && !executable.Contains(Path.AltDirectorySeparatorChar))
+        {
+            executable = ResolveOnPath(executable) ?? executable;
+        }
         if (!File.Exists(executable))
         {
             sw.Stop();
@@ -174,7 +184,35 @@ public sealed class ExperimentRunner
                 spec.Id, spec.Name, spec.Executable, executable, args, cwd, env,
                 ExitCode: null, TimedOut: false, Killed: false,
                 DurationMs: sw.ElapsedMilliseconds, Stdout: "", Stderr: "",
-                Error: $"executable not found on disk: {executable}");
+                Error: $"executable not found on disk or PATH: {executable}");
+        }
+
+        // Detect args that started life as a single ${TOKEN} but
+        // expanded to empty. This is the "no firmware flashed yet,
+        // ${ActiveCapnp} is null" trap — without this guard workerd
+        // would receive an empty positional arg and silently treat
+        // its cwd as the input file, producing a cryptic CreateFile
+        // OPEN_EXISTING failure.
+        var emptyTokens = new List<string>();
+        for (int i = 0; i < spec.Args.Count; i++)
+        {
+            var raw = spec.Args[i];
+            if (raw.StartsWith("${", StringComparison.Ordinal) && raw.EndsWith('}') &&
+                raw.IndexOf("${", 2, StringComparison.Ordinal) < 0 &&
+                string.IsNullOrEmpty(args[i]))
+            {
+                emptyTokens.Add(raw);
+            }
+        }
+        if (emptyTokens.Count > 0)
+        {
+            sw.Stop();
+            return new ExperimentResult(
+                spec.Id, spec.Name, spec.Executable, executable, args, cwd, env,
+                ExitCode: null, TimedOut: false, Killed: false,
+                DurationMs: sw.ElapsedMilliseconds, Stdout: "", Stderr: "",
+                Error: "Token(s) expanded to empty string: " + string.Join(", ", emptyTokens) +
+                       ". For ${ActiveCapnp} this means no firmware has been flashed yet — flash a firmware first or pick a different experiment.");
         }
 
         // Auto-materialize the minimal capnp probe if the experiment
@@ -294,6 +332,30 @@ public sealed class ExperimentRunner
         }
     }
 
+    private static string? ResolveOnPath(string name)
+    {
+        // Honor PATHEXT on Windows so "powershell" resolves to
+        // powershell.exe; on non-Windows we just try the name as-is.
+        var pathExt = OperatingSystem.IsWindows()
+            ? (Environment.GetEnvironmentVariable("PATHEXT") ?? ".COM;.EXE;.BAT;.CMD")
+                .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            : new[] { "" };
+        var hasExt = Path.HasExtension(name);
+        var paths = (Environment.GetEnvironmentVariable("PATH") ?? "")
+            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        foreach (var dir in paths)
+        {
+            foreach (var ext in hasExt ? new[] { "" } : pathExt)
+            {
+                string candidate;
+                try { candidate = Path.Combine(dir, name + ext); }
+                catch { continue; }
+                if (File.Exists(candidate)) return candidate;
+            }
+        }
+        return null;
+    }
+
     private static string ExpandTokens(string value, IReadOnlyDictionary<string, string> tokens)
     {
         if (string.IsNullOrEmpty(value) || value.IndexOf("${", StringComparison.Ordinal) < 0) return value;
@@ -354,6 +416,69 @@ public sealed class ExperimentRunner
             Cwd = "${DiagDir}",
             TimeoutSec = 10,
             Daemon = true,
+        },
+        // ── std::terminate triage helpers ──────────────────────────
+        new ExperimentSpec
+        {
+            Id = "workerd-help",
+            Name = "workerd --help",
+            Description = "Workerd starts normally and prints usage. If --version works but --help also fails, the binary's own runtime init is broken (CRT, ICU, missing DLL).",
+            Executable = "${WorkerdPath}",
+            Args = ["--help"],
+            TimeoutSec = 5,
+        },
+        new ExperimentSpec
+        {
+            Id = "host-diag",
+            Name = "host environment dump",
+            Description = "Identity / Job Object / loaded modules / VC runtime version of the C# host. Most workerd std::terminate cases on shared IIS hosts come down to: process is in a restrictive Job, missing VC++ redist, or AppLocker blocking a DLL load.",
+            Executable = "powershell.exe",
+            Args = [
+                "-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference='Continue';" +
+                "Write-Host '== whoami =='; whoami /all 2>&1 | Out-String;" +
+                "Write-Host '== process =='; Get-Process -Id $PID | Format-List Name, Id, Path, StartTime, MainModule | Out-String;" +
+                "Write-Host '== job object =='; Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public static class J{[DllImport(\"kernel32\")]public static extern bool IsProcessInJob(IntPtr h, IntPtr j, out bool r);[DllImport(\"kernel32\")]public static extern IntPtr GetCurrentProcess();}'; $r=$false; [J]::IsProcessInJob([J]::GetCurrentProcess(),[IntPtr]::Zero,[ref]$r) | Out-Null; \"InJob=$r\";" +
+                "Write-Host '== workerd file info =='; Get-Item '${WorkerdPath}' | Format-List FullName, Length, LastWriteTime | Out-String;" +
+                "(Get-Command '${WorkerdPath}').FileVersionInfo | Format-List FileVersion, ProductVersion, OriginalFilename | Out-String;" +
+                "Write-Host '== vcruntime =='; Get-ChildItem 'C:\\Windows\\System32\\vcruntime*.dll','C:\\Windows\\System32\\msvcp*.dll','C:\\Windows\\System32\\ucrtbase.dll' -ErrorAction SilentlyContinue | Select-Object Name, Length, @{n='Ver';e={(Get-Command $_.FullName).FileVersionInfo.FileVersion}} | Format-Table -AutoSize | Out-String;" +
+                "Write-Host '== drive map =='; Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize | Out-String;"
+            ],
+            TimeoutSec = 15,
+        },
+        new ExperimentSpec
+        {
+            Id = "crash-dumps",
+            Name = "list workerd/deno crash dumps",
+            Description = "Scans the standard Windows Error Reporting locations for recent workerd/deno crash dumps. WER writes a .dmp on std::terminate if collection is enabled; if no files appear here, WER dump collection is disabled for the host identity (HKCU\\Software\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps).",
+            Executable = "powershell.exe",
+            Args = [
+                "-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference='Continue';" +
+                "$paths = @(\"$env:LOCALAPPDATA\\CrashDumps\", \"$env:USERPROFILE\\AppData\\Local\\CrashDumps\", 'C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportArchive', 'C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue', '${DiagDir}');" +
+                "foreach ($p in $paths) { Write-Host \"== $p ==\"; if (Test-Path $p) { Get-ChildItem $p -Recurse -File -ErrorAction SilentlyContinue -Include 'workerd*','*.dmp','Report.wer' | Sort-Object LastWriteTime -Descending | Select-Object -First 20 FullName, Length, LastWriteTime | Format-Table -AutoSize | Out-String } else { 'not present' } }"
+            ],
+            TimeoutSec = 10,
+        },
+        new ExperimentSpec
+        {
+            Id = "enable-wer-dumps",
+            Name = "enable WER dumps for workerd (HKCU)",
+            Description = "Configures Windows Error Reporting to write full crash dumps for workerd.exe to ${DiagDir}/wer-dumps the next time workerd terminates abnormally. Writes to HKCU so it works without admin (the registry value is per-user; the C# host runs as your domain account, which is the same identity that spawns workerd).",
+            Executable = "powershell.exe",
+            Args = [
+                "-NoProfile", "-NonInteractive", "-Command",
+                "$ErrorActionPreference='Stop';" +
+                "$dump = '${DiagDir}\\wer-dumps'; New-Item -ItemType Directory -Force -Path $dump | Out-Null;" +
+                "$key = 'HKCU:\\Software\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\workerd.exe';" +
+                "New-Item -Path $key -Force | Out-Null;" +
+                "Set-ItemProperty -Path $key -Name DumpFolder -Value $dump -Type ExpandString;" +
+                "Set-ItemProperty -Path $key -Name DumpType -Value 2 -Type DWord;" +
+                "Set-ItemProperty -Path $key -Name DumpCount -Value 10 -Type DWord;" +
+                "Get-ItemProperty -Path $key | Format-List | Out-String;" +
+                "Write-Host \"WER dumps for workerd.exe will land in $dump on next crash. Run a workerd experiment afterwards, then re-run crash-dumps.\""
+            ],
+            TimeoutSec = 8,
         },
     };
 

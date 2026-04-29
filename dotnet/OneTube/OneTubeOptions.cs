@@ -170,6 +170,27 @@ public sealed class OneTubeOptions
     public int? WorkerdMaxHeapMb { get; set; }
 
     /// <summary>
+    /// Compatibility date written into generated workerd configs.
+    /// Maps to <c>--compat-date</c>. Null means the gateway's own
+    /// default/clamping logic chooses the date.
+    /// </summary>
+    public string? WorkerdCompatibilityDate { get; set; }
+
+    /// <summary>
+    /// Compatibility flags written into generated workerd configs.
+    /// Maps to repeated <c>--compat-flag</c>. Null means the gateway's
+    /// own defaults (<c>nodejs_compat</c>, etc.) apply.
+    /// </summary>
+    public IReadOnlyList<string>? WorkerdCompatibilityFlags { get; set; }
+
+    /// <summary>
+    /// Passes <c>--experimental</c> to the workerd process. Required
+    /// when <see cref="WorkerdCompatibilityFlags"/> contains the
+    /// <c>experimental</c> compatibility flag.
+    /// </summary>
+    public bool WorkerdExperimental { get; set; }
+
+    /// <summary>
     /// Auto-kill leftover <c>workerd</c> processes when the boot-time
     /// port preflight finds one of workerd's sockets already busy.
     /// Maps to <c>--kill-stale-workerd</c>. Recommended <c>true</c> on

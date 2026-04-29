@@ -1,0 +1,14 @@
+{
+  "id": "workerd-dbg-version",
+  "name": "workerd DBG --version",
+  "description": "Checks whether the prod host can load and execute workerd-dbg.exe at all. Exit 0xc0000135 means missing DLL/runtime before main().",
+  "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  "args": [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "$ErrorActionPreference='Continue'; $bin=Split-Path '${WorkerdPath}'; $w=Join-Path $bin 'workerd-dbg.exe'; Write-Output \"workerd: $w\"; if (-not (Test-Path $w)) { Write-Error \"debug workerd not found: $w\"; exit 2 }; & $w --version 2>&1 | Out-String; Write-Output \"native exit=$LASTEXITCODE\"; exit $LASTEXITCODE"
+  ],
+  "cwd": "${DiagDir}",
+  "timeoutSec": 15
+}

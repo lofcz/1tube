@@ -242,6 +242,21 @@ async function collectDistFiles(
     if (!(err instanceof Deno.errors.NotFound)) throw err;
   }
 
+  for (const fn of manifest.functions) {
+    for (const sourceFile of fn.sourceFiles ?? []) {
+      const src = join(distDir, "sources", fn.name, sourceFile);
+      try {
+        const fileStat = await Deno.stat(src);
+        if (fileStat.isFile) {
+          const rel = `sources/${fn.name}/${sourceFile}`.replace(/\\/g, "/");
+          plan.push({ src, zipPath: `dist/${rel}`, size: fileStat.size });
+        }
+      } catch (err) {
+        if (!(err instanceof Deno.errors.NotFound)) throw err;
+      }
+    }
+  }
+
   const plannedZipPaths = new Set(plan.map((p) => p.zipPath));
   for (const fn of manifest.functions) {
     const expected = `dist/${fn.bundleFile}`;

@@ -32,7 +32,7 @@
  */
 
 import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
-import { isAbsolute, join, resolve as resolvePath } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import {
   bundleAllChunked,
   bundleSharedModule,
@@ -146,6 +146,37 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return out;
 }
 
+async function copySourceSnapshot(functionsDir: string, name: string, outDir: string): Promise<string[]> {
+  const sourceRoot = join(functionsDir, name);
+  const outRoot = join(outDir, "sources", name);
+  const files: string[] = [];
+  async function walk(dir: string): Promise<void> {
+    for await (const entry of Deno.readDir(dir)) {
+      if (entry.name === "node_modules" || entry.name === ".git") continue;
+      const abs = join(dir, entry.name);
+      if (entry.isDirectory) {
+        await walk(abs);
+      } else if (entry.isFile) {
+        const rel = relative(sourceRoot, abs).replaceAll("\\", "/");
+        files.push(rel);
+        const dest = join(outRoot, rel);
+        await ensureDir(dirname(dest));
+        await Deno.copyFile(abs, dest);
+      }
+    }
+  }
+  await walk(sourceRoot);
+  return files.sort((a, b) => a.localeCompare(b));
+}
+
+async function removeDirIfExists(path: string): Promise<void> {
+  try {
+    await Deno.remove(path, { recursive: true });
+  } catch (err) {
+    if (!(err instanceof Deno.errors.NotFound)) throw err;
+  }
+}
+
 /**
  * Build every function under `functionsDir` into `outDir`. Idempotent
  * w.r.t. the on-disk artifact — running twice with the same inputs
@@ -180,6 +211,7 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
   }
 
   await ensureDir(outDir);
+  await removeDirIfExists(join(outDir, "sources"));
 
   // Bundles live under `dist/functions/` to mirror the `.1tube`
   // firmware payload layout. Manifest stays at `dist/manifest.json`
@@ -274,6 +306,7 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
       const bytes = await Deno.readFile(r.bundlePath);
       const sha = await sha256Hex(bytes);
       const manifest = await loadManifest(functionsDir, r.name);
+      const sourceFiles = await copySourceSnapshot(functionsDir, r.name, outDir);
       opts.onProgress?.({
         phase: "hash-function",
         current: idx + 1,
@@ -296,6 +329,7 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
         bundleSha256: sha,
         moduleFiles: chunkedFn?.moduleFiles ?? [bundleFile],
         manifest,
+        sourceFiles,
       };
     }),
   );
