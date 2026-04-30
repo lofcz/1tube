@@ -28,6 +28,13 @@ export interface DiscoveryProgress {
 export interface DiscoveryOptions {
   /** When set, appended as `?v=` to module URLs to force re-transpilation. */
   cacheBust?: string;
+  /**
+   * Optional alternate root for dynamic imports. Discovery and manifests still
+   * read from `functionsDir`; only module URLs are resolved under this root.
+   * Used by Deno-backend HMR snapshots so transitive relative imports get a
+   * fresh file URL namespace.
+   */
+  importRoot?: string;
   /** Restrict loading to this set of function names (others are skipped entirely). */
   only?: ReadonlySet<string>;
   /** Max number of concurrent dynamic imports. Defaults to 8. */
@@ -73,6 +80,9 @@ export async function discoverAndLoad(
   const errors: Array<{ name: string; error: string }> = [];
 
   const resolvedDir = await Deno.realPath(functionsDir);
+  const importRoot = options?.importRoot
+    ? await Deno.realPath(options.importRoot)
+    : resolvedDir;
 
   const candidates: string[] = [];
   for await (const entry of Deno.readDir(resolvedDir)) {
@@ -121,7 +131,7 @@ export async function discoverAndLoad(
   let completed = 0;
 
   const loadOne = async (name: string): Promise<void> => {
-    const indexPath = join(resolvedDir, name, "index.ts");
+    const indexPath = join(importRoot, name, "index.ts");
     // pathToFileURL is the node:url equivalent of std/path's toFileUrl;
     // both produce a `file://` URL whose searchParams we mutate below for
     // HMR cache-busting.
@@ -143,7 +153,11 @@ export async function discoverAndLoad(
       // on demand. This is the single biggest startup-time win for sites
       // with many rarely-called functions.
       if (options?.lazy && !manifest.warm) {
-        registry.registerCandidate({ name, moduleUrl: moduleUrl.href, manifest });
+        registry.registerCandidate({
+          name,
+          moduleUrl: moduleUrl.href,
+          manifest,
+        });
         deferred.push(name);
         const durationMs = performance.now() - start;
         options?.onProgress?.({
@@ -160,7 +174,11 @@ export async function discoverAndLoad(
       // Even in lazy mode, eagerly-warm functions still register a candidate
       // so HMR reloads can re-import via the same URL.
       if (options?.lazy && manifest.warm) {
-        registry.registerCandidate({ name, moduleUrl: moduleUrl.href, manifest });
+        registry.registerCandidate({
+          name,
+          moduleUrl: moduleUrl.href,
+          manifest,
+        });
       }
       await registry.runWithCurrentFunction(name, async () => {
         await import(moduleUrl.href);
@@ -193,13 +211,16 @@ export async function discoverAndLoad(
   // internally, but we still benefit from overlapping transpile + JSR fetches.
   const concurrency = Math.max(1, options?.concurrency ?? 8);
   let cursor = 0;
-  const workers = Array.from({ length: Math.min(concurrency, work.length) }, async () => {
-    while (true) {
-      const i = cursor++;
-      if (i >= work.length) return;
-      await loadOne(work[i]);
-    }
-  });
+  const workers = Array.from(
+    { length: Math.min(concurrency, work.length) },
+    async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= work.length) return;
+        await loadOne(work[i]);
+      }
+    },
+  );
   await Promise.all(workers);
 
   return { loaded, skipped, errors, removed, deferred };

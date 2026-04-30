@@ -12,13 +12,18 @@
  * Deno.serve() call, so we never actually open a socket.
  */
 
-import { assertEquals, assert } from "@std/assert";
-import { join, fromFileUrl } from "@std/path";
+import { assert, assertEquals } from "@std/assert";
+import { fromFileUrl, join } from "@std/path";
 
-const SERVER = join(fromFileUrl(new URL(".", import.meta.url)), "..", "src", "server.ts");
-const LEAKED_JWT =
-  "super-secret-jwt-token-with-at-least-32-characters-long";
-const LEAKED_SR = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU";
+const SERVER = join(
+  fromFileUrl(new URL(".", import.meta.url)),
+  "..",
+  "src",
+  "server.ts",
+);
+const LEAKED_JWT = "super-secret-jwt-token-with-at-least-32-characters-long";
+const LEAKED_SR =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU";
 
 async function runServer(
   env: Record<string, string>,
@@ -113,7 +118,8 @@ Deno.test({
 });
 
 Deno.test({
-  name: "dev-guard: --dev mode boots even without secrets (applies dev defaults)",
+  name:
+    "dev-guard: --dev mode boots even without secrets (applies dev defaults)",
   permissions: { run: true, read: true, write: true, env: true },
 }, async () => {
   // Use a bogus functions dir + ephemeral port; the boot still proceeds past
@@ -143,8 +149,9 @@ Deno.test({
       stderr: "piped",
     });
     const child = cmd.spawn();
-    // Give it long enough to apply dev defaults and start serving.
-    await new Promise((r) => setTimeout(r, 1500));
+    // Give cold Deno runs enough time to type-check imports, apply dev
+    // defaults, and start serving before we terminate the child.
+    await new Promise((r) => setTimeout(r, 5000));
     try {
       child.kill("SIGKILL");
     } catch {
