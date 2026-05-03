@@ -147,42 +147,47 @@ export function createDenoReloadDebouncer(
  *    precise case — exactly the functions that transitively import the
  *    changed file.
  * 2. Files matching `<functionsDir>/<name>/index.ts`: include `<name>`.
- *    Catches newly-added function dirs whose entry hasn't been graphed
- *    yet, plus the entry's own edits.
- * 3. Path is the directory `<functionsDir>/<name>` itself or anything
- *    under it (subtree change, including whole-dir removal). This is
- *    the case `Deno.watchFs` emits on Windows when a function dir is
- *    deleted — events come back as paths to the dir, not to the
- *    nonexistent files inside. Only matched against `knownNames` so
- *    random sibling-dir activity doesn't trigger spurious reloads.
+ *    Catches the entry's own edits.
+ * 3. Path is the directory `<functionsDir>/<name>` itself or any path
+ *    under it (subtree change). This is necessary for two cases the
+ *    other rules miss:
+ *      - **Linux**: `Deno.watchFs` is recursive only over the dirs
+ *        that existed at start. A *new* function dir reports a single
+ *        `<functionsDir>/<name>` create event — child file events
+ *        never fire because inotify doesn't auto-watch the new subdir.
+ *      - **Windows**: deleting a function dir tree emits dir-path
+ *        events instead of `index.ts` events.
+ *    Either way the affected name is the first path component after
+ *    `functionsDir`. We let `discoverCandidates` filter out junk
+ *    (e.g. `_shared`) on the reload pass so this rule stays simple
+ *    and doesn't need the host's knownNames set.
  */
 export function computeAffected(
   paths: readonly string[],
   depGraph: DepGraph,
-  options: { functionsDir?: string; knownNames?: Iterable<string> } = {},
+  options: { functionsDir?: string } = {},
 ): Set<string> {
   const out = depGraph.affected(paths);
   for (const p of paths) {
     const m = /[\\/]([^\\/]+)[\\/]index\.ts$/.exec(p);
     if (m && m[1]) out.add(m[1]);
   }
-  if (options.functionsDir && options.knownNames) {
+  if (options.functionsDir) {
     const fnDir = options.functionsDir.replace(/[\\/]$/, "");
-    for (const name of options.knownNames) {
-      // Cheap substring test — avoids escaping the name for a regex
-      // and works for both forward- and back-slashed paths.
-      const needleA = `${fnDir}\\${name}`;
-      const needleB = `${fnDir}/${name}`;
-      for (const p of paths) {
-        if (p === needleA || p === needleB) {
-          out.add(name);
-          break;
-        }
-        if (p.startsWith(needleA + "\\") || p.startsWith(needleB + "/")) {
-          out.add(name);
-          break;
-        }
-      }
+    for (const p of paths) {
+      // Strip the prefix; anything left should look like
+      // `/<name>` or `/<name>/<rest>`. Cross-platform: try both
+      // separators and accept whichever the OS produced.
+      let rest: string | null = null;
+      if (p.startsWith(fnDir + "/")) rest = p.slice(fnDir.length + 1);
+      else if (p.startsWith(fnDir + "\\")) rest = p.slice(fnDir.length + 1);
+      else if (p === fnDir) continue;
+      if (rest === null) continue;
+      const seg = rest.split(/[\\/]/, 1)[0];
+      // Skip private/shared dirs the host already filters out — keeps
+      // the affected set tight even before `reload()` runs.
+      if (!seg || seg.startsWith("_") || seg.endsWith("_shared")) continue;
+      out.add(seg);
     }
   }
   return out;
@@ -205,10 +210,29 @@ export function createDenoHotReloader(
     setTimer: opts.setTimer,
     clearTimer: opts.clearTimer,
     flushFn: async (paths) => {
-      const affected = computeAffected(paths, opts.host.depGraph, {
+      const raw = computeAffected(paths, opts.host.depGraph, {
         functionsDir: opts.functionsDir,
-        knownNames: opts.host.list(),
       });
+      // Filter to names that are either currently loaded or have an
+      // `index.ts` on disk right now. This drops spurious entries
+      // synthesized from non-function files at the root of
+      // `functionsDir` (README.md, .gitignore, …) so we don't spend
+      // a reload pass producing an empty summary.
+      const known = new Set(opts.host.list());
+      const affected = new Set<string>();
+      for (const name of raw) {
+        if (known.has(name)) {
+          affected.add(name);
+          continue;
+        }
+        try {
+          const indexPath = `${opts.functionsDir}/${name}/index.ts`;
+          const stat = await Deno.stat(indexPath);
+          if (stat.isFile) affected.add(name);
+        } catch {
+          // No index.ts → not a function; drop.
+        }
+      }
       if (affected.size === 0) return;
       const reason = `${affected.size} function(s) changed: ${
         [...affected].sort().join(", ")
