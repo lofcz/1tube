@@ -77,6 +77,29 @@ export interface FunctionCandidate {
   manifest: FunctionManifest;
 }
 
+/**
+ * Out-of-process function handle used by the Worker-backed Deno backend.
+ * The gateway holds a `WorkerFunctionHandle` instead of a JS handler;
+ * `dispatch()` forwards the request through `postMessage` to the
+ * function's Web Worker.
+ *
+ * Defined here (rather than in `backends/deno/`) so the registry can
+ * type its `workerHandles` map without a circular import. The actual
+ * implementation lives in `src/backends/deno/worker-host.ts`.
+ */
+export interface WorkerFunctionHandle {
+  readonly name: string;
+  readonly manifest: FunctionManifest;
+  readonly isPublic: boolean;
+  readonly timeoutMs?: number;
+  dispatch(
+    req: Request,
+    auth: AuthContext | null,
+    signal: AbortSignal,
+  ): Promise<Response>;
+  terminate(): Promise<void>;
+}
+
 export class FunctionRegistry {
   private handlers = new Map<string, RegisteredFunction>();
   private pendingManifests = new Map<string, FunctionManifest>();
@@ -91,6 +114,14 @@ export class FunctionRegistry {
    * a JS handler exists.
    */
   private externalManifests = new Map<string, FunctionManifest>();
+  /**
+   * Out-of-process worker handles for the Deno backend's Worker-per-function
+   * execution model. Treated as live, dispatchable functions: `has()` /
+   * `knownNames()` / `manifestFor()` all surface them, but they live in a
+   * separate Map so the in-process `handlers` / `candidates` paths used by
+   * tests and the legacy in-isolate model stay unaffected.
+   */
+  private workerHandles = new Map<string, WorkerFunctionHandle>();
   /** In-flight import dedupe: many concurrent first-requests await the same Promise. */
   private loading = new Map<string, Promise<RegisteredFunction | null>>();
 
@@ -153,16 +184,18 @@ export class FunctionRegistry {
     return (
       this.handlers.has(name) ||
       this.candidates.has(name) ||
-      this.externalManifests.has(name)
+      this.externalManifests.has(name) ||
+      this.workerHandles.has(name)
     );
   }
 
-  /** Names visible to dispatch (loaded handlers + unloaded candidates). */
+  /** Names visible to dispatch (loaded handlers + unloaded candidates + worker handles). */
   knownNames(): string[] {
     const out = new Set<string>();
     for (const k of this.handlers.keys()) out.add(k);
     for (const k of this.candidates.keys()) out.add(k);
     for (const k of this.externalManifests.keys()) out.add(k);
+    for (const k of this.workerHandles.keys()) out.add(k);
     return [...out].sort();
   }
 
@@ -206,8 +239,26 @@ export class FunctionRegistry {
     return (
       this.handlers.get(name)?.manifest ??
       this.candidates.get(name)?.manifest ??
+      this.workerHandles.get(name)?.manifest ??
       this.externalManifests.get(name)
     );
+  }
+
+  /**
+   * Register a Worker-backed function handle (Deno backend). Replaces any
+   * prior handle for `name` — callers are expected to terminate the old
+   * worker themselves; the registry doesn't own worker lifecycles.
+   */
+  setWorkerHandle(name: string, handle: WorkerFunctionHandle): void {
+    this.workerHandles.set(name, handle);
+  }
+
+  workerHandle(name: string): WorkerFunctionHandle | undefined {
+    return this.workerHandles.get(name);
+  }
+
+  clearWorkerHandle(name: string): boolean {
+    return this.workerHandles.delete(name);
   }
 
   /**
@@ -253,6 +304,7 @@ export class FunctionRegistry {
     this.pendingManifests.delete(name);
     this.candidates.delete(name);
     this.loading.delete(name);
+    this.workerHandles.delete(name);
     return this.handlers.delete(name);
   }
 
@@ -261,6 +313,7 @@ export class FunctionRegistry {
     this.pendingManifests.clear();
     this.candidates.clear();
     this.loading.clear();
+    this.workerHandles.clear();
   }
 
   list(): string[] {

@@ -16,12 +16,9 @@
 // cleanly when launched from a host project's node_modules — bare
 // specifiers would otherwise require the host's deno.json to mirror our
 // import map. Same convention applies to every src/ file.
-import { type Context, Hono } from "npm:hono@4";
+import { Hono, type Context } from "npm:hono@4";
 import { bodyLimit } from "npm:hono@4/body-limit";
-import { relative, sep as SEPARATOR } from "node:path";
 import { currentRequestStorage, FunctionRegistry } from "./registry.ts";
-import { discoverAndLoad, type DiscoveryProgress } from "./discovery.ts";
-import { createBootProgress } from "./boot-progress.ts";
 import { validateRequest } from "./gateway/auth.ts";
 import { watchdogBody } from "./gateway/body-watchdog.ts";
 import { corsMiddleware } from "./gateway/cors.ts";
@@ -29,18 +26,16 @@ import { loggingMiddleware } from "./gateway/logging.ts";
 import { createRateLimiter } from "./gateway/rate-limit.ts";
 import { createHealthHandler, createMetricsHandler } from "./health.ts";
 import { FunctionSupervisor } from "./supervisor.ts";
-import { installEnvScope, runWithEnvScope } from "./env-scope.ts";
+import { installEnvScope } from "./env-scope.ts";
 import { flushLogs } from "./log-buffer.ts";
 import { VERSION } from "./version.ts";
-import { createDenoHmrSnapshot } from "./deno-hmr-snapshot.ts";
+import { createWorkerdBackend, type WorkerdBackend } from "./backends/workerd/backend.ts";
+import { createWorkerdHotReloader, type WorkerdHotReloader } from "./backends/workerd/hot-reloader.ts";
+import { createDenoWorkerHost, type DenoWorkerHost } from "./backends/deno/worker-host.ts";
 import {
-  createWorkerdBackend,
-  type WorkerdBackend,
-} from "./backends/workerd/backend.ts";
-import {
-  createWorkerdHotReloader,
-  type WorkerdHotReloader,
-} from "./backends/workerd/hot-reloader.ts";
+  createDenoHotReloader,
+  type DenoHotReloader,
+} from "./backends/deno/hot-reloader.ts";
 import {
   createWorkerdWatchdog,
   recommendedBudgetBytes,
@@ -189,15 +184,10 @@ function parseArgs(): CliOpts {
   // --lazy or 1TUBE_LAZY=1 when boot speed matters more than first-hit
   // latency (e.g. sites with hundreds of rarely-called functions).
   const lazyEnv = Deno.env.get("1TUBE_LAZY");
-  let lazy = lazyEnv === undefined
-    ? false
-    : (lazyEnv === "1" || lazyEnv === "true");
+  let lazy = lazyEnv === undefined ? false : (lazyEnv === "1" || lazyEnv === "true");
   const backendEnv = (Deno.env.get("1TUBE_BACKEND") ?? "").trim().toLowerCase();
-  let backend: "deno" | "workerd" = backendEnv === "workerd"
-    ? "workerd"
-    : "deno";
-  let workerdBin: string | undefined = Deno.env.get("1TUBE_WORKERD_BIN") ||
-    undefined;
+  let backend: "deno" | "workerd" = backendEnv === "workerd" ? "workerd" : "deno";
+  let workerdBin: string | undefined = Deno.env.get("1TUBE_WORKERD_BIN") || undefined;
   // Operator can either use --workerd-env=A,B,C on the CLI or set
   // 1TUBE_WORKERD_ENV. The CLI flag wins; otherwise the backend reads
   // the env var itself so a missing flag still picks up the var.
@@ -223,8 +213,7 @@ function parseArgs(): CliOpts {
     if (v === "1" || v.toLowerCase() === "true") return DEFAULT_INSPECTOR_ADDR;
     return v;
   })();
-  let prebuiltDir: string | undefined = Deno.env.get("1TUBE_PREBUILT") ||
-    undefined;
+  let prebuiltDir: string | undefined = Deno.env.get("1TUBE_PREBUILT") || undefined;
   // Auto-kill leftover workerd processes if the boot preflight finds
   // port conflicts. CLI flag overrides env var; both default to off.
   let killStaleWorkerd: boolean = (() => {
@@ -238,30 +227,19 @@ function parseArgs(): CliOpts {
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n > 0 ? n : undefined;
   })();
-  let workerdCompatibilityDate: string | undefined =
-    Deno.env.get("1TUBE_WORKERD_COMPAT_DATE") || undefined;
-  const workerdCompatibilityFlags: string[] =
-    (Deno.env.get("1TUBE_WORKERD_COMPAT_FLAGS") ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
+  let workerdCompatibilityDate: string | undefined = Deno.env.get("1TUBE_WORKERD_COMPAT_DATE") || undefined;
+  const workerdCompatibilityFlags: string[] = (Deno.env.get("1TUBE_WORKERD_COMPAT_FLAGS") ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
   let workerdExperimental = envFlag("1TUBE_WORKERD_EXPERIMENTAL");
   let port = parseInt(Deno.env.get("PORT") || "3100", 10);
   let host = (Deno.env.get("1TUBE_HOST") || "127.0.0.1").trim();
   let functionsPath = Deno.env.get("FUNCTIONS_PATH") || "./supabase/functions";
-  let defaultTimeoutMs = parseInt(
-    Deno.env.get("FUNCTION_TIMEOUT_MS") || "150000",
-    10,
-  );
+  let defaultTimeoutMs = parseInt(Deno.env.get("FUNCTION_TIMEOUT_MS") || "150000", 10);
   const bodyLimitMb = parseFloat(Deno.env.get("1TUBE_BODY_LIMIT_MB") || "30");
-  const bodyReadIdleMs = parseInt(
-    Deno.env.get("1TUBE_BODY_READ_MS") || "30000",
-    10,
-  );
-  const shutdownGraceMs = parseInt(
-    Deno.env.get("1TUBE_SHUTDOWN_GRACE_MS") || "10000",
-    10,
-  );
+  const bodyReadIdleMs = parseInt(Deno.env.get("1TUBE_BODY_READ_MS") || "30000", 10);
+  const shutdownGraceMs = parseInt(Deno.env.get("1TUBE_SHUTDOWN_GRACE_MS") || "10000", 10);
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -284,22 +262,14 @@ function parseArgs(): CliOpts {
     } else if (a === "--backend" && args[i + 1]) {
       const v = args[++i].toLowerCase();
       if (v !== "deno" && v !== "workerd") {
-        console.error(
-          `[1tube] FATAL: --backend must be 'deno' or 'workerd', got ${
-            JSON.stringify(v)
-          }`,
-        );
+        console.error(`[1tube] FATAL: --backend must be 'deno' or 'workerd', got ${JSON.stringify(v)}`);
         Deno.exit(EXIT_CODES.USAGE);
       }
       backend = v;
     } else if (a.startsWith("--backend=")) {
       const v = a.slice("--backend=".length).toLowerCase();
       if (v !== "deno" && v !== "workerd") {
-        console.error(
-          `[1tube] FATAL: --backend must be 'deno' or 'workerd', got ${
-            JSON.stringify(v)
-          }`,
-        );
+        console.error(`[1tube] FATAL: --backend must be 'deno' or 'workerd', got ${JSON.stringify(v)}`);
         Deno.exit(EXIT_CODES.USAGE);
       }
       backend = v;
@@ -354,26 +324,18 @@ function parseArgs(): CliOpts {
       workerdCompatibilityFlags.push(args[++i]);
     } else if (a.startsWith("--compat-flag=")) {
       workerdCompatibilityFlags.push(a.slice("--compat-flag=".length));
-    } else if (
-      a === "--workerd-experimental" || a === "--workerd-experimental=true"
-    ) {
+    } else if (a === "--workerd-experimental" || a === "--workerd-experimental=true") {
       workerdExperimental = true;
-    } else if (
-      a === "--workerd-experimental=false" || a === "--no-workerd-experimental"
-    ) {
+    } else if (a === "--workerd-experimental=false" || a === "--no-workerd-experimental") {
       workerdExperimental = false;
-    } else if (
-      a === "--kill-stale-workerd" || a === "--kill-stale-workerd=true"
-    ) {
+    } else if (a === "--kill-stale-workerd" || a === "--kill-stale-workerd=true") {
       // Boolean flag — accept both bare-flag and explicit `=true` forms
       // so we don't surprise scripts that programmatically generate
       // CLI strings. `--no-kill-stale-workerd` is the explicit override
       // for cases where the env var is set globally but a particular
       // run wants the safer behavior.
       killStaleWorkerd = true;
-    } else if (
-      a === "--kill-stale-workerd=false" || a === "--no-kill-stale-workerd"
-    ) {
+    } else if (a === "--kill-stale-workerd=false" || a === "--no-kill-stale-workerd") {
       killStaleWorkerd = false;
     }
   }
@@ -461,9 +423,7 @@ async function applyDevDefaults() {
     if (Deno.env.get(target)) continue;
     const value = sources
       .map((source) => statusEnv[source])
-      .find((candidate) =>
-        typeof candidate === "string" && candidate.length > 0
-      );
+      .find((candidate) => typeof candidate === "string" && candidate.length > 0);
     if (!value) continue;
     Deno.env.set(target, value);
     applied++;
@@ -568,9 +528,7 @@ function isInternalRequest(req: Request): boolean {
 }
 
 function requireInternal(c: Context): Response | null {
-  return isInternalRequest(c.req.raw)
-    ? null
-    : c.json({ error: "Forbidden" }, 403);
+  return isInternalRequest(c.req.raw) ? null : c.json({ error: "Forbidden" }, 403);
 }
 
 if (opts.dev) {
@@ -579,24 +537,17 @@ if (opts.dev) {
   enforceProdSecrets();
 }
 
-const denoVersion =
-  `${Deno.version.deno} (V8 ${Deno.version.v8}, TS ${Deno.version.typescript})`;
+const denoVersion = `${Deno.version.deno} (V8 ${Deno.version.v8}, TS ${Deno.version.typescript})`;
 const bannerText = `  1tube v${VERSION}  ·  Deno ${denoVersion}  `;
 const bannerLine = "─".repeat(bannerText.length);
 console.log(`\x1b[36m┌${bannerLine}┐\x1b[0m`);
-console.log(
-  `\x1b[36m│\x1b[0m  \x1b[1m1tube\x1b[0m v${VERSION}  \x1b[2m·\x1b[0m  Deno ${denoVersion}  \x1b[36m│\x1b[0m`,
-);
+console.log(`\x1b[36m│\x1b[0m  \x1b[1m1tube\x1b[0m v${VERSION}  \x1b[2m·\x1b[0m  Deno ${denoVersion}  \x1b[36m│\x1b[0m`);
 console.log(`\x1b[36m└${bannerLine}┘\x1b[0m`);
 console.log(
   `[1tube] mode=${opts.dev ? "dev" : "prod"} hmr=${opts.hmr ? "on" : "off"} ` +
     `lazy=${opts.lazy ? "on" : "off"} backend=${opts.backend} ` +
-    `host=${opts.host} bodyLimit=${
-      (opts.bodyLimitBytes / 1024 / 1024).toFixed(1)
-    }MB ` +
-    `bodyReadIdle=${
-      opts.bodyReadIdleMs > 0 ? opts.bodyReadIdleMs + "ms" : "off"
-    }`,
+    `host=${opts.host} bodyLimit=${(opts.bodyLimitBytes / 1024 / 1024).toFixed(1)}MB ` +
+    `bodyReadIdle=${opts.bodyReadIdleMs > 0 ? opts.bodyReadIdleMs + "ms" : "off"}`,
 );
 
 const registry = new FunctionRegistry();
@@ -659,202 +610,37 @@ if (enforceManifest && !allowAll) {
 // the dispatcher consults). Empty string is a sentinel for "no
 // functions dir"; the only caller that uses this path is the HMR
 // watcher, and that's gated off when prebuilt is on.
-const resolvedFunctionsPath = opts.prebuiltDir ? "" : await (async () => {
-  try {
-    return await Deno.realPath(opts.functionsPath);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(
-      `[1tube] FATAL: functions directory not found: ${opts.functionsPath} (${msg})`,
-    );
-    flushLogs();
-    Deno.exit(EXIT_CODES.CONFIG);
-  }
-})();
-let denoHmrGeneration = 0;
-
-/**
- * Map a changed filesystem path to either a function name or `null` ("shared",
- * meaning the change is outside any function dir / under `_shared` / under any
- * dir starting with `_`, so it could affect any function — reload all).
- */
-function classifyChangedPath(absPath: string): string | null {
-  const rel = relative(resolvedFunctionsPath, absPath);
-  if (
-    !rel || rel.startsWith("..") || rel.startsWith(SEPARATOR + "..") ||
-    rel === "."
-  ) {
-    return null;
-  }
-  const first = rel.split(/[\\/]/, 1)[0];
-  if (!first) return null;
-  if (first.startsWith("_") || first.endsWith("_shared")) return null;
-  return first;
-}
-
-function progressLine(p: DiscoveryProgress): string {
-  const pad = String(p.total).length;
-  const idx = String(p.index).padStart(pad, " ");
-  const status = p.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
-  const dur = `${p.durationMs.toFixed(0)}ms`;
-  const tail = p.ok ? "" : ` — ${p.error ?? "error"}`;
-  return `[1tube] [${idx}/${p.total}] ${status} ${p.name} \x1b[2m(${dur})\x1b[0m${tail}`;
-}
-
-async function reloadFunctions(
-  reason: string,
-  changedFunctionNames: Set<string> | "all",
-) {
-  const isFullReload = changedFunctionNames === "all";
-  const isInitialBoot = reason === "initial boot";
-  const start = performance.now();
-  let importRoot: string | undefined;
-
-  if (isFullReload) {
-    console.log(`[1tube] Reloading all functions (${reason})...`);
-  } else {
-    const names = [...changedFunctionNames].sort();
-    if (names.length === 0) return;
-    console.log(
-      `[1tube] Reloading ${names.length} function(s) (${reason}): ${
-        names.join(", ")
-      }`,
-    );
-  }
-
-  if (!isInitialBoot) {
-    const snapshot = await createDenoHmrSnapshot({
-      functionsDir: opts.functionsPath,
-      changed: changedFunctionNames,
-      generation: ++denoHmrGeneration,
-    });
-    importRoot = snapshot.functionsDir;
-  }
-
-  if (isFullReload) {
-    registry.clear();
-  }
-
-  // Cache-bust only when re-importing modules that may already be in Deno's
-  // module cache — i.e. any reload after the initial boot.
-  const cacheBust = isInitialBoot
-    ? undefined
-    : `${Date.now()}-${crypto.randomUUID()}`;
-
-  // HMR reloads always import eagerly so the change is observable on the
-  // very next request — even when boot-time discovery was lazy.
-  const useLazy = opts.lazy && isInitialBoot;
-
-  // Append-only "still working" heartbeat. Does not redraw, does not race
-  // with foreign console.log() from imported modules — see
-  // src/boot-progress.ts for the design rationale. Heartbeat is silent for
-  // tiny HMR reloads (≤2 functions) where the per-completion line is
-  // already enough signal.
-  const isTinyReload = changedFunctionNames instanceof Set &&
-    changedFunctionNames.size <= 2;
-  const progress = createBootProgress(Deno.stdout, {
-    pulseMs: isTinyReload ? 0 : 2000,
-  });
-
-  let result;
-  try {
-    result = await discoverAndLoad(
-      opts.functionsPath,
-      registry,
-      {
-        cacheBust,
-        importRoot,
-        only: isFullReload ? undefined : changedFunctionNames,
-        onStart: (p) => {
-          // Late-bind the total on the first start event — by then we
-          // know the real work-list size after `only`/exists filtering.
-          if (p.index === 1) progress.start(p.total);
-          progress.onStart(p.name);
-        },
-        onProgress: (p) => progress.onFinish(progressLine(p), p.name),
-        lazy: useLazy,
-      },
-    );
-  } finally {
-    progress.stop();
-  }
-  const { loaded, skipped, errors, removed, deferred } = result;
-
-  for (const name of removed) {
-    if (registry.delete(name)) {
-      supervisor.forget(name);
-      console.log(`[1tube] Removed "${name}" (index.ts gone)`);
+const resolvedFunctionsPath = opts.prebuiltDir
+  ? ""
+  : await (async () => {
+    try {
+      return await Deno.realPath(opts.functionsPath);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[1tube] FATAL: functions directory not found: ${opts.functionsPath} (${msg})`);
+      flushLogs();
+      Deno.exit(EXIT_CODES.CONFIG);
     }
-  }
+  })();
 
-  for (const name of loaded) {
-    const reg = registry.get(name);
-    if (reg) supervisor.setManifest(name, reg.manifest);
-    // On reload, drop accumulated stats so the breaker doesn't immediately
-    // re-trip on stale counts after the operator fixed the function.
-    if (!isFullReload) supervisor.reset(name);
-  }
-  // Lazy candidates also get a manifest so the supervisor can rate-limit /
-  // circuit-break BEFORE the first import — protects against startup-amplified
-  // attacks.
-  for (const name of deferred) {
-    const cand = registry.candidate(name);
-    if (cand) supervisor.setManifest(name, cand.manifest);
-  }
-  if (isFullReload) {
-    // Full reloads are explicit operator action — clear all stats.
-    for (const name of registry.list()) {
-      supervisor.setManifest(name, registry.get(name)!.manifest);
-    }
-  }
-
-  const totalMs = performance.now() - start;
-  if (isFullReload) {
-    const deferTag = deferred.length > 0 ? `, deferred ${deferred.length}` : "";
-    console.log(
-      `[1tube] Loaded ${loaded.length} function(s)${deferTag}, ` +
-        `skipped ${skipped.length} dir(s) in ${totalMs.toFixed(0)}ms`,
-    );
-    const all = registry.knownNames();
-    if (all.length > 0) {
-      console.log(`[1tube] Functions: ${all.join(", ")}`);
-    }
-  } else {
-    console.log(
-      `[1tube] Reloaded ${loaded.length} function(s) in ${
-        totalMs.toFixed(0)
-      }ms ` +
-        `(${registry.size} total registered)`,
-    );
-  }
-
-  if (errors.length > 0) {
-    console.error(
-      `[1tube] ${errors.length} function(s) failed to load (check .env for missing vars):`,
-    );
-    for (const e of errors) {
-      console.error(`  ${e.name}: ${e.error}`);
-    }
-  }
-}
-
-// Backend selection. The workerd path skips Deno-side discovery + HMR
-// because functions run inside an isolated workerd subprocess, with
-// their own bundling pipeline; the gateway becomes a thin auth/rate-
-// limit/proxy layer in that mode. Default stays Deno so existing
-// deployments are unaffected.
+// Backend selection. The workerd path runs functions inside an isolated
+// workerd subprocess. The deno path runs each function in a Web Worker
+// so HMR is a clean `worker.terminate()` + new Worker, and so functions
+// don't share an isolate (each has its own module cache and globals).
+// In both cases the gateway is a thin auth/rate-limit/proxy layer.
 let workerdBackend: WorkerdBackend | null = null;
 let workerdHotReloader: WorkerdHotReloader | null = null;
 let workerdWatchdog: WorkerdWatchdog | null = null;
 const workerdNames = new Set<string>();
+let denoWorkerHost: DenoWorkerHost | null = null;
+let denoHotReloader: DenoHotReloader | null = null;
 
 if (opts.backend === "workerd") {
   if (opts.workerdInspector) {
     // Surface the security implication BEFORE we bring workerd up so
     // an operator who typo'd `--inspector` on a public host has a
     // chance to ctrl-C before any code runs.
-    const isLoopback =
-      /^(127\.0\.0\.1|localhost|\[::1\])(:|$)/.test(opts.workerdInspector) ||
+    const isLoopback = /^(127\.0\.0\.1|localhost|\[::1\])(:|$)/.test(opts.workerdInspector) ||
       /^(127\.0\.0\.1|localhost):/.test(opts.workerdInspector) ||
       /^\d+$/.test(opts.workerdInspector);
     if (!isLoopback) {
@@ -884,23 +670,14 @@ if (opts.backend === "workerd") {
       `[1tube] auto-kill leftover workerd: ON (--kill-stale-workerd)`,
     );
   }
-  if (
-    opts.workerdCompatibilityDate ||
-    (opts.workerdCompatibilityFlags?.length ?? 0) > 0
-  ) {
+  if (opts.workerdCompatibilityDate || (opts.workerdCompatibilityFlags?.length ?? 0) > 0) {
     console.log(
-      `[1tube] workerd compatibility: date=${
-        opts.workerdCompatibilityDate ?? "default"
-      } ` +
-        `flags=${
-          (opts.workerdCompatibilityFlags ?? []).join(",") || "default"
-        }`,
+      `[1tube] workerd compatibility: date=${opts.workerdCompatibilityDate ?? "default"} ` +
+        `flags=${(opts.workerdCompatibilityFlags ?? []).join(",") || "default"}`,
     );
   }
   if (opts.workerdExperimental) {
-    console.log(
-      `[1tube] workerd process experimental mode: ON (--experimental)`,
-    );
+    console.log(`[1tube] workerd process experimental mode: ON (--experimental)`);
   }
   workerdBackend = createWorkerdBackend({
     functionsDir: opts.functionsPath,
@@ -915,9 +692,7 @@ if (opts.backend === "workerd") {
     ...(opts.workerdBasePort ? { basePort: opts.workerdBasePort } : {}),
     ...(opts.workerdInspector ? { inspectorAddr: opts.workerdInspector } : {}),
     ...(opts.workerdMaxHeapMB ? { maxHeapMB: opts.workerdMaxHeapMB } : {}),
-    ...(opts.workerdCompatibilityDate
-      ? { compatibilityDate: opts.workerdCompatibilityDate }
-      : {}),
+    ...(opts.workerdCompatibilityDate ? { compatibilityDate: opts.workerdCompatibilityDate } : {}),
     ...((opts.workerdCompatibilityFlags?.length ?? 0) > 0
       ? { compatibilityFlags: opts.workerdCompatibilityFlags }
       : {}),
@@ -928,9 +703,7 @@ if (opts.backend === "workerd") {
     logLineSink: (line) => {
       // Surface workerd's own logs through stderr with a tag so they
       // interleave with [1tube] output cleanly.
-      try {
-        Deno.stderr.writeSync(new TextEncoder().encode(`[workerd] ${line}\n`));
-      } catch { /* */ }
+      try { Deno.stderr.writeSync(new TextEncoder().encode(`[workerd] ${line}\n`)); } catch { /* */ }
     },
     onUnexpectedExit: ({ crashCount, expectedRetry }) => {
       if (!expectedRetry) {
@@ -982,9 +755,7 @@ if (opts.backend === "workerd") {
   }
   const wdMs = performance.now() - wdStart;
   console.log(
-    `[1tube] workerd backend ready (v${
-      workerdBackend.workerdVersion ?? "?"
-    }) ` +
+    `[1tube] workerd backend ready (v${workerdBackend.workerdVersion ?? "?"}) ` +
       `· ${workerdNames.size} function(s) in ${wdMs.toFixed(0)}ms`,
   );
   if (workerdNames.size > 0) {
@@ -997,10 +768,7 @@ if (opts.backend === "workerd") {
   // yields nothing (no manifest declares a memory hint), the
   // watchdog stays off — silently, so existing deployments aren't
   // surprised by sudden recycle behaviour.
-  const explicitCap = parseInt(
-    Deno.env.get("1TUBE_WORKERD_MAX_RSS_MB") || "",
-    10,
-  );
+  const explicitCap = parseInt(Deno.env.get("1TUBE_WORKERD_MAX_RSS_MB") || "", 10);
   const explicitBudget = Number.isFinite(explicitCap) && explicitCap > 0
     ? explicitCap * 1024 * 1024
     : null;
@@ -1009,16 +777,11 @@ if (opts.backend === "workerd") {
   // boot log so operators know what the recommendation was based on.
   let declaredSum = 0;
   for (const m of workerdBackend.manifests.values()) {
-    if (typeof m.memoryMB === "number" && m.memoryMB > 0) {
-      declaredSum += m.memoryMB;
-    }
+    if (typeof m.memoryMB === "number" && m.memoryMB > 0) declaredSum += m.memoryMB;
   }
   const budget = explicitBudget ?? recommended;
   if (budget !== null) {
-    const intervalMs = parseInt(
-      Deno.env.get("1TUBE_WORKERD_RSS_INTERVAL_MS") || "",
-      10,
-    );
+    const intervalMs = parseInt(Deno.env.get("1TUBE_WORKERD_RSS_INTERVAL_MS") || "", 10);
     workerdWatchdog = createWorkerdWatchdog({
       backend: workerdBackend,
       budgetBytes: budget,
@@ -1031,9 +794,7 @@ if (opts.backend === "workerd") {
       ? "1TUBE_WORKERD_MAX_RSS_MB"
       : `manifest sum (${declaredSum}MB × 1.5 + 64MB overhead)`;
     console.log(
-      `[1tube] workerd memory watchdog ON: budget=${
-        (budget / 1024 / 1024).toFixed(0)
-      }MB (source: ${src})`,
+      `[1tube] workerd memory watchdog ON: budget=${(budget / 1024 / 1024).toFixed(0)}MB (source: ${src})`,
     );
   } else {
     console.log(
@@ -1060,77 +821,64 @@ if (opts.backend === "workerd") {
     }
   }
 } else {
+  // Deno backend: each function runs in its own Web Worker so HMR is
+  // a clean `worker.terminate()` + new Worker (fresh module cache for
+  // the entire dep graph). The dep-graph keeps the affected-set
+  // precise — touching a file under `_shared/` only restarts the
+  // workers that actually transitively import it.
+  if (opts.lazy) {
+    console.warn(
+      "[1tube] --lazy is ignored on the Deno backend (Workers are spawned eagerly at boot).",
+    );
+  }
   console.log(`[1tube] Loading functions from: ${opts.functionsPath}`);
-  await reloadFunctions("initial boot", "all");
-}
-
-let reloadTimer: number | undefined;
-let isReloading = false;
-const pendingChanges = new Set<string>();
-let pendingSharedChange = false;
-
-function scheduleReload(paths: string[]) {
-  for (const p of paths) {
-    const name = classifyChangedPath(p);
-    if (name === null) {
-      pendingSharedChange = true;
-    } else {
-      pendingChanges.add(name);
-    }
-  }
-  if (!pendingSharedChange && pendingChanges.size === 0) return;
-
-  if (reloadTimer !== undefined) {
-    clearTimeout(reloadTimer);
-  }
-  reloadTimer = setTimeout(async () => {
-    reloadTimer = undefined;
-
-    if (isReloading) return;
-
-    const sharedChanged = pendingSharedChange;
-    const names = new Set(pendingChanges);
-    pendingSharedChange = false;
-    pendingChanges.clear();
-
-    isReloading = true;
-    try {
-      const reason = sharedChanged
-        ? `shared change (+${names.size} function(s))`
-        : `${names.size} function(s) changed`;
-      await reloadFunctions(reason, sharedChanged ? "all" : names);
-    } catch (err) {
-      console.error("[1tube] Reload failed:", err);
-    } finally {
-      isReloading = false;
-      if (pendingSharedChange || pendingChanges.size > 0) {
-        scheduleReload([]);
-      }
-    }
-  }, 200);
-}
-
-let watcherAbort: AbortController | undefined;
-
-async function watchFunctions() {
-  watcherAbort = new AbortController();
+  // Pull the deno.json import map (if any) so the dep-graph can
+  // resolve bare specifiers to their actual file URLs. Best-effort:
+  // missing or malformed JSON degrades to "no import map", which is
+  // fine for projects that use only relative imports.
+  const denoConfigPath = `${Deno.cwd()}/deno.json`;
+  let importMap: Record<string, string> | undefined;
   try {
-    const watcher = Deno.watchFs(opts.functionsPath, { recursive: true });
-    console.log(`[1tube] HMR watching: ${opts.functionsPath}`);
-    for await (const event of watcher) {
-      if (watcherAbort.signal.aborted) break;
-      if (event.paths.length === 0) continue;
-      scheduleReload(event.paths);
+    const raw = await Deno.readTextFile(denoConfigPath);
+    const parsed = JSON.parse(raw) as { imports?: Record<string, string> };
+    if (parsed.imports && typeof parsed.imports === "object") {
+      importMap = parsed.imports;
     }
-  } catch (err) {
-    console.warn("[1tube] HMR watcher disabled:", err);
+  } catch {
+    // No host deno.json or it isn't JSON; proceed without an import map.
   }
-}
 
-if (opts.hmr && opts.backend === "deno") {
-  watchFunctions();
-} else if (opts.backend === "deno") {
-  console.log("[1tube] HMR disabled (set 1TUBE_HMR=1 or pass --hmr to enable)");
+  denoWorkerHost = createDenoWorkerHost({
+    functionsDir: opts.functionsPath,
+    registry,
+    supervisor,
+    ...(importMap ? { importMap, importMapBase: denoConfigPath } : {}),
+  });
+  const bootStart = performance.now();
+  const { loaded, errors } = await denoWorkerHost.start();
+  const bootMs = performance.now() - bootStart;
+  console.log(
+    `[1tube] Loaded ${loaded.length} function(s) in ${bootMs.toFixed(0)}ms`,
+  );
+  if (loaded.length > 0) {
+    console.log(`[1tube] Functions: ${[...loaded].sort().join(", ")}`);
+  }
+  if (errors.length > 0) {
+    console.error(
+      `[1tube] ${errors.length} function(s) failed to load (check .env for missing vars):`,
+    );
+    for (const e of errors) console.error(`  ${e.name}: ${e.error}`);
+  }
+
+  if (opts.hmr) {
+    denoHotReloader = createDenoHotReloader({
+      host: denoWorkerHost,
+      functionsDir: opts.functionsPath,
+    });
+    await denoHotReloader.start();
+  } else {
+    console.log("[1tube] HMR disabled (set 1TUBE_HMR=1 or pass --hmr to enable)");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1153,9 +901,7 @@ const rpmOverride = Number.isFinite(defaultRpmEnv) && defaultRpmEnv > 0
   ? defaultRpmEnv
   : null;
 if (rpmOverride !== null) {
-  console.log(
-    `[1tube] default rpm overridden via 1TUBE_DEFAULT_RPM=${rpmOverride}`,
-  );
+  console.log(`[1tube] default rpm overridden via 1TUBE_DEFAULT_RPM=${rpmOverride}`);
 }
 const rateLimiter = createRateLimiter({
   registry,
@@ -1171,9 +917,10 @@ const rateLimiter = createRateLimiter({
 //      auth here — the dispatcher decides per function based on `isPublic`)
 //   6. Rate limiter (now sees a real userId for per-user keying)
 app.use("/functions/v1/*", corsMiddleware);
-// Backend-aware function-existence probe. On Deno backend, the registry
-// owns the truth; on workerd backend, the bundled-set captured at boot
-// is the source. Both expose the same Map-lookup-cost contract.
+// Backend-aware function-existence probe. On the workerd backend the
+// bundled-set captured at boot is the source; on the deno backend the
+// registry's worker-handle map is. Both expose the same Map-lookup-cost
+// contract.
 const functionExists = (name: string): boolean =>
   opts.backend === "workerd" ? workerdNames.has(name) : registry.has(name);
 
@@ -1249,9 +996,7 @@ app.all("/functions/v1/:name{.+}", async (c) => {
     const decision = supervisor.admit(name);
     if (!decision.ok) {
       const headers: Record<string, string> = {};
-      if (decision.retryAfter) {
-        headers["Retry-After"] = String(decision.retryAfter);
-      }
+      if (decision.retryAfter) headers["Retry-After"] = String(decision.retryAfter);
       return c.json(
         { error: "Service temporarily unavailable", reason: decision.reason },
         decision.status as 503,
@@ -1263,22 +1008,18 @@ app.all("/functions/v1/:name{.+}", async (c) => {
     const rawBody = c.req.raw.body;
     const wrappedBody = rawBody !== null
       ? watchdogBody(rawBody, opts.bodyReadIdleMs, abort, (idleMs) => {
-        console.warn(
-          `[1tube] Body read stalled in "${name}" (no progress in ${idleMs}ms) — aborting request.`,
-        );
-      }).body
+          console.warn(
+            `[1tube] Body read stalled in "${name}" (no progress in ${idleMs}ms) — aborting request.`,
+          );
+        }).body
       : null;
     // Mirror the Deno-path URL rewrite: user code expects to see the
     // pathname without the `/functions/v1` prefix, matching Supabase
     // Edge Runtime behaviour. Without this strip, hello/echo see the
     // gateway prefix in their `new URL(req.url).pathname`.
     const originalUrl = new URL(c.req.raw.url);
-    const rewrittenPath =
-      originalUrl.pathname.replace(/^\/functions\/v1/, "") || "/";
-    const rewrittenUrl = new URL(
-      rewrittenPath + originalUrl.search,
-      originalUrl.origin,
-    );
+    const rewrittenPath = originalUrl.pathname.replace(/^\/functions\/v1/, "") || "/";
+    const rewrittenUrl = new URL(rewrittenPath + originalUrl.search, originalUrl.origin);
     const proxyReq = new Request(rewrittenUrl.toString(), {
       method: c.req.raw.method,
       headers: c.req.raw.headers,
@@ -1293,36 +1034,20 @@ app.all("/functions/v1/:name{.+}", async (c) => {
     // gateway-wide default. Same precedence the Deno path uses.
     const timeoutMs = wdManifest?.timeoutMs ?? opts.defaultTimeoutMs;
     const timer = timeoutMs > 0
-      ? setTimeout(
-        () =>
-          abort.abort(
-            new Error(`workerd dispatch timed out after ${timeoutMs}ms`),
-          ),
-        timeoutMs,
-      )
+      ? setTimeout(() => abort.abort(new Error(`workerd dispatch timed out after ${timeoutMs}ms`)), timeoutMs)
       : null;
 
     let response: Response;
     let errored = false;
     try {
-      response = await workerdBackend.dispatch(
-        proxyReq,
-        name,
-        auth,
-        abort.signal,
-      );
+      response = await workerdBackend.dispatch(proxyReq, name, auth, abort.signal);
     } catch (err) {
       errored = true;
-      const reasonMsg = (abort.signal.reason as Error | undefined)?.message ??
-        "";
-      if (
-        err instanceof DOMException && err.name === "AbortError" &&
-        reasonMsg.includes("timed out")
-      ) {
+      const reasonMsg = (abort.signal.reason as Error | undefined)?.message ?? "";
+      if (err instanceof DOMException && err.name === "AbortError" && reasonMsg.includes("timed out")) {
         response = c.json({ error: "Function execution timed out" }, 504);
       } else if (
-        err instanceof DOMException && err.name === "AbortError" &&
-        reasonMsg.includes("Body read stalled")
+        err instanceof DOMException && err.name === "AbortError" && reasonMsg.includes("Body read stalled")
       ) {
         response = c.json({ error: "Request body read timed out" }, 408);
       } else {
@@ -1343,7 +1068,9 @@ app.all("/functions/v1/:name{.+}", async (c) => {
       const outcome = supervisor.record(name, errored);
       if (outcome.breakerJustTripped) {
         console.warn(
-          `[1tube] Circuit breaker OPEN for "${name}" (workerd) — refusing requests for ${wdManifest.recycle.cooldownMs}ms (errorRate >= ${wdManifest.recycle.errorRate}).`,
+          `[1tube] Circuit breaker OPEN for "${name}" (workerd) — refusing requests for ${
+            wdManifest.recycle.cooldownMs
+          }ms (errorRate >= ${wdManifest.recycle.errorRate}).`,
         );
       }
       if (outcome.recycleJustRecommended) {
@@ -1356,19 +1083,12 @@ app.all("/functions/v1/:name{.+}", async (c) => {
     return response;
   }
 
-  // Deno backend dispatch path (unchanged from pre-workerd behaviour).
-  // getOrLoad triggers a one-time dynamic import for lazy candidates; subsequent
-  // calls are a hot map lookup. Concurrent first-requests dedupe on the same
-  // in-flight Promise.
-  let fn: Awaited<ReturnType<typeof registry.getOrLoad>>;
-  try {
-    fn = await registry.getOrLoad(name);
-  } catch (err) {
-    console.error(`[1tube] Lazy import of "${name}" failed:`, err);
-    return c.json({ error: "Function failed to load" }, 500);
-  }
-
-  if (!fn) {
+  // Deno backend dispatch path: forward the request to the function's
+  // Worker over postMessage. Each function lives in its own Worker so
+  // there's no in-process handler to invoke; HMR works by terminating
+  // the worker (clean module cache) and spawning a fresh one.
+  const handle = registry.workerHandle(name);
+  if (!handle) {
     return c.json({ error: `Function "${name}" not found` }, 404);
   }
 
@@ -1376,9 +1096,7 @@ app.all("/functions/v1/:name{.+}", async (c) => {
   const decision = supervisor.admit(name);
   if (!decision.ok) {
     const headers: Record<string, string> = {};
-    if (decision.retryAfter) {
-      headers["Retry-After"] = String(decision.retryAfter);
-    }
+    if (decision.retryAfter) headers["Retry-After"] = String(decision.retryAfter);
     return c.json(
       { error: "Service temporarily unavailable", reason: decision.reason },
       decision.status as 503,
@@ -1386,34 +1104,26 @@ app.all("/functions/v1/:name{.+}", async (c) => {
     );
   }
 
-  const timeoutMs = fn.timeoutMs ?? fn.manifest.timeoutMs ??
+  const timeoutMs = handle.timeoutMs ?? handle.manifest.timeoutMs ??
     opts.defaultTimeoutMs;
 
   // Strip /functions/v1 prefix to match Supabase Edge Runtime behavior.
   const originalUrl = new URL(c.req.raw.url);
-  const rewrittenPath = originalUrl.pathname.replace(/^\/functions\/v1/, "") ||
-    "/";
-  const rewrittenUrl = new URL(
-    rewrittenPath + originalUrl.search,
-    originalUrl.origin,
-  );
+  const rewrittenPath = originalUrl.pathname.replace(/^\/functions\/v1/, "") || "/";
+  const rewrittenUrl = new URL(rewrittenPath + originalUrl.search, originalUrl.origin);
 
   const abort = new AbortController();
 
-  // Wrap an actual body stream with the slow-loris watchdog. Body-less
-  // methods (GET / HEAD / DELETE-without-body) skip wrapping — there's
-  // nothing to read. The watchdog resets its idle timer on every chunk;
-  // if no chunk arrives within `bodyReadIdleMs`, it aborts the same
-  // signal the handler is already wired to, so `req.json()` /
-  // `req.text()` / `req.arrayBuffer()` reject with AbortError and the
-  // request slot is freed immediately.
+  // Slow-loris watchdog around any actual body stream, same as the
+  // workerd path. The watchdog aborts the request signal we forward to
+  // the worker if the client stalls mid-upload.
   const rawBody = c.req.raw.body;
   const wrappedBody = rawBody !== null
     ? watchdogBody(rawBody, opts.bodyReadIdleMs, abort, (idleMs) => {
-      console.warn(
-        `[1tube] Body read stalled in "${name}" (no progress in ${idleMs}ms) — aborting request.`,
-      );
-    }).body
+        console.warn(
+          `[1tube] Body read stalled in "${name}" (no progress in ${idleMs}ms) — aborting request.`,
+        );
+      }).body
     : null;
 
   const rewrittenReq = new Request(rewrittenUrl.toString(), {
@@ -1425,67 +1135,45 @@ app.all("/functions/v1/:name{.+}", async (c) => {
     duplex: "half",
   });
 
-  const invoke = (): Promise<Response> => {
-    if (!fn.isPublic) {
-      const auth = (c as any).get("__authContext");
-      if (!auth) {
-        // Surfaced to the caller via the outer try/catch path below.
-        return Promise.resolve(c.json({ error: "Unauthorized" }, 401));
-      }
-      return Promise.resolve((fn.handler as any)(rewrittenReq, auth));
-    }
-    return Promise.resolve((fn.handler as any)(rewrittenReq));
-  };
+  const auth = (c as any).get("__authContext") ?? null;
+  if (!handle.isPublic && !auth) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
 
-  // Bind the function name as the active async context for the entire handler
-  // call tree. This lets the global `unhandledrejection` listener attribute
-  // orphan rejections (from setTimeout/fire-and-forget Promises inside the
-  // function) to the correct function — preserved across awaits in 2.7+.
-  const inner = enforceManifest && !allowAll
-    ? () =>
-      runWithEnvScope(
-        { functionName: name, allow: new Set(fn.manifest.permissions.env) },
-        invoke,
-      )
-    : invoke;
-
-  const handlerPromise = Promise.resolve(
-    currentRequestStorage.run({ functionName: name }, inner),
-  ) as Promise<Response>;
+  const timer = timeoutMs > 0
+    ? setTimeout(
+      () =>
+        abort.abort(
+          new Error(`Function "${name}" timed out after ${timeoutMs}ms`),
+        ),
+      timeoutMs,
+    )
+    : null;
 
   let response: Response;
   let errored = false;
   try {
-    if (timeoutMs > 0) {
-      const timeout = new Promise<never>((_, reject) =>
-        setTimeout(() => {
-          abort.abort();
-          reject(
-            new Error(`Function "${name}" timed out after ${timeoutMs}ms`),
-          );
-        }, timeoutMs)
-      );
-      response = await Promise.race([handlerPromise, timeout]);
-    } else {
-      response = await handlerPromise;
-    }
+    response = await handle.dispatch(rewrittenReq, auth, abort.signal);
   } catch (err) {
     errored = true;
-    if (err instanceof Error && err.message.includes("timed out")) {
-      console.error(`[1tube] ${err.message}`);
+    const reasonMsg = (abort.signal.reason as Error | undefined)?.message ?? "";
+    if (
+      err instanceof DOMException && err.name === "AbortError" &&
+      reasonMsg.includes("timed out")
+    ) {
+      console.error(`[1tube] Function "${name}" timed out after ${timeoutMs}ms`);
       response = c.json({ error: "Function execution timed out" }, 504);
     } else if (
       err instanceof DOMException && err.name === "AbortError" &&
-      err.message.includes("Body read stalled")
+      reasonMsg.includes("Body read stalled")
     ) {
-      // Slow-loris watchdog tripped. The handler was awaiting the body and
-      // the abort propagated up. Return 408 so legitimate clients can retry
-      // — 503 would imply we'd accept a retry from the same offender.
       response = c.json({ error: "Request body read timed out" }, 408);
     } else {
       console.error(`[1tube] Unhandled error in "${name}":`, err);
       response = c.json({ error: "Internal server error" }, 500);
     }
+  } finally {
+    if (timer !== null) clearTimeout(timer);
   }
 
   if (response.status >= 500) errored = true;
@@ -1493,12 +1181,14 @@ app.all("/functions/v1/:name{.+}", async (c) => {
   const outcome = supervisor.record(name, errored);
   if (outcome.breakerJustTripped) {
     console.warn(
-      `[1tube] Circuit breaker OPEN for "${name}" — refusing requests for ${fn.manifest.recycle.cooldownMs}ms (errorRate >= ${fn.manifest.recycle.errorRate}).`,
+      `[1tube] Circuit breaker OPEN for "${name}" — refusing requests for ${
+        handle.manifest.recycle.cooldownMs
+      }ms (errorRate >= ${handle.manifest.recycle.errorRate}).`,
     );
   }
   if (outcome.recycleJustRecommended) {
     console.warn(
-      `[1tube] "${name}" reached ${fn.manifest.recycle.maxRequests} invocations — recycle recommended.`,
+      `[1tube] "${name}" reached ${handle.manifest.recycle.maxRequests} invocations — recycle recommended.`,
     );
   }
 
@@ -1556,16 +1246,11 @@ app.get(
   }),
 );
 
-async function runFunctionAdmin(
-  c: Context,
-  action: (backend: WorkerdBackend) => Promise<Response>,
-): Promise<Response> {
+async function runFunctionAdmin(c: Context, action: (backend: WorkerdBackend) => Promise<Response>): Promise<Response> {
   const forbidden = requireInternal(c);
   if (forbidden) return forbidden;
   if (!workerdBackend) {
-    return c.json({
-      error: "Edge function editor is available only with backend=workerd",
-    }, 503);
+    return c.json({ error: "Edge function editor is available only with backend=workerd" }, 503);
   }
   try {
     return await action(workerdBackend);
@@ -1575,23 +1260,14 @@ async function runFunctionAdmin(
   }
 }
 
-app.get(
-  "/1tube/api/functions",
-  (c) =>
-    runFunctionAdmin(c, async (backend) =>
-      c.json({
-        functions: await backend.listEditableFunctions(),
-      })),
+app.get("/1tube/api/functions", (c) =>
+  runFunctionAdmin(c, async (backend) => c.json({
+    functions: await backend.listEditableFunctions(),
+  }))
 );
 
-app.get(
-  "/1tube/api/functions/:name/source",
-  (c) =>
-    runFunctionAdmin(
-      c,
-      async (backend) =>
-        c.json(await backend.readEditableSource(c.req.param("name"))),
-    ),
+app.get("/1tube/api/functions/:name/source", (c) =>
+  runFunctionAdmin(c, async (backend) => c.json(await backend.readEditableSource(c.req.param("name"))))
 );
 
 app.post("/1tube/api/functions", (c) =>
@@ -1601,58 +1277,36 @@ app.post("/1tube/api/functions", (c) =>
       return c.json({ error: "Missing function name" }, 400);
     }
     const source = await backend.createEditableFunction(body.name);
-    return c.json(
-      { source, functions: await backend.listEditableFunctions() },
-      201,
+    return c.json({ source, functions: await backend.listEditableFunctions() }, 201);
+  })
+);
+
+app.put("/1tube/api/functions/:name/source", (c) =>
+  runFunctionAdmin(c, async (backend) => {
+    const body = await c.req.json().catch(() => ({})) as { files?: unknown };
+    if (!body.files || typeof body.files !== "object" || Array.isArray(body.files)) {
+      return c.json({ error: "Expected JSON body { files: { path: content } }" }, 400);
+    }
+    const reload = await backend.saveEditableSource(
+      c.req.param("name"),
+      { files: body.files as Record<string, string> },
     );
-  }));
-
-app.put(
-  "/1tube/api/functions/:name/source",
-  (c) =>
-    runFunctionAdmin(c, async (backend) => {
-      const body = await c.req.json().catch(() => ({})) as { files?: unknown };
-      if (
-        !body.files || typeof body.files !== "object" ||
-        Array.isArray(body.files)
-      ) {
-        return c.json({
-          error: "Expected JSON body { files: { path: content } }",
-        }, 400);
-      }
-      const reload = await backend.saveEditableSource(
-        c.req.param("name"),
-        { files: body.files as Record<string, string> },
-      );
-      return c.json({
-        reload,
-        functions: await backend.listEditableFunctions(),
-      });
-    }),
+    return c.json({ reload, functions: await backend.listEditableFunctions() });
+  })
 );
 
-app.delete(
-  "/1tube/api/functions/:name",
-  (c) =>
-    runFunctionAdmin(c, async (backend) => {
-      const reload = await backend.deleteEditableFunction(c.req.param("name"));
-      return c.json({
-        reload,
-        functions: await backend.listEditableFunctions(),
-      });
-    }),
+app.delete("/1tube/api/functions/:name", (c) =>
+  runFunctionAdmin(c, async (backend) => {
+    const reload = await backend.deleteEditableFunction(c.req.param("name"));
+    return c.json({ reload, functions: await backend.listEditableFunctions() });
+  })
 );
 
-app.post(
-  "/1tube/api/functions/:name/revert",
-  (c) =>
-    runFunctionAdmin(c, async (backend) => {
-      const reload = await backend.revertEditableFunction(c.req.param("name"));
-      return c.json({
-        reload,
-        functions: await backend.listEditableFunctions(),
-      });
-    }),
+app.post("/1tube/api/functions/:name/revert", (c) =>
+  runFunctionAdmin(c, async (backend) => {
+    const reload = await backend.revertEditableFunction(c.req.param("name"));
+    return c.json({ reload, functions: await backend.listEditableFunctions() });
+  })
 );
 
 // Root liveness probe — intentionally minimal so we don't leak the registered
@@ -1681,14 +1335,9 @@ async function shutdown(reason: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   const totalGraceMs = opts.shutdownGraceMs;
-  console.log(
-    `[1tube] Shutdown requested (${reason}); draining up to ${totalGraceMs}ms...`,
-  );
+  console.log(`[1tube] Shutdown requested (${reason}); draining up to ${totalGraceMs}ms...`);
   const shutdownStartedAt = performance.now();
-  const remaining = () =>
-    Math.max(0, totalGraceMs - (performance.now() - shutdownStartedAt));
-
-  watcherAbort?.abort();
+  const remaining = () => Math.max(0, totalGraceMs - (performance.now() - shutdownStartedAt));
 
   // Stop the workerd watchdog FIRST so a poll racing this shutdown
   // can't observe a half-down workerd and trigger a doomed recycle
@@ -1698,6 +1347,11 @@ async function shutdown(reason: string) {
   if (workerdHotReloader) {
     workerdHotReloader.stop().catch((err) => {
       console.warn("[1tube] workerd hot reloader stop() error:", err);
+    });
+  }
+  if (denoHotReloader) {
+    denoHotReloader.stop().catch((err) => {
+      console.warn("[1tube] deno hot reloader stop() error:", err);
     });
   }
 
@@ -1714,9 +1368,7 @@ async function shutdown(reason: string) {
   const drainStart = performance.now();
   const drained = await Promise.race([
     server.finished.then(() => "drained" as const),
-    new Promise<"timeout">((resolve) =>
-      setTimeout(() => resolve("timeout"), remaining())
-    ),
+    new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), remaining())),
   ]);
   const drainMs = performance.now() - drainStart;
   if (drained === "timeout") {
@@ -1725,11 +1377,7 @@ async function shutdown(reason: string) {
         `forcing workerd teardown — some in-flight requests may have been dropped.`,
     );
   } else {
-    console.log(
-      `[1tube] Gateway drained ${
-        drainMs.toFixed(0)
-      }ms; tearing down workerd...`,
-    );
+    console.log(`[1tube] Gateway drained ${drainMs.toFixed(0)}ms; tearing down workerd...`);
   }
 
   // Phase 3: stop the workerd subprocess. Now safe to tear down —
@@ -1746,18 +1394,23 @@ async function shutdown(reason: string) {
         console.warn("[1tube] workerd backend stop() error:", err);
         return "stopped" as const;
       }),
-      new Promise<"timeout">((resolve) =>
-        setTimeout(() => resolve("timeout"), wdGraceMs)
-      ),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), wdGraceMs)),
     ]);
     const wdMs = performance.now() - wdStart;
     if (wdResult === "timeout") {
-      console.warn(
-        `[1tube] workerd stop() did not return within ${wdGraceMs}ms — abandoning.`,
-      );
+      console.warn(`[1tube] workerd stop() did not return within ${wdGraceMs}ms — abandoning.`);
     } else {
       console.log(`[1tube] workerd stopped in ${wdMs.toFixed(0)}ms.`);
     }
+  }
+
+  // Phase 3 (deno): terminate every per-function Worker. Bounded by
+  // whatever shutdown grace remains; teardown is fast (just SIGKILL
+  // equivalents in V8 isolate-land) so we don't bother racing it.
+  if (denoWorkerHost) {
+    await denoWorkerHost.stop().catch((err) => {
+      console.warn("[1tube] deno worker host stop() error:", err);
+    });
   }
 
   flushLogs();

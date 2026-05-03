@@ -18,6 +18,7 @@
     "esbuild": "npm:esbuild@^0.28",
     "es-module-lexer": "npm:es-module-lexer@^2",
     "@deno/esbuild-plugin": "jsr:@deno/esbuild-plugin@^1.2",
+    "@deno/graph": "jsr:@deno/graph@^0.108",
     "@zip-js/zip-js": "jsr:@zip-js/zip-js@^2.8"
   },
   "lint": {

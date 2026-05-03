@@ -2,6 +2,7 @@
   "version": "5",
   "specifiers": {
     "jsr:@deno/esbuild-plugin@^1.2.0": "1.2.1",
+    "jsr:@deno/graph@0.108": "0.108.1",
     "jsr:@deno/loader@~0.3.10": "0.3.14",
     "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/fs@1": "1.0.22",
@@ -10,7 +11,10 @@
     "jsr:@std/path@^1.1.1": "1.1.4",
     "jsr:@std/path@^1.1.4": "1.1.4",
     "jsr:@zip-js/zip-js@^2.8.0": "2.8.26",
+    "npm:@ai-sdk/anthropic@2": "2.0.77_zod@3.25.76",
+    "npm:@ai-sdk/google@2": "2.0.70_zod@3.25.76",
     "npm:@ai-sdk/mcp@0": "0.0.15_zod@3.25.76",
+    "npm:@ai-sdk/openai@2": "2.0.103_zod@3.25.76",
     "npm:@google/genai@1.39.0": "1.39.0",
     "npm:@supabase/supabase-js@2": "2.93.3",
     "npm:ai@6": "6.0.67_zod@3.25.76",
@@ -30,6 +34,9 @@
         "jsr:@std/path@^1.1.1",
         "npm:esbuild@~0.25.5"
       ]
+    },
+    "@deno/graph@0.108.1": {
+      "integrity": "10ba877ae62f94987f4465aa94c355612382456f64bb9b1b9c1b473559f294af"
     },
     "@deno/loader@0.3.14": {
       "integrity": "97bc63a6cc2d27a60bcdc953f588c5213331d866d44212eebb24cebfb9b011ca"
@@ -60,12 +67,28 @@
     }
   },
   "npm": {
+    "@ai-sdk/anthropic@2.0.77_zod@3.25.76": {
+      "integrity": "sha512-8n7ApEzFOxqVvT3HyqLrEQlgUx/2nUmPFLTGY3fNKwUA8KVNU3Ovd2C66Qh1Y93Iq5NkHsOWuLiTyAZpRKQhgw==",
+      "dependencies": [
+        "@ai-sdk/provider@2.0.1",
+        "@ai-sdk/provider-utils@3.0.23_zod@3.25.76",
+        "zod"
+      ]
+    },
     "@ai-sdk/gateway@3.0.32_zod@3.25.76": {
       "integrity": "sha512-7clZRr07P9rpur39t1RrbIe7x8jmwnwUWI8tZs+BvAfX3NFgdSVGGIaT7bTz2pb08jmLXzTSDbrOTqAQ7uBkBQ==",
       "dependencies": [
         "@ai-sdk/provider@3.0.7",
         "@ai-sdk/provider-utils@4.0.13_zod@3.25.76",
         "@vercel/oidc",
+        "zod"
+      ]
+    },
+    "@ai-sdk/google@2.0.70_zod@3.25.76": {
+      "integrity": "sha512-NDMTvMo6vnPHDTA94FBOh3YMv0lxWDohYmFSGYhg0IimHMcOcC1ZV7E2KMLjzHOz5S7uasTITW7V3X5T+ozInQ==",
+      "dependencies": [
+        "@ai-sdk/provider@2.0.1",
+        "@ai-sdk/provider-utils@3.0.23_zod@3.25.76",
         "zod"
       ]
     },
@@ -78,8 +101,25 @@
         "zod"
       ]
     },
+    "@ai-sdk/openai@2.0.103_zod@3.25.76": {
+      "integrity": "sha512-FDwY060LV/D5th+LeaxpSKcot5eXjzNzHguDf0NU1K+v7rxYZFWbldQPZarNo/IpD/WJE9RojgrFAcZ1e8KyvQ==",
+      "dependencies": [
+        "@ai-sdk/provider@2.0.1",
+        "@ai-sdk/provider-utils@3.0.23_zod@3.25.76",
+        "zod"
+      ]
+    },
     "@ai-sdk/provider-utils@3.0.22_zod@3.25.76": {
       "integrity": "sha512-fFT1KfUUKktfAFm5mClJhS1oux9tP2qgzmEZVl5UdwltQ1LO/s8hd7znVrgKzivwv1s1FIPza0s9OpJaNB/vHw==",
+      "dependencies": [
+        "@ai-sdk/provider@2.0.1",
+        "@standard-schema/spec",
+        "eventsource-parser",
+        "zod"
+      ]
+    },
+    "@ai-sdk/provider-utils@3.0.23_zod@3.25.76": {
+      "integrity": "sha512-60GYsRj5wIJQRcq5YwYJq4KhwLeStceXEJiZdecP1miiH+6FMmrnc7lZDOJoQ6m9lrudEb+uI4LEwddLz5+rPQ==",
       "dependencies": [
         "@ai-sdk/provider@2.0.1",
         "@standard-schema/spec",
@@ -861,6 +901,7 @@
   "workspace": {
     "dependencies": [
       "jsr:@deno/esbuild-plugin@^1.2.0",
+      "jsr:@deno/graph@0.108",
       "jsr:@std/assert@1",
       "jsr:@std/path@1",
       "jsr:@zip-js/zip-js@^2.8.0",
