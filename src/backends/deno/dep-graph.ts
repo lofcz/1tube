@@ -64,6 +64,13 @@ export interface DepGraph {
    * normalized internally.
    */
   affected(changedFiles: Iterable<string>): Set<string>;
+  /**
+   * Absolute file paths of every file in `name`'s graph (including
+   * the entry). Returns an empty array if no graph has been built
+   * for `name`. Used by the source rewriter to emit shared-module
+   * stubs into a function's transitive deps.
+   */
+  filesFor(name: string): readonly string[];
   /** Total number of distinct file URLs currently tracked. */
   readonly size: number;
 }
@@ -193,6 +200,18 @@ export function createDepGraph(options?: DepGraphOptions): DepGraph {
         if (!old || !old.has(f)) indexAdd(name, f);
       }
       perName.set(name, fresh);
+    },
+
+    filesFor(name) {
+      const set = perName.get(name);
+      if (!set) return [];
+      const out: string[] = [];
+      for (const url of set) {
+        try {
+          out.push(fileURLToPath(url));
+        } catch { /* */ }
+      }
+      return out;
     },
 
     forget(name) {

@@ -30,6 +30,8 @@
 
 import type { DenoWorkerHost, ReloadSummary } from "./worker-host.ts";
 import type { DepGraph } from "./dep-graph.ts";
+import type { DenoSharedRuntime } from "./shared-runtime.ts";
+import type { RewriteCache } from "./source-rewriter.ts";
 
 export type FsEventStream = AsyncIterable<{ paths: readonly string[] }> & {
   close(): void;
@@ -49,6 +51,15 @@ export interface DenoHotReloaderOptions {
   log?: (line: string) => void;
   /** Optional hook fired after each reload, with the summary. */
   onReloaded?: (summary: ReloadSummary) => void;
+  /**
+   * When set, an edit that lands on a tracked shared-module source
+   * file triggers (a) a re-import in the gateway runtime and
+   * (b) invalidation of the rewrite cache, before the affected
+   * functions are recomputed. Required for shared-module HMR; safe
+   * to omit when no shared modules are configured.
+   */
+  sharedRuntime?: DenoSharedRuntime;
+  rewriteCache?: RewriteCache;
 }
 
 export interface DenoHotReloader {
@@ -210,9 +221,44 @@ export function createDenoHotReloader(
     setTimer: opts.setTimer,
     clearTimer: opts.clearTimer,
     flushFn: async (paths) => {
+      // Shared-module changes need to land BEFORE the rewrite-cache
+      // invalidation pass, because the rewriter reads the runtime's
+      // current export list to (re)generate stubs. We re-import the
+      // module in the gateway, drop its cached stub + every rewritten
+      // copy, then fall through to the normal affected-set pass —
+      // which will pick up every dependent function via the dep
+      // graph and respawn its Worker against the fresh stub.
+      const sharedRuntime = opts.sharedRuntime;
+      const rewriteCache = opts.rewriteCache;
+      if (sharedRuntime && rewriteCache) {
+        const sharedPaths = new Set(sharedRuntime.sourcePaths);
+        for (const p of paths) {
+          if (!sharedPaths.has(p)) continue;
+          try {
+            const { record } = await sharedRuntime.reload(p);
+            rewriteCache.invalidateStub(record.id);
+            log(`[1tube] HMR shared module reloaded: ${record.id}`);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log(`[1tube] HMR shared module reload FAILED for ${p}: ${msg}`);
+          }
+        }
+      }
+      // Invalidate rewritten copies of any per-function file that
+      // changed. The next worker spawn will re-emit the rewrite from
+      // the fresh source.
+      if (rewriteCache) {
+        for (const p of paths) rewriteCache.invalidate(p);
+      }
+
       const raw = computeAffected(paths, opts.host.depGraph, {
         functionsDir: opts.functionsDir,
       });
+      // Files that aren't owned by any single function (shared
+      // modules, anything imported by ≥2 functions) need every
+      // dependent reloaded. The dep-graph already covers this — its
+      // reverse index maps file → owner names — so `raw` is already
+      // the correct union.
       // Filter to names that are either currently loaded or have an
       // `index.ts` on disk right now. This drops spurious entries
       // synthesized from non-function files at the root of

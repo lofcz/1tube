@@ -37,6 +37,16 @@ import {
   type DenoHotReloader,
 } from "./backends/deno/hot-reloader.ts";
 import {
+  createDenoSharedRuntime,
+  type DenoSharedRuntime,
+  discoverSharedModules,
+} from "./backends/deno/shared-runtime.ts";
+import {
+  createRewriteCache,
+  type RewriteCache,
+} from "./backends/deno/source-rewriter.ts";
+import { createBootProgress } from "./boot-progress.ts";
+import {
   createWorkerdWatchdog,
   recommendedBudgetBytes,
   type WorkerdWatchdog,
@@ -634,6 +644,8 @@ let workerdWatchdog: WorkerdWatchdog | null = null;
 const workerdNames = new Set<string>();
 let denoWorkerHost: DenoWorkerHost | null = null;
 let denoHotReloader: DenoHotReloader | null = null;
+let denoSharedRuntimeRef: DenoSharedRuntime | null = null;
+let denoRewriteCacheRef: RewriteCache | null = null;
 
 if (opts.backend === "workerd") {
   if (opts.workerdInspector) {
@@ -848,14 +860,73 @@ if (opts.backend === "workerd") {
     // No host deno.json or it isn't JSON; proceed without an import map.
   }
 
+  // Shared modules (Supabase _shared/profile-cache.ts convention +
+  // any explicit --workerd-shared paths) are evaluated ONCE here in
+  // the gateway main isolate. Function Workers receive auto-generated
+  // RPC stubs in place of the real source via the source rewriter,
+  // so a top-level `subscribeToProfileChanges()` runs once total
+  // instead of once per Worker.
+  const discoveredShared = await discoverSharedModules(
+    resolvedFunctionsPath,
+    opts.workerdShared ?? [],
+  );
+  let denoSharedRuntime: DenoSharedRuntime | undefined;
+  let denoRewriteCache: RewriteCache | undefined;
+  if (discoveredShared.length > 0) {
+    denoSharedRuntime = await createDenoSharedRuntime(discoveredShared);
+    const cacheDir = await Deno.makeTempDir({ prefix: "1tube-deno-shared-" });
+    denoRewriteCache = createRewriteCache({
+      cacheDir,
+      sharedRuntime: denoSharedRuntime,
+    });
+    denoSharedRuntimeRef = denoSharedRuntime;
+    denoRewriteCacheRef = denoRewriteCache;
+    console.log(
+      `[1tube] Shared module(s) loaded once in gateway: ${
+        discoveredShared.map((m) => m.id).join(", ")
+      }`,
+    );
+  }
+
   denoWorkerHost = createDenoWorkerHost({
     functionsDir: opts.functionsPath,
     registry,
     supervisor,
     ...(importMap ? { importMap, importMapBase: denoConfigPath } : {}),
+    ...(denoSharedRuntime ? { sharedRuntime: denoSharedRuntime } : {}),
+    ...(denoRewriteCache ? { rewriteCache: denoRewriteCache } : {}),
   });
+
+  // Boot progress: append-only `[i/N] ✓ name (123ms)` per worker plus
+  // a heartbeat every 2s so a project with many functions / a slow
+  // import shows progress instead of looking hung. Suppressed for
+  // small projects (≤2 functions) where the per-completion line is
+  // already enough signal.
   const bootStart = performance.now();
-  const { loaded, errors } = await denoWorkerHost.start();
+  const progress = createBootProgress(Deno.stdout, { pulseMs: 2000 });
+  let started = false;
+  const padTo = (n: number, width: number) =>
+    String(n).padStart(width, " ");
+  const { loaded, errors } = await denoWorkerHost.start({
+    onSpawnStart: (p) => {
+      if (!started) {
+        progress.start(p.total);
+        started = true;
+      }
+      progress.onStart(p.name);
+    },
+    onSpawnFinish: (p) => {
+      const w = String(p.total).length;
+      const status = p.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
+      const tail = p.ok ? "" : ` — ${p.error ?? "error"}`;
+      progress.onFinish(
+        `[1tube] [${padTo(p.index, w)}/${p.total}] ${status} ${p.name} ` +
+          `\x1b[2m(${p.durationMs.toFixed(0)}ms)\x1b[0m${tail}`,
+        p.name,
+      );
+    },
+  });
+  progress.stop();
   const bootMs = performance.now() - bootStart;
   console.log(
     `[1tube] Loaded ${loaded.length} function(s) in ${bootMs.toFixed(0)}ms`,
@@ -874,6 +945,8 @@ if (opts.backend === "workerd") {
     denoHotReloader = createDenoHotReloader({
       host: denoWorkerHost,
       functionsDir: opts.functionsPath,
+      ...(denoSharedRuntime ? { sharedRuntime: denoSharedRuntime } : {}),
+      ...(denoRewriteCache ? { rewriteCache: denoRewriteCache } : {}),
     });
     await denoHotReloader.start();
   } else {
@@ -1411,6 +1484,14 @@ async function shutdown(reason: string) {
     await denoWorkerHost.stop().catch((err) => {
       console.warn("[1tube] deno worker host stop() error:", err);
     });
+  }
+  if (denoSharedRuntimeRef) {
+    await denoSharedRuntimeRef.stop().catch((err) => {
+      console.warn("[1tube] deno shared runtime stop() error:", err);
+    });
+  }
+  if (denoRewriteCacheRef) {
+    await denoRewriteCacheRef.stop().catch(() => {});
   }
 
   flushLogs();

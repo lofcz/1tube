@@ -34,6 +34,7 @@
 
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { defaultManifest, type FunctionManifest, loadManifest } from "../../manifest.ts";
 import type {
   AuthContext,
@@ -42,6 +43,8 @@ import type {
 } from "../../registry.ts";
 import type { FunctionSupervisor } from "../../supervisor.ts";
 import { createDepGraph, type DepGraph } from "./dep-graph.ts";
+import type { DenoSharedRuntime } from "./shared-runtime.ts";
+import type { RewriteCache } from "./source-rewriter.ts";
 
 export type DenoWorkerHandle = WorkerFunctionHandle;
 
@@ -62,6 +65,15 @@ export interface DenoWorkerHostOptions {
   importMapBase?: string;
   /** Hook fired on every reload completion (for tests / observability). */
   onReloaded?: (summary: ReloadSummary) => void;
+  /**
+   * Optional shared-module runtime. When set, every Worker's
+   * `globalThis.__1tube_call_shared(moduleId, exportName, args)`
+   * round-trips into this runtime, and the source rewriter (also
+   * required) replaces tainted imports with stub URLs. When both
+   * are omitted the host behaves as before — no shared modules.
+   */
+  sharedRuntime?: DenoSharedRuntime;
+  rewriteCache?: RewriteCache;
 }
 
 export interface ReloadSummary {
@@ -99,6 +111,18 @@ interface SpawnOpts {
    * without going through AsyncLocalStorage.
    */
   onUnhandledRejection?: (msg: string) => void;
+  /**
+   * Resolve a shared-module RPC initiated inside this Worker.
+   * Returns the value (or rejects with an Error) from the
+   * gateway-side {@link DenoSharedRuntime}. Omit to disable shared
+   * runtime calls — the worker will reject `__1tube_call_shared`
+   * with a "not configured" message in that case.
+   */
+  onSharedCall?: (
+    moduleId: string,
+    exportName: string,
+    args: readonly unknown[],
+  ) => Promise<unknown>;
 }
 
 function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
@@ -249,6 +273,43 @@ function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
         opts.onUnhandledRejection?.(String(m.message ?? "unknown"));
         return;
       }
+
+      if (m.type === "shared_call") {
+        // Round-trip the call through the gateway-side runtime. The
+        // worker side waits on a matching `shared_call_result` so we
+        // post one in both success and failure paths. Errors are
+        // serialized to a message + stack — structured clone can't
+        // ferry a real Error across without losing the prototype.
+        const id = m.id as number;
+        const moduleId = String(m.moduleId ?? "");
+        const exportName = String(m.exportName ?? "");
+        const args = Array.isArray(m.args) ? (m.args as unknown[]) : [];
+        const handler = opts.onSharedCall;
+        const reply = (payload: Record<string, unknown>) => {
+          try {
+            worker.postMessage({ type: "shared_call_result", id, ...payload });
+          } catch {
+            // The worker may have terminated mid-call; nothing to do.
+          }
+        };
+        if (!handler) {
+          reply({
+            ok: false,
+            message: "shared runtime is not configured for this worker host",
+          });
+          return;
+        }
+        Promise.resolve()
+          .then(() => handler(moduleId, exportName, args))
+          .then(
+            (value) => reply({ ok: true, value }),
+            (err) => {
+              const e = err instanceof Error ? err : new Error(String(err));
+              reply({ ok: false, message: e.message, stack: e.stack });
+            },
+          );
+        return;
+      }
     };
 
     // Kick off init; the worker will reply with `ready` once the
@@ -262,8 +323,32 @@ function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
   });
 }
 
+export interface SpawnProgress {
+  /** 1-based index of this function in the boot sequence. */
+  index: number;
+  /** Total functions discovered for this start() call. */
+  total: number;
+  name: string;
+  /** True when the worker spawned + reported `ready`. False on error. */
+  ok: boolean;
+  /** Time taken to spawn this worker, in milliseconds. */
+  durationMs: number;
+  /** Error message when `ok === false`. */
+  error?: string;
+}
+
+export interface StartOptions {
+  /** Fired before each worker spawn begins. */
+  onSpawnStart?: (p: { index: number; total: number; name: string }) => void;
+  /** Fired after each worker either becomes ready or errors out. */
+  onSpawnFinish?: (p: SpawnProgress) => void;
+}
+
 export interface DenoWorkerHost {
-  start(): Promise<{ loaded: string[]; errors: Array<{ name: string; error: string }> }>;
+  start(opts?: StartOptions): Promise<{
+    loaded: string[];
+    errors: Array<{ name: string; error: string }>;
+  }>;
   reload(names: ReadonlySet<string> | "all", reason?: string): Promise<ReloadSummary>;
   stop(): Promise<void>;
   /** Currently registered function names (loaded + booting). */
@@ -314,13 +399,31 @@ export function createDenoWorkerHost(opts: DenoWorkerHostOptions): DenoWorkerHos
   );
   const concurrency = Math.max(1, opts.concurrency ?? 8);
 
+  const sharedRuntime = opts.sharedRuntime;
+  const rewriteCache = opts.rewriteCache;
+
   async function spawnAndRegister(
     cand: DiscoveredCandidate,
   ): Promise<{ handle: InternalHandle } | { error: string }> {
     try {
+      // Build the dep-graph BEFORE spawning. The rewriter needs the
+      // file list to decide which files are tainted by a shared
+      // module, and the worker needs to import the rewritten entry
+      // URL (not the original) when any file in its graph touches a
+      // shared module.
+      await depGraph.refresh(cand.name, cand.entryUrl);
+
+      let entryUrlForWorker = cand.entryUrl;
+      if (rewriteCache && sharedRuntime && sharedRuntime.list().length > 0) {
+        const entryPath = fileURLToPath(cand.entryUrl);
+        const graphPaths = depGraph.filesFor(cand.name);
+        const r = await rewriteCache.rewrite({ entryPath, graphPaths });
+        entryUrlForWorker = r.entryUrl;
+      }
+
       const handle = await spawnWorker({
         name: cand.name,
-        entryUrl: cand.entryUrl,
+        entryUrl: entryUrlForWorker,
         manifest: cand.manifest,
         onUnhandledRejection: (msg) => {
           // Count orphan rejections against the function so the breaker
@@ -328,6 +431,10 @@ export function createDenoWorkerHost(opts: DenoWorkerHostOptions): DenoWorkerHos
           opts.supervisor.record(cand.name, true);
           console.error(`[1tube] Unhandled rejection in "${cand.name}": ${msg}`);
         },
+        onSharedCall: sharedRuntime
+          ? (moduleId, exportName, args) =>
+            sharedRuntime.call(moduleId, exportName, args)
+          : undefined,
       });
       // Update the registry + supervisor in one step so dispatch + admit
       // see consistent state.
@@ -338,7 +445,6 @@ export function createDenoWorkerHost(opts: DenoWorkerHostOptions): DenoWorkerHos
       if (old) {
         await old.terminate().catch(() => {});
       }
-      await depGraph.refresh(cand.name, cand.entryUrl);
       return { handle };
     } catch (err) {
       return { error: err instanceof Error ? err.message : String(err) };
@@ -363,16 +469,38 @@ export function createDenoWorkerHost(opts: DenoWorkerHostOptions): DenoWorkerHos
     await Promise.all(workers);
   }
 
-  async function start() {
+  async function start(startOpts: StartOptions = {}) {
     const candidates = await discoverCandidates(opts.functionsDir);
     const loaded: string[] = [];
     const errors: Array<{ name: string; error: string }> = [];
+    const total = candidates.length;
+    let nextIndex = 1;
+
     await runBounded(candidates, async (cand) => {
+      const index = nextIndex++;
+      startOpts.onSpawnStart?.({ index, total, name: cand.name });
+      const t0 = performance.now();
       const r = await spawnAndRegister(cand);
+      const durationMs = performance.now() - t0;
       if ("error" in r) {
         errors.push({ name: cand.name, error: r.error });
+        startOpts.onSpawnFinish?.({
+          index,
+          total,
+          name: cand.name,
+          ok: false,
+          durationMs,
+          error: r.error,
+        });
       } else {
         loaded.push(cand.name);
+        startOpts.onSpawnFinish?.({
+          index,
+          total,
+          name: cand.name,
+          ok: true,
+          durationMs,
+        });
       }
     });
     return { loaded, errors };

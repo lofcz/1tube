@@ -46,7 +46,16 @@ interface DispatchMessage {
   auth: AuthContext | null;
 }
 
-type HostMessage = InitMessage | DispatchMessage;
+interface SharedCallResultMessage {
+  type: "shared_call_result";
+  id: number;
+  ok: boolean;
+  value?: unknown;
+  message?: string;
+  stack?: string;
+}
+
+type HostMessage = InitMessage | DispatchMessage | SharedCallResultMessage;
 
 type Handler = (req: Request, auth?: AuthContext) => Response | Promise<Response>;
 
@@ -64,6 +73,42 @@ let captured: CapturedHandler | null = null;
 let functionName = "<unknown>";
 let manifest: FunctionManifest | null = null;
 let initDone = false;
+
+// Shared-module RPC: a tainted module imports the gateway-generated
+// stub, which calls `globalThis.__1tube_call_shared(id, name, args)`
+// to round-trip into the gateway's DenoSharedRuntime. We correlate
+// requests + responses by a per-Worker monotonic id.
+let nextSharedCallId = 1;
+const sharedCallPending = new Map<number, {
+  resolve: (value: unknown) => void;
+  reject: (err: unknown) => void;
+}>();
+
+function callSharedFromWorker(
+  moduleId: string,
+  exportName: string,
+  args: readonly unknown[],
+): Promise<unknown> {
+  const id = nextSharedCallId++;
+  return new Promise((resolve, reject) => {
+    sharedCallPending.set(id, { resolve, reject });
+    try {
+      postMessage({
+        type: "shared_call",
+        id,
+        moduleId,
+        exportName,
+        args: [...args],
+      });
+    } catch (err) {
+      sharedCallPending.delete(id);
+      reject(err);
+    }
+  });
+}
+
+(globalThis as { __1tube_call_shared?: typeof callSharedFromWorker })
+  .__1tube_call_shared = callSharedFromWorker;
 
 const stub: RegistryStub = {
   register(handler, opts) {
@@ -197,6 +242,19 @@ self.onmessage = (ev: MessageEvent<HostMessage>) => {
   }
   if (msg.type === "dispatch") {
     void runDispatch(msg);
+    return;
+  }
+  if (msg.type === "shared_call_result") {
+    const pending = sharedCallPending.get(msg.id);
+    if (!pending) return;
+    sharedCallPending.delete(msg.id);
+    if (msg.ok) {
+      pending.resolve(msg.value);
+    } else {
+      const err = new Error(msg.message ?? "shared runtime error");
+      if (msg.stack) (err as Error).stack = msg.stack;
+      pending.reject(err);
+    }
     return;
   }
 };
