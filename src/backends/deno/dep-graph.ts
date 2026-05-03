@@ -20,7 +20,11 @@
  * tracks it correctly.
  */
 
-import { createGraph } from "@deno/graph";
+// Direct `jsr:` specifier (not the `@deno/graph` import-map alias from
+// our own deno.json) so this module loads cleanly when 1tube is
+// consumed from a host project's node_modules — host configs do not
+// mirror our import map. Same convention as every other src/ file.
+import { createGraph } from "jsr:@deno/graph@^0.108";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Local re-export for callers that prefer std/path-style names. Underlying
