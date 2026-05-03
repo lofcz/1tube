@@ -907,6 +907,13 @@ if (opts.backend === "workerd") {
   let started = false;
   const padTo = (n: number, width: number) =>
     String(n).padStart(width, " ");
+  // Workers spawn in parallel, so `p.index` (assigned at spawn-start
+  // time) doesn't match the order in which finish lines are printed
+  // — the result reads as a jumbled `[8/53] ... [4/53] ... [7/53]`.
+  // Track a separate "print order" counter so the output reads
+  // monotonically. We still get the correct total + per-fn name +
+  // duration; the only thing that changes is the column we display.
+  let printOrder = 0;
   const { loaded, errors } = await denoWorkerHost.start({
     onSpawnStart: (p) => {
       if (!started) {
@@ -919,8 +926,9 @@ if (opts.backend === "workerd") {
       const w = String(p.total).length;
       const status = p.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
       const tail = p.ok ? "" : ` — ${p.error ?? "error"}`;
+      const idx = ++printOrder;
       progress.onFinish(
-        `[1tube] [${padTo(p.index, w)}/${p.total}] ${status} ${p.name} ` +
+        `[1tube] [${padTo(idx, w)}/${p.total}] ${status} ${p.name} ` +
           `\x1b[2m(${p.durationMs.toFixed(0)}ms)\x1b[0m${tail}`,
         p.name,
       );

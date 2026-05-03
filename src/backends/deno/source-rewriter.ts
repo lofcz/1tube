@@ -439,7 +439,24 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
       }
       // external / unknown: leave specifier alone.
       if (replacement !== null) {
-        replacements.push({ start: r.start, end: r.end, with: replacement });
+        // For static imports (`import x from "spec"`) the lexer
+        // reports [s, e) over just the specifier text (no quotes),
+        // so writing the bare URL is correct. For dynamic imports
+        // (`await import("spec")`) the slice covers the entire
+        // argument expression including the quotes, so we must
+        // re-quote the replacement or we'd produce
+        // `import(file:///...)` — a parse error. Same goes for
+        // template literals; we normalise to a plain string since
+        // the URL never contains characters that would need
+        // escaping in a JSON string. Detect by sniffing the first
+        // char of the slice.
+        const first = source.charAt(r.start);
+        const isQuoted = first === '"' || first === "'" || first === "`";
+        replacements.push({
+          start: r.start,
+          end: r.end,
+          with: isQuoted ? JSON.stringify(replacement) : replacement,
+        });
       }
     }
 

@@ -234,6 +234,97 @@ Deno.test(
   },
 );
 
+Deno.test(
+  "shared modules: dynamic import() of a non-shared dep keeps quotes around the rewritten URL",
+  async () => {
+    // Regression for a parse error we hit in real-world projects:
+    // `await import("./model.ts")` was being rewritten to
+    // `await import(file:///.../model.ts)` (no quotes) because the
+    // lexer's [s, e) span for dynamic imports includes the quotes
+    // and the splicer was emitting a bare URL. The handler below
+    // imports a constant lazily so the rewriter's dynamic-import
+    // branch is exercised end-to-end.
+    const dir = await Deno.makeTempDir({ prefix: "1tube-dyn-import-" });
+    try {
+      const evalLog = join(dir, ".shared-evals.log");
+      await Deno.writeTextFile(evalLog, "");
+
+      await write(
+        join(dir, "_shared", "profile-cache.ts"),
+        `await Deno.writeTextFile(${JSON.stringify(evalLog)}, Deno.readTextFileSync(${JSON.stringify(evalLog)}) + "x");
+export async function getCachedProfile(_id) { return { ok: true }; }
+`,
+      );
+
+      // model.ts is NOT shared and is dynamically imported. The
+      // rewritten copy of index.ts must keep the import statement
+      // syntactically valid.
+      await write(
+        join(dir, "fn", "model.ts"),
+        `export const CHEAP_MODEL = "tiny";\n`,
+      );
+      await write(
+        join(dir, "fn", "index.ts"),
+        `import { getCachedProfile } from "../_shared/profile-cache.ts";
+
+const reg = (globalThis).__edgeFunctionRegistry;
+reg.register(
+  async () => {
+    const { CHEAP_MODEL } = await import("./model.ts");
+    const profile = await getCachedProfile("u1");
+    return new Response(JSON.stringify({ model: CHEAP_MODEL, profile }), {
+      headers: { "content-type": "application/json" },
+    });
+  },
+  { public: true },
+);
+`,
+      );
+
+      const shared = await discoverSharedModules(dir);
+      const sharedRuntime = await createDenoSharedRuntime(shared);
+      const cacheDir = await Deno.makeTempDir({ prefix: "1tube-rewrite-" });
+      const rewriteCache = createRewriteCache({ cacheDir, sharedRuntime });
+      const registry = new FunctionRegistry();
+      const supervisor = new FunctionSupervisor();
+      const host = createDenoWorkerHost({
+        functionsDir: dir,
+        registry,
+        supervisor,
+        sharedRuntime,
+        rewriteCache,
+      });
+      try {
+        const { loaded, errors } = await host.start();
+        assertEquals(errors, [], `unexpected boot errors: ${JSON.stringify(errors)}`);
+        assertEquals(loaded, ["fn"]);
+
+        const handle = registry.workerHandle("fn");
+        assert(handle, "expected fn to register");
+        const abort = new AbortController();
+        const resp = await handle.dispatch(
+          new Request("http://localhost/"),
+          null,
+          abort.signal,
+        );
+        assertEquals(resp.status, 200);
+        const body = await resp.json() as {
+          model: string;
+          profile: { ok: boolean };
+        };
+        assertEquals(body.model, "tiny");
+        assertEquals(body.profile, { ok: true });
+      } finally {
+        await host.stop();
+        await sharedRuntime.stop();
+        await rewriteCache.stop();
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
 Deno.test("shared modules: rewriter is a no-op when no shared modules are configured", async () => {
   const proj = await makeProject(2);
   try {
