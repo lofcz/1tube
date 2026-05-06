@@ -40,6 +40,8 @@ export interface DepGraphOptions {
    * only relative imports are tracked precisely.
    */
   importMap?: Readonly<Record<string, string>>;
+  /** Parsed `scopes` field from the host project's deno.json import map. */
+  importMapScopes?: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /**
    * Absolute path of the deno.json the import map came from. Import
    * map values are resolved relative to this. Required when
@@ -56,6 +58,16 @@ export interface DepGraph {
    * burst with a half-written file doesn't crash the watcher.
    */
   refresh(name: string, entryFileUrl: string): Promise<void>;
+  /**
+   * Build one module graph for many function entries and populate each
+   * function's reachable file set from that shared graph. Initial eager boot
+   * uses this when shared-module rewriting needs every function's file list:
+   * it avoids N overlapping `deno_graph` walks over the same `_shared`, npm,
+   * and JSR dependencies.
+   */
+  refreshMany(
+    entries: Iterable<{ name: string; entryFileUrl: string }>,
+  ): Promise<void>;
   /** Drop a function's graph. Used when an `index.ts` is deleted. */
   forget(name: string): void;
   /**
@@ -113,6 +125,36 @@ function applyImportMap(
   return resolveAgainst(target, base);
 }
 
+function resolveImportMap(
+  specifier: string,
+  referrer: string,
+  importMap: Readonly<Record<string, string>> | undefined,
+  scopes:
+    | Readonly<Record<string, Readonly<Record<string, string>>>>
+    | undefined,
+  base: string,
+): string | null {
+  let bestScope: string | null = null;
+  if (scopes) {
+    for (const rawScope of Object.keys(scopes)) {
+      const scopeUrl = resolveAgainst(rawScope, base);
+      if (!referrer.startsWith(scopeUrl)) continue;
+      if (bestScope === null || scopeUrl.length > bestScope.length) {
+        bestScope = scopeUrl;
+      }
+    }
+  }
+  if (bestScope !== null && scopes) {
+    for (const rawScope of Object.keys(scopes)) {
+      if (resolveAgainst(rawScope, base) !== bestScope) continue;
+      const scoped = applyImportMap(specifier, scopes[rawScope], base);
+      if (scoped !== null) return scoped;
+      break;
+    }
+  }
+  return importMap ? applyImportMap(specifier, importMap, base) : null;
+}
+
 function resolveAgainst(target: string, base: string): string {
   // Bare URLs (npm:/jsr:/https:/file:) pass through unchanged. Relative
   // paths get resolved against the import map's deno.json directory so
@@ -127,11 +169,18 @@ export function createDepGraph(options?: DepGraphOptions): DepGraph {
   const reverse = new Map<string, Set<string>>();
 
   const importMap = options?.importMap;
+  const importMapScopes = options?.importMapScopes;
   const importMapBase = options?.importMapBase;
 
-  const resolve = importMap && importMapBase
+  const resolve = importMapBase && (importMap || importMapScopes)
     ? (specifier: string, referrer: string): string => {
-      const rewritten = applyImportMap(specifier, importMap, importMapBase);
+      const rewritten = resolveImportMap(
+        specifier,
+        referrer,
+        importMap,
+        importMapScopes,
+        importMapBase,
+      );
       if (rewritten !== null) return rewritten;
       // Fall through to standard resolution against the referrer.
       try {
@@ -158,6 +207,41 @@ export function createDepGraph(options?: DepGraphOptions): DepGraph {
     if (set.size === 0) reverse.delete(fileUrl);
   }
 
+  function replaceGraph(name: string, fresh: Set<string>): void {
+    const old = perName.get(name);
+    if (old) {
+      for (const f of old) {
+        if (!fresh.has(f)) indexRemove(name, f);
+      }
+    }
+    for (const f of fresh) {
+      if (!old || !old.has(f)) indexAdd(name, f);
+    }
+    perName.set(name, fresh);
+  }
+
+  function minimalGraph(entry: string): Set<string> {
+    return new Set<string>([entry]);
+  }
+
+  function fileDepsOf(mod: unknown): string[] {
+    const deps = (mod as { dependencies?: unknown[] })?.dependencies;
+    if (!Array.isArray(deps)) return [];
+    const out: string[] = [];
+    for (const dep of deps) {
+      const d = dep as {
+        code?: { specifier?: unknown };
+        type?: { specifier?: unknown };
+      };
+      for (const target of [d.code?.specifier, d.type?.specifier]) {
+        if (typeof target === "string" && target.startsWith("file://")) {
+          out.push(target);
+        }
+      }
+    }
+    return out;
+  }
+
   return {
     async refresh(name, entryFileUrl) {
       const entry = normalize(entryFileUrl);
@@ -169,13 +253,7 @@ export function createDepGraph(options?: DepGraphOptions): DepGraph {
         // disk; deno_graph throws. Drop the graph for `name` so the
         // affected-set reverts to "this entry only" and let the next
         // (clean) save rebuild it. Better than dying.
-        const old = perName.get(name);
-        if (old) {
-          for (const f of old) indexRemove(name, f);
-        }
-        const minimal = new Set<string>([entry]);
-        perName.set(name, minimal);
-        indexAdd(name, entry);
+        replaceGraph(name, minimalGraph(entry));
         return;
       }
 
@@ -189,17 +267,49 @@ export function createDepGraph(options?: DepGraphOptions): DepGraph {
       // Always include the entry, even if deno_graph short-circuited
       // due to a load error on a child.
       fresh.add(entry);
+      replaceGraph(name, fresh);
+    },
 
-      const old = perName.get(name);
-      if (old) {
-        for (const f of old) {
-          if (!fresh.has(f)) indexRemove(name, f);
+    async refreshMany(entries) {
+      const normalized = [...entries].map((e) => ({
+        name: e.name,
+        entry: normalize(e.entryFileUrl),
+      }));
+      if (normalized.length === 0) return;
+
+      let graph;
+      try {
+        graph = await createGraph(
+          normalized.map((e) => e.entry),
+          resolve ? { resolve } : undefined,
+        );
+      } catch {
+        for (const e of normalized) replaceGraph(e.name, minimalGraph(e.entry));
+        return;
+      }
+
+      const modules = new Map<string, unknown>();
+      const adjacency = new Map<string, string[]>();
+      for (const mod of graph.modules ?? []) {
+        const spec = (mod as { specifier?: unknown })?.specifier;
+        if (typeof spec !== "string" || !spec.startsWith("file://")) continue;
+        modules.set(spec, mod);
+        adjacency.set(spec, fileDepsOf(mod));
+      }
+
+      for (const e of normalized) {
+        const fresh = new Set<string>([e.entry]);
+        const stack = [e.entry];
+        while (stack.length > 0) {
+          const current = stack.pop()!;
+          for (const dep of adjacency.get(current) ?? []) {
+            if (fresh.has(dep)) continue;
+            fresh.add(dep);
+            if (modules.has(dep)) stack.push(dep);
+          }
         }
+        replaceGraph(e.name, fresh);
       }
-      for (const f of fresh) {
-        if (!old || !old.has(f)) indexAdd(name, f);
-      }
-      perName.set(name, fresh);
     },
 
     filesFor(name) {

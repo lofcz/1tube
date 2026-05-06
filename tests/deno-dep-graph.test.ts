@@ -156,3 +156,64 @@ Deno.test("dep-graph: refresh on broken file degrades to entry-only graph", asyn
     await Deno.remove(tmp, { recursive: true });
   }
 });
+
+Deno.test("dep-graph: refreshMany matches repeated refresh for shared and aliased deps", async () => {
+  const tmp = await Deno.makeTempDir({ prefix: "1tube-dep-graph-many-" });
+  try {
+    await writeFile(
+      join(tmp, "_shared", "common.ts"),
+      `export const common = 1;\n`,
+    );
+    await writeFile(
+      join(tmp, "_shared", "only-a.ts"),
+      `export const onlyA = 2;\n`,
+    );
+    await writeFile(
+      join(tmp, "a", "index.ts"),
+      `import { common } from "@shared/common.ts"; import { onlyA } from "@shared/only-a.ts"; export default common + onlyA;\n`,
+    );
+    await writeFile(
+      join(tmp, "b", "index.ts"),
+      `import { common } from "@shared/common.ts"; export default common;\n`,
+    );
+
+    const options = {
+      importMap: {
+        "@shared/": "./_shared/",
+      },
+      importMapBase: join(tmp, "deno.json"),
+    };
+    const repeated = createDepGraph(options);
+    await repeated.refresh("a", urlOf(join(tmp, "a", "index.ts")));
+    await repeated.refresh("b", urlOf(join(tmp, "b", "index.ts")));
+
+    const batched = createDepGraph(options);
+    await batched.refreshMany([
+      { name: "a", entryFileUrl: urlOf(join(tmp, "a", "index.ts")) },
+      { name: "b", entryFileUrl: urlOf(join(tmp, "b", "index.ts")) },
+    ]);
+
+    const commonPath = join(tmp, "_shared", "common.ts");
+    const onlyAPath = join(tmp, "_shared", "only-a.ts");
+    assertEquals(
+      [...batched.affected([commonPath])].sort(),
+      [...repeated.affected([commonPath])].sort(),
+    );
+    assertEquals([...batched.affected([commonPath])].sort(), ["a", "b"]);
+    assertEquals(
+      [...batched.affected([onlyAPath])].sort(),
+      [...repeated.affected([onlyAPath])].sort(),
+    );
+    assertEquals([...batched.affected([onlyAPath])], ["a"]);
+    assertEquals(
+      [...batched.filesFor("a")].sort(),
+      [...repeated.filesFor("a")].sort(),
+    );
+    assertEquals(
+      [...batched.filesFor("b")].sort(),
+      [...repeated.filesFor("b")].sort(),
+    );
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});

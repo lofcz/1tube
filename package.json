@@ -42,6 +42,6 @@
     "prepublishOnly": "bun run typecheck && bun run check && bun run smoke:bin"
   },
   "dependencies": {
-    "hono": "^4.12.14"
+    "hono": "^4.12.18"
   }
 }

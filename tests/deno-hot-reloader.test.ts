@@ -11,7 +11,10 @@
 import { assert, assertEquals } from "@std/assert";
 import { join } from "@std/path";
 import { pathToFileURL } from "node:url";
-import { createDepGraph, type DepGraph } from "../src/backends/deno/dep-graph.ts";
+import {
+  createDepGraph,
+  type DepGraph,
+} from "../src/backends/deno/dep-graph.ts";
 import {
   computeAffected,
   createDenoHotReloader,
@@ -92,7 +95,10 @@ Deno.test("computeAffected: includes graph owners and new function dirs", async 
       `import { x } from "../_shared/x.ts"; export default x;\n`,
     );
     const graph = createDepGraph();
-    await graph.refresh("alpha", pathToFileURL(join(tmp, "alpha", "index.ts")).href);
+    await graph.refresh(
+      "alpha",
+      pathToFileURL(join(tmp, "alpha", "index.ts")).href,
+    );
 
     // Existing function affected via dep-graph.
     let affected = computeAffected([join(tmp, "_shared", "x.ts")], graph);
@@ -113,7 +119,8 @@ interface FakeStream extends FsEventStream {
 
 function makeFakeStream(): FakeStream {
   const queue: Array<{ paths: string[] }> = [];
-  let resolveNext: ((v: IteratorResult<{ paths: string[] }>) => void) | null = null;
+  let resolveNext: ((v: IteratorResult<{ paths: string[] }>) => void) | null =
+    null;
   let closed = false;
 
   const iter: AsyncIterator<{ paths: string[] }> = {
@@ -243,6 +250,55 @@ Deno.test("hot-reloader: fs events trigger a precise reload via the dep-graph", 
       const set = reloads[0] as ReadonlySet<string>;
       assert(set instanceof Set);
       assertEquals([...set].sort(), ["alpha"]);
+    } finally {
+      await reloader.stop();
+    }
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+Deno.test("hot-reloader: relative functionsDir misses absolute directory event for a new function", async () => {
+  const tmp = await Deno.makeTempDir({
+    dir: Deno.cwd(),
+    prefix: "1tube-hot-relative-",
+  });
+  const rel = `./${tmp.split(/[\\/]/).pop()}`;
+  try {
+    await Deno.mkdir(join(tmp, "brand-new"), { recursive: true });
+    await Deno.writeTextFile(
+      join(tmp, "brand-new", "index.ts"),
+      `export default 1;\n`,
+    );
+
+    const graph = createDepGraph();
+    const { host, reloads } = fakeHost(graph);
+    const stream = makeFakeStream();
+    const clock = new FakeClock();
+
+    const reloader = createDenoHotReloader({
+      host,
+      functionsDir: rel,
+      debounceMs: 10,
+      watch: () => stream,
+      setTimer: clock.setTimer,
+      clearTimer: clock.clearTimer,
+      log: () => {},
+    });
+    await reloader.start();
+    try {
+      // Deno.watchFs emits absolute paths even when watched with a relative
+      // path. Linux can report only this directory path for a brand-new
+      // function directory, so the reloader must normalize before matching.
+      stream.emit([join(tmp, "brand-new")]);
+      await new Promise((r) => setTimeout(r, 0));
+      clock.fireAll();
+      await new Promise((r) => setTimeout(r, 10));
+
+      assertEquals(reloads.length, 1);
+      const set = reloads[0] as ReadonlySet<string>;
+      assert(set instanceof Set);
+      assertEquals([...set].sort(), ["brand-new"]);
     } finally {
       await reloader.stop();
     }

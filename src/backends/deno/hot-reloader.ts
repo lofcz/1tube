@@ -32,6 +32,7 @@ import type { DenoWorkerHost, ReloadSummary } from "./worker-host.ts";
 import type { DepGraph } from "./dep-graph.ts";
 import type { DenoSharedRuntime } from "./shared-runtime.ts";
 import type { RewriteCache } from "./source-rewriter.ts";
+import { resolve } from "node:path";
 
 export type FsEventStream = AsyncIterable<{ paths: readonly string[] }> & {
   close(): void;
@@ -159,31 +160,30 @@ export function createDenoReloadDebouncer(
  *    changed file.
  * 2. Files matching `<functionsDir>/<name>/index.ts`: include `<name>`.
  *    Catches the entry's own edits.
- * 3. Path is the directory `<functionsDir>/<name>` itself or any path
- *    under it (subtree change). This is necessary for two cases the
- *    other rules miss:
+ * 3. Optionally, path is the directory `<functionsDir>/<name>` itself. This is
+ *    necessary for two cases the other rules miss:
  *      - **Linux**: `Deno.watchFs` is recursive only over the dirs
  *        that existed at start. A *new* function dir reports a single
  *        `<functionsDir>/<name>` create event — child file events
  *        never fire because inotify doesn't auto-watch the new subdir.
  *      - **Windows**: deleting a function dir tree emits dir-path
  *        events instead of `index.ts` events.
- *    Either way the affected name is the first path component after
- *    `functionsDir`. We let `discoverCandidates` filter out junk
- *    (e.g. `_shared`) on the reload pass so this rule stays simple
- *    and doesn't need the host's knownNames set.
+ *    Callers that can stat the candidate directory should disable this
+ *    fallback and decide new/removed/existing precisely. A plain parent-dir
+ *    event can also be emitted for a child sidecar edit, and reloading that
+ *    function would be noisy when the dep graph has no edge to the file.
  */
 export function computeAffected(
   paths: readonly string[],
   depGraph: DepGraph,
-  options: { functionsDir?: string } = {},
+  options: { functionsDir?: string; includeDirectoryEvents?: boolean } = {},
 ): Set<string> {
   const out = depGraph.affected(paths);
   for (const p of paths) {
     const m = /[\\/]([^\\/]+)[\\/]index\.ts$/.exec(p);
     if (m && m[1]) out.add(m[1]);
   }
-  if (options.functionsDir) {
+  if (options.functionsDir && options.includeDirectoryEvents !== false) {
     const fnDir = options.functionsDir.replace(/[\\/]$/, "");
     for (const p of paths) {
       // Strip the prefix; anything left should look like
@@ -194,7 +194,8 @@ export function computeAffected(
       else if (p.startsWith(fnDir + "\\")) rest = p.slice(fnDir.length + 1);
       else if (p === fnDir) continue;
       if (rest === null) continue;
-      const seg = rest.split(/[\\/]/, 1)[0];
+      if (/[\\/]/.test(rest)) continue;
+      const seg = rest;
       // Skip private/shared dirs the host already filters out — keeps
       // the affected set tight even before `reload()` runs.
       if (!seg || seg.startsWith("_") || seg.endsWith("_shared")) continue;
@@ -204,13 +205,32 @@ export function computeAffected(
   return out;
 }
 
+function directoryEventFunctionNames(
+  paths: readonly string[],
+  functionsDir: string,
+): Set<string> {
+  const out = new Set<string>();
+  const fnDir = functionsDir.replace(/[\\/]$/, "");
+  for (const p of paths) {
+    let rest: string | null = null;
+    if (p.startsWith(fnDir + "/")) rest = p.slice(fnDir.length + 1);
+    else if (p.startsWith(fnDir + "\\")) rest = p.slice(fnDir.length + 1);
+    else continue;
+    if (!rest || /[\\/]/.test(rest)) continue;
+    if (rest.startsWith("_") || rest.endsWith("_shared")) continue;
+    out.add(rest);
+  }
+  return out;
+}
+
 export function createDenoHotReloader(
   opts: DenoHotReloaderOptions,
 ): DenoHotReloader {
   const log = opts.log ?? ((line) => console.log(line));
-  const watcherFactory = opts.watch ?? ((dir: string) =>
-    Deno.watchFs(dir, { recursive: true }) as unknown as FsEventStream
-  );
+  const functionsDir = resolve(opts.functionsDir);
+  const watcherFactory = opts.watch ??
+    ((dir: string) =>
+      Deno.watchFs(dir, { recursive: true }) as unknown as FsEventStream);
 
   let stream: FsEventStream | null = null;
   let stopped = false;
@@ -252,7 +272,8 @@ export function createDenoHotReloader(
       }
 
       const raw = computeAffected(paths, opts.host.depGraph, {
-        functionsDir: opts.functionsDir,
+        functionsDir,
+        includeDirectoryEvents: false,
       });
       // Files that aren't owned by any single function (shared
       // modules, anything imported by ≥2 functions) need every
@@ -265,6 +286,17 @@ export function createDenoHotReloader(
       // `functionsDir` (README.md, .gitignore, …) so we don't spend
       // a reload pass producing an empty summary.
       const known = new Set(opts.host.list());
+      for (
+        const name of directoryEventFunctionNames(paths, functionsDir)
+      ) {
+        const indexPath = `${functionsDir}/${name}/index.ts`;
+        try {
+          const stat = await Deno.stat(indexPath);
+          if (stat.isFile && !known.has(name)) raw.add(name);
+        } catch {
+          if (known.has(name)) raw.add(name);
+        }
+      }
       const affected = new Set<string>();
       for (const name of raw) {
         if (known.has(name)) {
@@ -272,7 +304,7 @@ export function createDenoHotReloader(
           continue;
         }
         try {
-          const indexPath = `${opts.functionsDir}/${name}/index.ts`;
+          const indexPath = `${functionsDir}/${name}/index.ts`;
           const stat = await Deno.stat(indexPath);
           if (stat.isFile) affected.add(name);
         } catch {
@@ -307,16 +339,18 @@ export function createDenoHotReloader(
         opts.onReloaded?.(summary);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        log(`[1tube] HMR reload FAILED — keeping previous workers alive. Error: ${msg}`);
+        log(
+          `[1tube] HMR reload FAILED — keeping previous workers alive. Error: ${msg}`,
+        );
       }
     },
   });
 
   return {
-    async start() {
-      if (stream) return;
-      stream = watcherFactory(opts.functionsDir);
-      log(`[1tube] HMR watching: ${opts.functionsDir}`);
+    start() {
+      if (stream) return Promise.resolve();
+      stream = watcherFactory(functionsDir);
+      log(`[1tube] HMR watching: ${functionsDir}`);
       consumeLoop = (async () => {
         try {
           for await (const event of stream!) {
@@ -328,6 +362,7 @@ export function createDenoHotReloader(
           if (!stopped) log(`[1tube] HMR watcher disabled: ${err}`);
         }
       })();
+      return Promise.resolve();
     },
     async stop() {
       if (stopped) return;

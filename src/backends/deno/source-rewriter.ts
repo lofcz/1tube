@@ -51,7 +51,10 @@
  * name, so a list change means stale stubs).
  */
 
-import { init as initLexer, parse as parseImports } from "npm:es-module-lexer@^2";
+import {
+  init as initLexer,
+  parse as parseImports,
+} from "npm:es-module-lexer@^2";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import type {
@@ -98,6 +101,16 @@ export interface RewriteCacheOptions {
   cacheDir: string;
   /** Source-of-truth for what's currently shared. */
   sharedRuntime: DenoSharedRuntime;
+  /**
+   * Parsed `imports` from the host project's deno.json. Mirrors the dep-graph
+   * resolver so bare aliases that point at `_shared/*` are rewritten to stubs
+   * instead of being left for every Worker to evaluate independently.
+   */
+  importMap?: Readonly<Record<string, string>>;
+  /** Parsed `scopes` field from the host project's deno.json import map. */
+  importMapScopes?: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  /** Absolute path to the deno.json the import map came from. */
+  importMapBase?: string;
 }
 
 export interface RewriteCache {
@@ -108,7 +121,11 @@ export interface RewriteCache {
   /** Drop the cached stub for a shared module (HMR: shared file changed). */
   invalidateStub(moduleId: string): void;
   /** Test seam: list emitted rewrites + stubs. */
-  inspect(): { rewrites: ReadonlyArray<string>; stubs: ReadonlyArray<string> };
+  inspect(): {
+    rewrites: ReadonlyArray<string>;
+    stubs: ReadonlyArray<string>;
+    parsedFiles: ReadonlyArray<string>;
+  };
   /** Best-effort cleanup of the cache directory. */
   stop(): Promise<void>;
 }
@@ -159,8 +176,15 @@ interface PlannedFile {
   rewritePath: string;
   /** Set of absolute file paths this file depends on (file:// only). */
   fileImports: Map<string, ResolvedImport>;
+  /** All parsed imports, including positions for source rewriting. */
+  imports: readonly ResolvedImport[];
   /** Source text (already read). */
   source: string;
+}
+
+interface ParsedFile {
+  source: string;
+  imports: readonly ResolvedImport[];
 }
 
 interface ResolvedImport {
@@ -184,11 +208,71 @@ interface ResolvedImport {
 
 const REWRITE_DIR = "rewrites";
 const STUBS_DIR = "stubs";
+const DEFAULT_IO_CONCURRENCY = 16;
+
+function applyImportMap(
+  specifier: string,
+  importMap: Readonly<Record<string, string>>,
+  base: string,
+): string | null {
+  const exact = importMap[specifier];
+  if (exact !== undefined) return resolveAgainst(exact, base);
+
+  let bestKey: string | null = null;
+  for (const key of Object.keys(importMap)) {
+    if (!key.endsWith("/")) continue;
+    if (!specifier.startsWith(key)) continue;
+    if (bestKey === null || key.length > bestKey.length) bestKey = key;
+  }
+  if (bestKey === null) return null;
+
+  const target = importMap[bestKey] + specifier.slice(bestKey.length);
+  return resolveAgainst(target, base);
+}
+
+function resolveImportMap(
+  specifier: string,
+  referrer: string,
+  importMap: Readonly<Record<string, string>> | undefined,
+  scopes:
+    | Readonly<Record<string, Readonly<Record<string, string>>>>
+    | undefined,
+  base: string,
+): string | null {
+  let bestScope: string | null = null;
+  if (scopes) {
+    for (const rawScope of Object.keys(scopes)) {
+      const scopeUrl = resolveAgainst(rawScope, base);
+      if (!referrer.startsWith(scopeUrl)) continue;
+      if (bestScope === null || scopeUrl.length > bestScope.length) {
+        bestScope = scopeUrl;
+      }
+    }
+  }
+  if (bestScope !== null && scopes) {
+    for (const rawScope of Object.keys(scopes)) {
+      if (resolveAgainst(rawScope, base) !== bestScope) continue;
+      const scoped = applyImportMap(specifier, scopes[rawScope], base);
+      if (scoped !== null) return scoped;
+      break;
+    }
+  }
+  return importMap ? applyImportMap(specifier, importMap, base) : null;
+}
+
+function resolveAgainst(target: string, base: string): string {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target)) return target;
+  const baseUrl = base.startsWith("file://") ? base : pathToFileURL(base).href;
+  return new URL(target, baseUrl).href;
+}
 
 export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
   const cacheDir = opts.cacheDir;
   const rewriteDir = join(cacheDir, REWRITE_DIR);
   const stubsDir = join(cacheDir, STUBS_DIR);
+  const importMap = opts.importMap;
+  const importMapScopes = opts.importMapScopes;
+  const importMapBase = opts.importMapBase;
 
   // Dirs are created lazily on first emit so an unused cache (no
   // shared modules in the project) costs zero IO.
@@ -204,6 +288,30 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
   const emittedRewrites = new Map<string, string>();
   /** Map<moduleId, stubPath> — same, for stubs. */
   const emittedStubs = new Map<string, string>();
+  /** Map<absPath, parsed source/imports>. Invalidated by HMR path changes. */
+  const parseCache = new Map<string, Promise<ParsedFile>>();
+
+  async function mapBounded<T, R>(
+    items: readonly T[],
+    fn: (item: T) => Promise<R>,
+    concurrency = DEFAULT_IO_CONCURRENCY,
+  ): Promise<R[]> {
+    if (items.length === 0) return [];
+    const out = new Array<R>(items.length);
+    let cursor = 0;
+    const workers = Array.from(
+      { length: Math.min(Math.max(1, concurrency), items.length) },
+      async () => {
+        while (true) {
+          const i = cursor++;
+          if (i >= items.length) return;
+          out[i] = await fn(items[i]);
+        }
+      },
+    );
+    await Promise.all(workers);
+    return out;
+  }
 
   function pathHash(absPath: string): string {
     // Stable, filesystem-safe slug. We don't need cryptographic
@@ -242,32 +350,38 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
     return out;
   }
 
-  async function readResolvedImports(
+  function readResolvedImports(
     absPath: string,
-  ): Promise<{ source: string; imports: ResolvedImport[] }> {
-    await ensureLexerReady();
-    const source = await Deno.readTextFile(absPath);
-    const [imports] = parseImports(source);
-    const dirAbs = dirname(absPath);
-    const out: ResolvedImport[] = [];
-    for (const imp of imports) {
-      // s/e are the byte positions of the SPECIFIER (without quotes
-      // for static imports). `n` is the parsed value when the
-      // specifier is a string literal (i.e. always for static
-      // imports; null only for `import("dynamic" + var)` which we
-      // don't try to rewrite).
-      const specifier = imp.n;
-      if (typeof specifier !== "string") continue;
-      const start = imp.s;
-      const end = imp.e;
-      out.push(classifyImport(specifier, dirAbs, start, end));
-    }
-    return { source, imports: out };
+  ): Promise<ParsedFile> {
+    const cached = parseCache.get(absPath);
+    if (cached) return cached;
+    const parsed = (async (): Promise<ParsedFile> => {
+      await ensureLexerReady();
+      const source = await Deno.readTextFile(absPath);
+      const [imports] = parseImports(source);
+      const out: ResolvedImport[] = [];
+      for (const imp of imports) {
+        // s/e are the byte positions of the SPECIFIER (without quotes
+        // for static imports). `n` is the parsed value when the
+        // specifier is a string literal (i.e. always for static
+        // imports; null only for `import("dynamic" + var)` which we
+        // don't try to rewrite).
+        const specifier = imp.n;
+        if (typeof specifier !== "string") continue;
+        const start = imp.s;
+        const end = imp.e;
+        out.push(classifyImport(specifier, absPath, start, end));
+      }
+      return { source, imports: out };
+    })();
+    parseCache.set(absPath, parsed);
+    parsed.catch(() => parseCache.delete(absPath));
+    return parsed;
   }
 
   function classifyImport(
     specifier: string,
-    importerDir: string,
+    importerPath: string,
     start: number,
     end: number,
   ): ResolvedImport {
@@ -278,9 +392,27 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
       return { specifier, kind: "external", start, end };
     }
     let absPath: string;
+    const mapped = importMapBase && (importMap || importMapScopes)
+      ? resolveImportMap(
+        specifier,
+        pathToFileURL(importerPath).href,
+        importMap,
+        importMapScopes,
+        importMapBase,
+      )
+      : null;
     if (specifier.startsWith("file:")) {
       try {
         absPath = fileURLToPath(specifier);
+      } catch {
+        return { specifier, kind: "unknown", start, end };
+      }
+    } else if (mapped !== null) {
+      if (!mapped.startsWith("file:")) {
+        return { specifier, kind: "external", start, end };
+      }
+      try {
+        absPath = fileURLToPath(mapped);
       } catch {
         return { specifier, kind: "unknown", start, end };
       }
@@ -290,7 +422,8 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
     ) {
       try {
         absPath = fileURLToPath(
-          new URL(specifier, pathToFileURL(importerDir + "/").href).href,
+          new URL(specifier, pathToFileURL(dirname(importerPath) + "/").href)
+            .href,
         );
       } catch {
         return { specifier, kind: "unknown", start, end };
@@ -317,8 +450,7 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
     }
 
     // Phase 1: read + resolve imports for every file in the graph.
-    const planned = new Map<string, PlannedFile>();
-    for (const abs of req.graphPaths) {
+    const plannedEntries = await mapBounded(req.graphPaths, async (abs) => {
       const { source, imports } = await readResolvedImports(abs);
       const fileImports = new Map<string, ResolvedImport>();
       for (const r of imports) {
@@ -326,13 +458,15 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
           fileImports.set(r.absPath, r);
         }
       }
-      planned.set(abs, {
+      return {
         abs,
         rewritePath: rewritePathFor(abs),
         fileImports,
+        imports,
         source,
-      });
-    }
+      } satisfies PlannedFile;
+    });
+    const planned = new Map(plannedEntries.map((p) => [p.abs, p]));
 
     // Phase 2: compute the taint set. Initial = files importing a
     // shared module directly. Then iterate: any file that imports a
@@ -376,18 +510,17 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
 
     // Phase 3: emit rewritten copies for every tainted file.
     await ensureDirs();
-    const emittedNow: string[] = [];
-    for (const abs of tainted) {
+    const emittedNow = (await mapBounded([...tainted], async (abs) => {
       const plan = planned.get(abs);
-      if (!plan) continue;
+      if (!plan) return null;
       // Skip if a previous rewrite of this file is still valid; the
       // hot reloader calls `invalidate(abs)` when the file changes.
-      if (emittedRewrites.has(abs)) continue;
+      if (emittedRewrites.has(abs)) return null;
       const rewrittenSource = await renderRewrite(plan, planned, tainted);
       await Deno.writeTextFile(plan.rewritePath, rewrittenSource);
       emittedRewrites.set(abs, plan.rewritePath);
-      emittedNow.push(plan.rewritePath);
-    }
+      return plan.rewritePath;
+    })).filter((p): p is string => typeof p === "string");
 
     const entryPlan = planned.get(req.entryPath);
     if (!entryPlan) {
@@ -412,14 +545,7 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
     const { source } = plan;
     const replacements: Array<{ start: number; end: number; with: string }> =
       [];
-    // Re-resolve imports against this file's source — same data we
-    // captured in `fileImports` but with the original positions.
-    const dirAbs = dirname(plan.abs);
-    const [parsed] = parseImports(source);
-    for (const imp of parsed) {
-      const specifier = imp.n;
-      if (typeof specifier !== "string") continue;
-      const r = classifyImport(specifier, dirAbs, imp.s, imp.e);
+    for (const r of plan.imports) {
       let replacement: string | null = null;
       if (r.kind === "shared" && r.absPath) {
         const record = opts.sharedRuntime.bySourcePath(r.absPath);
@@ -476,6 +602,7 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
     rewrite,
     invalidate(absPath) {
       const out = emittedRewrites.get(absPath);
+      parseCache.delete(absPath);
       if (!out) return;
       emittedRewrites.delete(absPath);
       Deno.remove(out).catch(() => {});
@@ -497,9 +624,11 @@ export function createRewriteCache(opts: RewriteCacheOptions): RewriteCache {
       return {
         rewrites: [...emittedRewrites.values()],
         stubs: [...emittedStubs.values()],
+        parsedFiles: [...parseCache.keys()],
       };
     },
     async stop() {
+      parseCache.clear();
       try {
         await Deno.remove(cacheDir, { recursive: true });
       } catch { /* */ }

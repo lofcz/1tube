@@ -325,6 +325,62 @@ reg.register(
   },
 );
 
+Deno.test("shared modules: rewrite cache reuses parsed files and invalidates precisely", async () => {
+  const dir = await Deno.makeTempDir({ prefix: "1tube-rewrite-cache-" });
+  try {
+    await write(
+      join(dir, "_shared", "profile-cache.ts"),
+      `export async function getCachedProfile(_id) { return { ok: true }; }\n`,
+    );
+    const indexPath = join(dir, "fn", "index.ts");
+    const sharedPath = join(dir, "_shared", "profile-cache.ts");
+    await write(
+      indexPath,
+      `import { getCachedProfile } from "../_shared/profile-cache.ts";
+export async function run() { return await getCachedProfile("u1"); }
+`,
+    );
+
+    const shared = await discoverSharedModules(dir);
+    const sharedRuntime = await createDenoSharedRuntime(shared);
+    const cacheDir = await Deno.makeTempDir({ prefix: "1tube-rewrite-" });
+    const rewriteCache = createRewriteCache({ cacheDir, sharedRuntime });
+    try {
+      const req = { entryPath: indexPath, graphPaths: [indexPath, sharedPath] };
+      const first = await rewriteCache.rewrite(req);
+      assertEquals(first.rewritten, true);
+      assertEquals(first.emittedRewrites.length, 1);
+      const afterFirst = rewriteCache.inspect();
+      assertEquals(afterFirst.rewrites.length, 1);
+      assertEquals(afterFirst.stubs.length, 1);
+      assertEquals([...afterFirst.parsedFiles].sort(), [indexPath, sharedPath].sort());
+
+      const second = await rewriteCache.rewrite(req);
+      assertEquals(second.emittedRewrites.length, 0);
+      assertEquals(
+        [...rewriteCache.inspect().parsedFiles].sort(),
+        [...afterFirst.parsedFiles].sort(),
+      );
+
+      rewriteCache.invalidate(indexPath);
+      assertEquals(rewriteCache.inspect().rewrites.length, 0);
+      const third = await rewriteCache.rewrite(req);
+      assertEquals(third.emittedRewrites.length, 1);
+      assertEquals(rewriteCache.inspect().rewrites.length, 1);
+
+      rewriteCache.invalidateStub("profile-cache");
+      const afterStubInvalidate = rewriteCache.inspect();
+      assertEquals(afterStubInvalidate.rewrites.length, 0);
+      assertEquals(afterStubInvalidate.stubs.length, 0);
+    } finally {
+      await sharedRuntime.stop();
+      await rewriteCache.stop();
+    }
+  } finally {
+    await Deno.remove(dir, { recursive: true }).catch(() => {});
+  }
+});
+
 Deno.test("shared modules: rewriter is a no-op when no shared modules are configured", async () => {
   const proj = await makeProject(2);
   try {

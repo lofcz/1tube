@@ -387,37 +387,23 @@ Deno.test(
 );
 
 Deno.test("prebuilt mode rejects public reload() calls", async () => {
-  // Pure unit: build a real artifact, point a backend at it, but never
-  // call start() — the public reload() guard must reject regardless of
-  // backend state. This avoids needing workerd here.
-  const dist = await Deno.makeTempDir({ prefix: "1tube-prebuilt-reload-" });
+  // Pure unit: reload() rejects from the immutable prebuilt-mode guard before
+  // reading the artifact or requiring workerd/esbuild.
+  const backend = createWorkerdBackend({
+    functionsDir: PLAYGROUND,
+    configPath: DENO_JSON,
+    prebuiltDir: join(PROJECT_ROOT, ".does-not-need-to-exist"),
+  });
+
+  let threw: Error | null = null;
   try {
-    await build({
-      functionsDir: PLAYGROUND,
-      outDir: dist,
-      configPath: DENO_JSON,
-      only: ["hello"],
-      sourcemap: false,
-    });
-
-    const backend = createWorkerdBackend({
-      functionsDir: PLAYGROUND,
-      configPath: DENO_JSON,
-      prebuiltDir: dist,
-    });
-
-    let threw: Error | null = null;
-    try {
-      await backend.reload();
-    } catch (err) {
-      threw = err as Error;
-    }
-    assert(threw, "reload() must reject in prebuilt mode");
-    assert(
-      /prebuilt/i.test(threw!.message),
-      `expected message to mention prebuilt, got: ${threw!.message}`,
-    );
-  } finally {
-    await Deno.remove(dist, { recursive: true }).catch(() => {});
+    await backend.reload();
+  } catch (err) {
+    threw = err as Error;
   }
+  assert(threw, "reload() must reject in prebuilt mode");
+  assert(
+    /prebuilt/i.test(threw!.message),
+    `expected message to mention prebuilt, got: ${threw!.message}`,
+  );
 });

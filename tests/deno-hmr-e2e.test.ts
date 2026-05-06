@@ -22,7 +22,7 @@
  */
 
 import { assert, assertEquals } from "@std/assert";
-import { join } from "@std/path";
+import { fromFileUrl, join } from "@std/path";
 import { FunctionRegistry } from "../src/registry.ts";
 import { FunctionSupervisor } from "../src/supervisor.ts";
 import {
@@ -34,6 +34,13 @@ import {
   createDenoHotReloader,
   type DenoHotReloader,
 } from "../src/backends/deno/hot-reloader.ts";
+
+const SERVER = join(
+  fromFileUrl(new URL(".", import.meta.url)),
+  "..",
+  "src",
+  "server.ts",
+);
 
 async function writeFile(path: string, text: string): Promise<void> {
   await Deno.mkdir(join(path, ".."), { recursive: true });
@@ -128,7 +135,9 @@ async function makeHarness(
           [...expected].join(",")
         }; saw ${summaries.length} summaries: ${
           summaries.map((s) =>
-            `[reloaded=${s.reloaded.join("|")}; added=${s.added.join("|")}; removed=${s.removed.join("|")}]`
+            `[reloaded=${s.reloaded.join("|")}; added=${
+              s.added.join("|")
+            }; removed=${s.removed.join("|")}]`
           ).join(", ")
         }`,
       );
@@ -155,6 +164,35 @@ async function fetchText(
   const ac = new AbortController();
   const r = await handle.dispatch(new Request("http://x/"), null, ac.signal);
   return await r.text();
+}
+
+function freePort(): number {
+  const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+  const port = (listener.addr as Deno.NetAddr).port;
+  listener.close();
+  return port;
+}
+
+async function waitForHttpText(
+  url: string,
+  expected: string,
+  timeoutMs = 10000,
+): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  let last = "";
+  while (performance.now() < deadline) {
+    try {
+      const res = await fetch(url);
+      last = `${res.status} ${await res.text()}`;
+      if (res.ok && last.endsWith(` ${expected}`)) return;
+    } catch (err) {
+      last = err instanceof Error ? err.message : String(err);
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(
+    `Timed out waiting for ${url} to return ${expected}; last=${last}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +310,361 @@ Deno.test("hmr-e2e: editing a transitive dep (dep of a dep) propagates", async (
   }
 });
 
+Deno.test("hmr-e2e: adding a new dependency import updates the graph for future edits", async () => {
+  const h = await makeHarness(async (root) => {
+    await writeFile(join(root, "fn", "index.ts"), fnSource(`"without-dep"`));
+    await writeFile(
+      join(root, "_shared", "late.ts"),
+      `export const late = "late-v1";\n`,
+    );
+  });
+  try {
+    assertEquals(await fetchText(h.registry, "fn"), "without-dep");
+
+    // First edit: the function starts importing a dependency that was not
+    // present in its initial graph. The reload must rebuild the graph after
+    // the worker respawns, otherwise subsequent edits to late.ts would be
+    // invisible to HMR.
+    await writeFile(
+      join(h.dir, "fn", "index.ts"),
+      fnSource("late", [`import { late } from "../_shared/late.ts";`]),
+    );
+    await h.waitForReloadOf(new Set(["fn"]));
+    assertEquals(await fetchText(h.registry, "fn"), "late-v1");
+
+    // Second edit: only the newly introduced dependency changes. This proves
+    // the graph learned about late.ts during the previous reload.
+    await writeFile(
+      join(h.dir, "_shared", "late.ts"),
+      `export const late = "late-v2";\n`,
+    );
+    const summary = await h.waitForReloadOf(new Set(["fn"]));
+    assertEquals(summary.reloaded.includes("fn"), true);
+    assertEquals(await fetchText(h.registry, "fn"), "late-v2");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+Deno.test({
+  name: "hmr-e2e: real --config import-map library update reloads consumers",
+  permissions: { run: true, read: true, write: true, net: true, env: true },
+}, async () => {
+  const root = await Deno.makeTempDir({ prefix: "1tube-hmr-config-" });
+  const functionsDir = join(root, "supabase", "functions");
+  const port = await freePort();
+  let child: Deno.ChildProcess | null = null;
+  try {
+    await writeFile(
+      join(functionsDir, "deno.json"),
+      JSON.stringify({
+        imports: {
+          "@fake/lib": "./_vendor/fake-lib.ts",
+        },
+      }),
+    );
+    await writeFile(
+      join(functionsDir, "_vendor", "fake-lib.ts"),
+      `export const version = "lib-v1";\n`,
+    );
+    await writeFile(
+      join(functionsDir, "uses-lib", "index.ts"),
+      fnSource("version", [`import { version } from "@fake/lib";`]),
+    );
+    await writeFile(
+      join(functionsDir, "plain", "index.ts"),
+      fnSource(`"plain"`),
+    );
+
+    const cmd = new Deno.Command(Deno.execPath(), {
+      args: [
+        "run",
+        "--allow-all",
+        "--no-lock",
+        "--config",
+        join(functionsDir, "deno.json"),
+        SERVER,
+        "--dev",
+        "--hmr",
+        "--backend",
+        "deno",
+        "--functions",
+        functionsDir,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        String(port),
+        "--deno-worker-concurrency",
+        "2",
+      ],
+      cwd: root,
+      env: {
+        "1TUBE_DEV": "1",
+        "1TUBE_BOOT_PROFILE": "",
+      },
+      stdout: "piped",
+      stderr: "piped",
+    });
+    child = cmd.spawn();
+    const output = child.output();
+
+    const usesLibUrl = `http://127.0.0.1:${port}/functions/v1/uses-lib`;
+    const plainUrl = `http://127.0.0.1:${port}/functions/v1/plain`;
+    await waitForHttpText(usesLibUrl, "lib-v1", 20000);
+    await waitForHttpText(plainUrl, "plain", 5000);
+
+    // This is the real bug class: Deno itself can resolve @fake/lib because
+    // the process was launched with --config, and 1tube's HMR graph must
+    // discover the same functionsDir deno.json so a library-file update maps
+    // back to its consumers.
+    await writeFile(
+      join(functionsDir, "_vendor", "fake-lib.ts"),
+      `export const version = "lib-v2";\n`,
+    );
+    await waitForHttpText(usesLibUrl, "lib-v2", 10000);
+    await waitForHttpText(plainUrl, "plain", 5000);
+
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Already exited.
+    }
+    await output;
+  } finally {
+    if (child) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already exited.
+      }
+    }
+    await Deno.remove(root, { recursive: true }).catch(() => {});
+  }
+});
+
+Deno.test({
+  name:
+    "hmr-e2e: real --config scoped import-map library update reloads consumers",
+  permissions: { run: true, read: true, write: true, net: true, env: true },
+}, async () => {
+  const root = await Deno.makeTempDir({ prefix: "1tube-hmr-scoped-config-" });
+  const functionsDir = join(root, "supabase", "functions");
+  const port = await freePort();
+  let child: Deno.ChildProcess | null = null;
+  try {
+    await writeFile(
+      join(functionsDir, "deno.json"),
+      JSON.stringify({
+        scopes: {
+          "./uses-scoped/": {
+            "@scoped/lib": "./_vendor/scoped-lib.ts",
+          },
+        },
+      }),
+    );
+    await writeFile(
+      join(functionsDir, "_vendor", "scoped-lib.ts"),
+      `export const version = "scoped-v1";\n`,
+    );
+    await writeFile(
+      join(functionsDir, "uses-scoped", "index.ts"),
+      fnSource("version", [`import { version } from "@scoped/lib";`]),
+    );
+
+    const cmd = new Deno.Command(Deno.execPath(), {
+      args: [
+        "run",
+        "--allow-all",
+        "--no-lock",
+        "--config",
+        join(functionsDir, "deno.json"),
+        SERVER,
+        "--dev",
+        "--hmr",
+        "--backend",
+        "deno",
+        "--functions",
+        functionsDir,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        String(port),
+        "--deno-worker-concurrency",
+        "1",
+      ],
+      cwd: root,
+      env: {
+        "1TUBE_DEV": "1",
+        "1TUBE_BOOT_PROFILE": "",
+      },
+      stdout: "piped",
+      stderr: "piped",
+    });
+    child = cmd.spawn();
+    const output = child.output();
+
+    const usesScopedUrl = `http://127.0.0.1:${port}/functions/v1/uses-scoped`;
+    await waitForHttpText(usesScopedUrl, "scoped-v1", 20000);
+
+    // Deno itself resolves this scoped alias because the server process was
+    // launched with --config. HMR must resolve the same scope so edits to the
+    // scoped library map back to its function consumer.
+    await writeFile(
+      join(functionsDir, "_vendor", "scoped-lib.ts"),
+      `export const version = "scoped-v2";\n`,
+    );
+    await waitForHttpText(usesScopedUrl, "scoped-v2", 10000);
+
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Already exited.
+    }
+    await output;
+  } finally {
+    if (child) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already exited.
+      }
+    }
+    await Deno.remove(root, { recursive: true }).catch(() => {});
+  }
+});
+
+Deno.test({
+  name: "hmr-e2e: shared profile-cache imported via import-map alias runs once",
+  permissions: { run: true, read: true, write: true, net: true, env: true },
+}, async () => {
+  const root = await Deno.makeTempDir({ prefix: "1tube-hmr-shared-alias-" });
+  const functionsDir = join(root, "supabase", "functions");
+  const evalLog = join(root, "profile-cache-evals.log");
+  const port = await freePort();
+  let child: Deno.ChildProcess | null = null;
+  try {
+    await writeFile(
+      join(functionsDir, "deno.json"),
+      JSON.stringify({
+        imports: {
+          "@shared/profile-cache": "./_shared/profile-cache.ts",
+        },
+      }),
+    );
+    await writeFile(evalLog, "");
+    await writeFile(
+      join(functionsDir, "_shared", "profile-cache.ts"),
+      `const logPath = ${JSON.stringify(evalLog)};
+await Deno.writeTextFile(logPath, Deno.readTextFileSync(logPath) + "x");
+export async function getCachedProfile(userId) {
+  return { userId, ok: true };
+}
+`,
+    );
+    for (const name of ["one", "two"]) {
+      await writeFile(
+        join(functionsDir, name, "index.ts"),
+        `import { getCachedProfile } from "@shared/profile-cache";
+const reg = (globalThis).__edgeFunctionRegistry;
+reg.register(async () => {
+  const profile = await getCachedProfile("${name}");
+  return new Response(JSON.stringify(profile), {
+    headers: { "content-type": "application/json" },
+  });
+}, { public: true });
+`,
+      );
+    }
+
+    const cmd = new Deno.Command(Deno.execPath(), {
+      args: [
+        "run",
+        "--allow-all",
+        "--no-lock",
+        "--config",
+        join(functionsDir, "deno.json"),
+        SERVER,
+        "--dev",
+        "--hmr",
+        "--backend",
+        "deno",
+        "--functions",
+        functionsDir,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        String(port),
+        "--deno-worker-concurrency",
+        "2",
+      ],
+      cwd: root,
+      env: {
+        "1TUBE_DEV": "1",
+      },
+      stdout: "piped",
+      stderr: "piped",
+    });
+    child = cmd.spawn();
+    const output = child.output();
+
+    await waitForHttpText(
+      `http://127.0.0.1:${port}/functions/v1/one`,
+      `{"userId":"one","ok":true}`,
+      20000,
+    );
+    await waitForHttpText(
+      `http://127.0.0.1:${port}/functions/v1/two`,
+      `{"userId":"two","ok":true}`,
+      5000,
+    );
+
+    assertEquals(
+      (await Deno.readTextFile(evalLog)).length,
+      1,
+      "profile-cache side effect should run once in the gateway, not once per Worker, when imported through an import-map alias",
+    );
+
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // Already exited.
+    }
+    await output;
+  } finally {
+    if (child) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already exited.
+      }
+    }
+    await Deno.remove(root, { recursive: true }).catch(() => {});
+  }
+});
+
+Deno.test("hmr-e2e: editing an unimported sidecar file does not reload its function", async () => {
+  const h = await makeHarness(async (root) => {
+    await writeFile(join(root, "fn", "index.ts"), fnSource(`"fn-v1"`));
+    await writeFile(join(root, "fn", "notes.txt"), "not imported v1\n");
+  });
+  try {
+    assertEquals(await fetchText(h.registry, "fn"), "fn-v1");
+    const before = h.registry.workerHandle("fn");
+
+    await writeFile(join(h.dir, "fn", "notes.txt"), "not imported v2\n");
+    await h.waitForQuiet(500);
+
+    assertEquals(
+      h.registry.workerHandle("fn"),
+      before,
+      "a non-imported sidecar edit should not reload the function when the dep graph has no edge to that file",
+    );
+    assertEquals(await fetchText(h.registry, "fn"), "fn-v1");
+  } finally {
+    await h.cleanup();
+  }
+});
+
 Deno.test("hmr-e2e: adding a new function dir at runtime makes it dispatchable", async () => {
   const h = await makeHarness(async (root) => {
     await writeFile(join(root, "alpha", "index.ts"), fnSource(`"alpha"`));
@@ -318,7 +711,10 @@ Deno.test("hmr-e2e: editing a file outside any function graph does NOT trigger a
     await writeFile(join(root, "alpha", "index.ts"), fnSource(`"alpha"`));
     await writeFile(join(root, "README.md"), `# notes\n`);
     // An untracked sibling .ts file — no function imports it.
-    await writeFile(join(root, "_shared", "untracked.ts"), `export const x = 1;\n`);
+    await writeFile(
+      join(root, "_shared", "untracked.ts"),
+      `export const x = 1;\n`,
+    );
   });
   try {
     const handleBefore = h.registry.workerHandle("alpha");

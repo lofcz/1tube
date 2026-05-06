@@ -45,10 +45,30 @@ reg.register(
       registry,
       supervisor,
     });
-    const { loaded, errors } = await host.start();
+    const progress: Array<{
+      graphMs: number;
+      rewriteMs: number;
+      workerMs: number;
+      durationMs: number;
+    }> = [];
+    const { loaded, errors } = await host.start({
+      onSpawnFinish: (p) => {
+        progress.push({
+          graphMs: p.graphMs,
+          rewriteMs: p.rewriteMs,
+          workerMs: p.workerMs,
+          durationMs: p.durationMs,
+        });
+      },
+    });
     try {
       assertEquals(errors, []);
       assertEquals(loaded, ["hello"]);
+      assertEquals(progress.length, 1);
+      assert(progress[0].durationMs >= 0);
+      assert(progress[0].graphMs >= 0);
+      assertEquals(progress[0].rewriteMs, 0);
+      assert(progress[0].workerMs >= 0);
 
       const handle = registry.workerHandle("hello");
       assert(handle, "expected hello to register a worker handle");
