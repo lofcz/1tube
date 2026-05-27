@@ -83,6 +83,40 @@ Deno.test("auth: rejects when JWT_SECRET is unset", async () => {
   assertEquals(auth, null);
 });
 
+Deno.test("auth: accepts a token matching SUPABASE_SERVICE_ROLE_KEY as service role", async () => {
+  resetTubeEnv();
+  Deno.env.set("JWT_SECRET", SECRET);
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "sb_secret_test_opaque_key_123");
+
+  const auth = await validateRequest(reqWith("sb_secret_test_opaque_key_123"));
+  assertExists(auth);
+  assertEquals(auth.userId, "");
+  assertEquals(auth.payload.role, "service_role");
+  assertEquals(auth.rawToken, "sb_secret_test_opaque_key_123");
+
+  Deno.env.delete("SUPABASE_SERVICE_ROLE_KEY");
+});
+
+Deno.test("auth: rejects opaque tokens that do not match SUPABASE_SERVICE_ROLE_KEY", async () => {
+  resetTubeEnv();
+  Deno.env.set("JWT_SECRET", SECRET);
+  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "sb_secret_expected");
+
+  const auth = await validateRequest(reqWith("sb_secret_attacker_value"));
+  assertEquals(auth, null);
+
+  Deno.env.delete("SUPABASE_SERVICE_ROLE_KEY");
+});
+
+Deno.test("auth: does not accept arbitrary tokens when SUPABASE_SERVICE_ROLE_KEY is unset", async () => {
+  resetTubeEnv();
+  Deno.env.set("JWT_SECRET", SECRET);
+  Deno.env.delete("SUPABASE_SERVICE_ROLE_KEY");
+
+  const auth = await validateRequest(reqWith("sb_secret_anything"));
+  assertEquals(auth, null);
+});
+
 Deno.test("auth: picks up a secret rotation between calls (lazy read)", async () => {
   resetTubeEnv();
   Deno.env.set("JWT_SECRET", SECRET);

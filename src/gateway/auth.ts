@@ -165,10 +165,47 @@ async function verifyToken(token: string): Promise<JWTPayload | null> {
 
 /**
  * Validate the Authorization header and return an AuthContext, or null if invalid.
+ *
+ * Two accepted token forms:
+ *
+ * 1. **HMAC-SHA256 JWT** signed with `JWT_SECRET`. This is the primary auth
+ *    mechanism — used by user session tokens and (in hosted Supabase) by
+ *    service role calls, since hosted service role keys are themselves JWTs.
+ *
+ * 2. **Service role key passthrough.** When `SUPABASE_SERVICE_ROLE_KEY` is set
+ *    and the bearer token matches it exactly, the request is treated as a
+ *    service-role call. This lets local-dev deployments use opaque key formats
+ *    (e.g. `sb_secret_*`) for inter-function calls without minting JWTs.
+ *
+ *    The synthesised payload has `role: "service_role"` and an empty `sub`,
+ *    matching the shape produced by hosted Supabase. Authorization specs that
+ *    want service-only access should check for `payload.role === "service_role"`
+ *    (e.g. via `require: ["service_role"]`).
  */
 export async function validateRequest(req: Request): Promise<AuthContext | null> {
   const token = parseBearer(req.headers.get("Authorization"));
   if (!token) return null;
+
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+  if (serviceKey && token === serviceKey) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    return {
+      userId: "",
+      email: "",
+      payload: {
+        sub: "",
+        email: "",
+        role: "service_role",
+        iss: "supabase",
+        aud: "service_role",
+        iat: nowSec,
+        // Synthetic exp matching JWTPayload shape; the token has no real
+        // expiry of its own — rotation is governed by env reload.
+        exp: nowSec + 60 * 60,
+      },
+      rawToken: token,
+    };
+  }
 
   const payload = await verifyToken(token);
   if (!payload) return null;
