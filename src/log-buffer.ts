@@ -31,7 +31,7 @@ export interface LogBufferConfig {
 
 class StreamBuffer {
   private buf: string[] = [];
-  private timer: number | undefined;
+  private timer: ReturnType<typeof setTimeout> | undefined;
   private bytesPending = 0;
 
   constructor(
@@ -150,6 +150,9 @@ export function _resetLogBufferForTests(): void {
   stderrBuf = new StreamBuffer(Deno.stderr, cfg);
 }
 
-export function _logBufferStatsForTests(): { stdoutPending: number; stderrPending: number } {
+export function _logBufferStatsForTests(): {
+  stdoutPending: number;
+  stderrPending: number;
+} {
   return { stdoutPending: stdoutBuf.pending, stderrPending: stderrBuf.pending };
 }

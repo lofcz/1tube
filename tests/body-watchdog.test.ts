@@ -24,7 +24,7 @@ function makeChunkedStream(opts: {
   endless?: boolean;
 }): ReadableStream<Uint8Array> {
   let i = 0;
-  let timer: number | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let resolveLast: (() => void) | undefined;
 
   const clearAll = () => {
@@ -70,7 +70,9 @@ function makeChunkedStream(opts: {
   });
 }
 
-async function drainToString(stream: ReadableStream<Uint8Array>): Promise<string> {
+async function drainToString(
+  stream: ReadableStream<Uint8Array>,
+): Promise<string> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -93,7 +95,11 @@ Deno.test("body-watchdog: idleMs <= 0 is a pass-through (returns the same stream
   const src = makeChunkedStream({ chunks: [enc.encode("hi")], gapMs: 0 });
   const abort = new AbortController();
   const w = watchdogBody(src, 0, abort);
-  assertEquals(w.body, src, "expected the original stream when watchdog is off");
+  assertEquals(
+    w.body,
+    src,
+    "expected the original stream when watchdog is off",
+  );
   assertEquals(w.stalled(), false);
   // Drain so the source's internal pull-queue doesn't leak its setTimeout
   // past the test boundary (Deno default highWaterMark eagerly pulls one).
@@ -117,7 +123,12 @@ Deno.test("body-watchdog: a fast normal body passes through unmodified", async (
 Deno.test("body-watchdog: slow-but-progressing body (gap < idle) is allowed", async () => {
   // Each chunk takes 30ms; idle threshold is 100ms — well under.
   const src = makeChunkedStream({
-    chunks: [enc.encode("a"), enc.encode("b"), enc.encode("c"), enc.encode("d")],
+    chunks: [
+      enc.encode("a"),
+      enc.encode("b"),
+      enc.encode("c"),
+      enc.encode("d"),
+    ],
     gapMs: 30,
   });
   const abort = new AbortController();
@@ -147,7 +158,11 @@ Deno.test("body-watchdog: fully stalled body trips the watchdog and aborts", asy
 
   assertEquals(w.stalled(), true);
   assertEquals(abort.signal.aborted, true);
-  assertEquals(stallEvents, [50], "onStall should fire exactly once with the configured idleMs");
+  assertEquals(
+    stallEvents,
+    [50],
+    "onStall should fire exactly once with the configured idleMs",
+  );
   assert(abort.signal.reason instanceof DOMException);
   assertEquals((abort.signal.reason as DOMException).name, "AbortError");
 });
@@ -271,14 +286,17 @@ Deno.test("body-watchdog: aborting via the external controller short-circuits th
   // The next read may resolve done or reject — either is fine, but it must
   // NOT hang. We bound it with a short timer to be sure the test fails fast
   // if a regression makes it block.
-  let timerId = 0;
+  let timerId: ReturnType<typeof setTimeout> | undefined;
   const watchdog = new Promise<never>((_, reject) => {
-    timerId = setTimeout(() => reject(new Error("read() hung after external abort")), 500);
+    timerId = setTimeout(
+      () => reject(new Error("read() hung after external abort")),
+      500,
+    );
   });
   try {
     await Promise.race([reader.read().catch(() => undefined), watchdog]);
   } finally {
-    clearTimeout(timerId);
+    if (timerId !== undefined) clearTimeout(timerId);
   }
   // (No assertion on the read outcome — only that we didn't hang.)
 });

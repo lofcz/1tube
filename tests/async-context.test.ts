@@ -17,7 +17,9 @@ import { currentRequestStorage } from "../src/registry.ts";
 function dispatch<T>(fnName: string, fn: () => T | Promise<T>): Promise<T> {
   // Mirrors the wrap in src/server.ts: every handler runs inside a
   // `currentRequestStorage.run({ functionName }, ...)` scope.
-  return Promise.resolve(currentRequestStorage.run({ functionName: fnName }, fn));
+  return Promise.resolve(
+    currentRequestStorage.run({ functionName: fnName }, fn),
+  );
 }
 
 Deno.test("async-context: store visible synchronously inside the handler", async () => {
@@ -102,7 +104,7 @@ Deno.test("async-context: unhandledrejection sees the originating function", asy
   // does so the test fails fast rather than hanging the test runner. Note
   // we keep the timer id so we can clear it after `captured` wins the race —
   // otherwise Deno's leak detector flags the dangling setTimeout.
-  let timerId = 0;
+  let timerId: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<void>((_, reject) => {
     timerId = setTimeout(
       () => reject(new Error("unhandledrejection never fired")),
@@ -112,7 +114,7 @@ Deno.test("async-context: unhandledrejection sees the originating function", asy
   try {
     await Promise.race([captured, timeout]);
   } finally {
-    clearTimeout(timerId);
+    if (timerId !== undefined) clearTimeout(timerId);
   }
 
   assert(seen.length >= 1, "expected at least one rejection capture");

@@ -50,7 +50,7 @@ export function watchdogBody(
   }
 
   const reader = source.getReader();
-  let timer: number | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let didStall = false;
   /** Set by the timer callback so the in-flight pull() can surface it as an
    *  error to the consumer instead of treating the cancel-induced EOF as a
@@ -86,7 +86,10 @@ export function watchdogBody(
     clear();
     timer = setTimeout(() => {
       didStall = true;
-      const reason = new DOMException(`Body read stalled (${idleMs}ms)`, "AbortError");
+      const reason = new DOMException(
+        `Body read stalled (${idleMs}ms)`,
+        "AbortError",
+      );
       stallReason = reason;
       onStall?.(idleMs);
       // Abort the request signal so the handler's `req.json()` / consumers

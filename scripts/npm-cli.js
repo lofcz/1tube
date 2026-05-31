@@ -25,6 +25,7 @@ const child = spawn(
   ],
   {
     stdio: "inherit",
+    shell: process.platform === "win32",
     windowsHide: false,
   },
 );
