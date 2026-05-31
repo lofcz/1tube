@@ -15,7 +15,8 @@
     "npm:esbuild@0.28": "0.28.0",
     "npm:esbuild@~0.25.5": "0.25.12",
     "npm:hono@4": "4.12.18",
-    "npm:hono@^4.12.18": "4.12.18"
+    "npm:hono@^4.12.18": "4.12.18",
+    "npm:typescript@latest": "6.0.3"
   },
   "jsr": {
     "@deno/esbuild-plugin@1.2.1": {
@@ -389,6 +390,10 @@
     },
     "hono@4.12.18": {
       "integrity": "sha512-RWzP96k/yv0PQfyXnWjs6zot20TqfpfsNXhOnev8d1InAxubW93L11/oNUc3tQqn2G0bSdAOBpX+2uDFHV7kdQ=="
+    },
+    "typescript@6.0.3": {
+      "integrity": "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==",
+      "bin": true
     }
   },
   "workspace": {

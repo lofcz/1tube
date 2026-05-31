@@ -7,3 +7,4 @@ node_modules/
 /artifacts
 /.artifacts
 /.1tube-cache
+/dist
