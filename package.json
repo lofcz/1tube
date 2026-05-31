@@ -14,8 +14,16 @@
     "url": "https://github.com/lofcz/1tube/issues"
   },
   "exports": {
-    "./edge": "./src/edge.ts",
-    "./edge-caller": "./src/edge-caller.ts",
+    "./edge": {
+      "types": "./dist/edge.d.ts",
+      "import": "./dist/edge.js",
+      "default": "./dist/edge.js"
+    },
+    "./edge-caller": {
+      "types": "./dist/edge-caller.d.ts",
+      "import": "./dist/edge-caller.js",
+      "default": "./dist/edge-caller.js"
+    },
     "./eslint-plugin": "./eslint-plugin.js",
     "./package.json": "./package.json"
   },
@@ -24,6 +32,7 @@
   },
   "files": [
     "eslint-plugin.js",
+    "dist",
     "scripts/npm-cli.js",
     "src",
     "deno.json",
@@ -38,10 +47,12 @@
   "scripts": {
     "dev": "deno task dev",
     "serve": "deno task serve",
+    "build:edge": "deno run -A npm:typescript@latest/tsc --target ES2022 --module ESNext --moduleResolution Bundler --declaration --outDir dist src/edge.ts src/edge-caller.ts",
+    "prepack": "bun run build:edge",
     "typecheck": "deno check src/server.ts src/cli.ts src/edge.ts src/edge-caller.ts eslint-plugin.js",
     "check": "deno cache --allow-scripts=npm:protobufjs src/server.ts",
     "smoke:bin": "node ./scripts/npm-cli.js --version",
-    "prepublishOnly": "bun run typecheck && bun run check && bun run smoke:bin"
+    "prepublishOnly": "bun run build:edge && bun run typecheck && bun run check && bun run smoke:bin"
   },
   "dependencies": {
     "hono": "^4.12.18"
