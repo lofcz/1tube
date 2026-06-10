@@ -61,6 +61,27 @@ internal static class GatewayCommand
 
         if (opts.Hmr) args.Add("--hmr");
         if (opts.Dev) args.Add("--dev");
+
+        // Invocation log store. The DB path is always passed explicitly
+        // (absolute) so the gateway and the host-side reader agree on
+        // the file regardless of the child's cwd.
+        if (opts.InvocationLogs)
+        {
+            args.Add("--log-db");
+            args.Add(ResolveLogDbPath(opts));
+            if (opts.LogRetentionDays is int retention && retention >= 0)
+            {
+                args.Add($"--log-retention-days={retention}");
+            }
+            if (opts.LogMaxRows is long maxRows && maxRows >= 0)
+            {
+                args.Add($"--log-max-rows={maxRows}");
+            }
+        }
+        else
+        {
+            args.Add("--no-invocation-logs");
+        }
         // The gateway flag is `--lazy` (default off). We only emit it
         // when the operator explicitly opts in; no flag means "use
         // gateway default" which is also off, so behavior matches.
@@ -162,6 +183,24 @@ internal static class GatewayCommand
             : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, path));
 
     /// <summary>
+    /// Resolve the invocation-log DB file the gateway should write and
+    /// the host-side reader should read. Single source of truth — the
+    /// logs reader (<c>AddOneTubeLogs</c>) calls this too.
+    /// </summary>
+    internal static string ResolveLogDbPath(OneTubeOptions opts)
+    {
+        if (!string.IsNullOrWhiteSpace(opts.LogDbPath))
+        {
+            return ResolveHostPath(opts.LogDbPath);
+        }
+        if (!string.IsNullOrWhiteSpace(opts.DataRoot))
+        {
+            return ResolveHostPath(Path.Combine(opts.DataRoot, "onetube", "logs", "1tube-logs.db"));
+        }
+        return ResolveHostPath(Path.Combine(".1tube", "logs.db"));
+    }
+
+    /// <summary>
     /// Outer gateway ports must not share the same inner workerd socket
     /// range. WorkerdBackend itself uses base and base+500 for its own
     /// reload generations, so reserve 1000 ports per outer gateway port.
@@ -234,6 +273,13 @@ internal static class GatewayCommand
         if (!string.IsNullOrEmpty(opts.InternalKey))
         {
             env["INTERNAL_KEY"] = opts.InternalKey;
+        }
+
+        // Console capture default is on in the gateway; only emit the
+        // env var when the host explicitly opts out.
+        if (!opts.LogConsoleCapture)
+        {
+            env["1TUBE_LOG_CONSOLE"] = "0";
         }
 
         // Caller-supplied passthrough is layered last so it always

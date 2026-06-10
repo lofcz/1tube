@@ -26,6 +26,7 @@
 
 /// <reference lib="deno.worker" />
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { FunctionManifest } from "../../manifest.ts";
 import type { AuthContext } from "../../registry.ts";
 
@@ -34,6 +35,8 @@ interface InitMessage {
   name: string;
   entryUrl: string;
   manifest: FunctionManifest;
+  /** Wrap console.* and stream lines back to the host. */
+  captureConsole?: boolean;
 }
 
 interface DispatchMessage {
@@ -44,6 +47,8 @@ interface DispatchMessage {
   headers: Array<[string, string]>;
   body: ReadableStream<Uint8Array> | null;
   auth: AuthContext | null;
+  /** Gateway-assigned invocation id for console attribution. */
+  invocationId?: string;
 }
 
 interface SharedCallResultMessage {
@@ -73,6 +78,63 @@ let captured: CapturedHandler | null = null;
 let functionName = "<unknown>";
 let manifest: FunctionManifest | null = null;
 let initDone = false;
+
+// ---------------------------------------------------------------------------
+// Console capture
+//
+// Each dispatch runs inside `invocationContext.run({ invocationId }, …)`
+// so concurrent requests in the same Worker attribute their console
+// output correctly (AsyncLocalStorage follows the await chain). Lines
+// emitted outside any dispatch — module top-level code, timers started
+// at import time — carry no invocation id and are stored as boot/
+// background output by the host.
+// ---------------------------------------------------------------------------
+
+const invocationContext = new AsyncLocalStorage<{ invocationId?: string }>();
+
+type ConsoleLevel = "debug" | "log" | "info" | "warn" | "error";
+const CONSOLE_LEVELS: ConsoleLevel[] = ["debug", "log", "info", "warn", "error"];
+const MAX_CONSOLE_MESSAGE = 8 * 1024;
+
+function formatConsoleArg(arg: unknown): string {
+  if (typeof arg === "string") return arg;
+  try {
+    return Deno.inspect(arg, { depth: 4, colors: false, strAbbreviateSize: 4096 });
+  } catch {
+    try {
+      return String(arg);
+    } catch {
+      return "[unprintable]";
+    }
+  }
+}
+
+function installConsoleCapture(): void {
+  for (const level of CONSOLE_LEVELS) {
+    const original = console[level].bind(console);
+    console[level] = (...args: unknown[]) => {
+      // Original first: the developer-facing terminal stream must never
+      // depend on the capture path working.
+      original(...args);
+      try {
+        let message = args.map(formatConsoleArg).join(" ");
+        if (message.length > MAX_CONSOLE_MESSAGE) {
+          message = message.slice(0, MAX_CONSOLE_MESSAGE) + "…";
+        }
+        postMessage({
+          type: "console",
+          level,
+          message,
+          tsMs: Date.now(),
+          invocationId: invocationContext.getStore()?.invocationId ?? null,
+        });
+      } catch {
+        // postMessage can throw during teardown; losing a captured line
+        // is acceptable, breaking user code is not.
+      }
+    };
+  }
+}
 
 // Shared-module RPC: a tainted module imports the gateway-generated
 // stub, which calls `globalThis.__1tube_call_shared(id, name, args)`
@@ -137,6 +199,9 @@ self.addEventListener("unhandledrejection", (e) => {
     name: functionName,
     message: err instanceof Error ? err.message : String(err),
     stack: err instanceof Error ? err.stack : undefined,
+    // Deno 2.7+ propagates async context through rejections, so most
+    // orphan rejections still attribute to the request that leaked them.
+    invocationId: invocationContext.getStore()?.invocationId ?? null,
   });
 });
 
@@ -147,6 +212,7 @@ self.addEventListener("error", (e) => {
     name: functionName,
     message: err instanceof Error ? err.message : String(err),
     stack: err instanceof Error ? err.stack : undefined,
+    invocationId: invocationContext.getStore()?.invocationId ?? null,
   });
 });
 
@@ -173,11 +239,15 @@ async function runDispatch(msg: DispatchMessage): Promise<void> {
   const req = new Request(msg.url, init);
   let resp: Response;
   try {
-    resp = await Promise.resolve(
-      captured.isPublic
-        ? captured.handler(req)
-        : captured.handler(req, msg.auth ?? undefined),
-    );
+    const run = () =>
+      Promise.resolve(
+        captured!.isPublic
+          ? captured!.handler(req)
+          : captured!.handler(req, msg.auth ?? undefined),
+      );
+    resp = msg.invocationId !== undefined
+      ? await invocationContext.run({ invocationId: msg.invocationId }, run)
+      : await run();
   } catch (err) {
     postMessage({
       type: "response_error",
@@ -212,6 +282,9 @@ self.onmessage = (ev: MessageEvent<HostMessage>) => {
     initDone = true;
     functionName = msg.name;
     manifest = msg.manifest;
+    // Install BEFORE the dynamic import so module top-level console
+    // output (boot logs) is captured too.
+    if (msg.captureConsole) installConsoleCapture();
     void (async () => {
       try {
         await import(msg.entryUrl);

@@ -8,3 +8,5 @@ node_modules/
 /.artifacts
 /.1tube-cache
 /dist
+/dotnet/OneTube.Tests/bin
+/dotnet/OneTube.Tests/obj

@@ -24,6 +24,11 @@
       "import": "./dist/edge-caller.js",
       "default": "./dist/edge-caller.js"
     },
+    "./warmup-client": {
+      "types": "./dist/warmup-client.d.ts",
+      "import": "./dist/warmup-client.js",
+      "default": "./dist/warmup-client.js"
+    },
     "./eslint-plugin": "./eslint-plugin.js",
     "./package.json": "./package.json"
   },
@@ -33,6 +38,7 @@
   "files": [
     "eslint-plugin.js",
     "dist",
+    "drizzle",
     "scripts/npm-cli.js",
     "src",
     "deno.json",
@@ -47,14 +53,18 @@
   "scripts": {
     "dev": "deno task dev",
     "serve": "deno task serve",
-    "build:edge": "deno run -A npm:typescript@latest/tsc --target ES2022 --module ESNext --moduleResolution Bundler --declaration --outDir dist src/edge.ts src/edge-caller.ts",
+    "build:edge": "deno run -A npm:typescript@latest/tsc --target ES2022 --module ESNext --moduleResolution Bundler --declaration --outDir dist src/edge.ts src/edge-caller.ts src/warmup-client.ts",
     "prepack": "bun run build:edge",
-    "typecheck": "deno check src/server.ts src/cli.ts src/edge.ts src/edge-caller.ts eslint-plugin.js",
+    "typecheck": "deno check src/server.ts src/cli.ts src/edge.ts src/edge-caller.ts src/warmup-client.ts eslint-plugin.js",
     "check": "deno cache --allow-scripts=npm:protobufjs src/server.ts",
     "smoke:bin": "node ./scripts/npm-cli.js --version",
     "prepublishOnly": "bun run build:edge && bun run typecheck && bun run check && bun run smoke:bin"
   },
   "dependencies": {
-    "hono": "^4.12.18"
+    "drizzle-orm": "1.0.0-rc.3",
+    "hono": "^4.12.25"
+  },
+  "devDependencies": {
+    "drizzle-kit": "1.0.0-rc.3"
   }
 }

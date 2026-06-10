@@ -8,6 +8,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Console;
 using Microsoft.Extensions.Options;
 using OneTube.Firmware;
+using OneTube.Logs;
 using OneTube.Secrets;
 using OneTube.Workerd;
 using Yarp.ReverseProxy.Forwarder;
@@ -200,6 +201,39 @@ public static class OneTubeExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// Enable read-only access to the gateway's invocation log store
+    /// (SQLite + FTS5). Registers <see cref="IOneTubeLogReader"/> for
+    /// direct injection (the recommended path for Blazor Server admin
+    /// UIs) — pair with <see cref="MapOneTubeLogs"/> when you also want
+    /// the HTTP query surface.
+    ///
+    /// <para>The DB path follows <see cref="OneTubeOptions.LogDbPath"/>
+    /// (or its DataRoot-derived default), i.e. exactly the file the
+    /// spawned gateway writes. Must be called AFTER
+    /// <see cref="AddOneTube"/>.</para>
+    /// </summary>
+    public static IServiceCollection AddOneTubeLogs(this IServiceCollection services)
+    {
+        services.TryAddSingleton<IOneTubeLogReader>(sp =>
+        {
+            var opts = sp.GetRequiredService<IOptions<OneTubeOptions>>().Value;
+            return new SqliteOneTubeLogReader(GatewayCommand.ResolveLogDbPath(opts));
+        });
+        return services;
+    }
+
+    /// <summary>
+    /// Map the invocation-log query endpoints (served by the .NET host
+    /// straight from the SQLite file — no Deno hop). Returns the route
+    /// group so the consumer can attach their auth filter; logs contain
+    /// user data and belong behind admin auth.
+    /// </summary>
+    public static RouteGroupBuilder MapOneTubeLogs(
+        this IEndpointRouteBuilder endpoints,
+        string prefix = "/1tube/api/logs")
+        => LogsEndpoints.MapOneTubeLogs(endpoints, prefix);
 
     /// <summary>
     /// Map the live-secrets editor endpoints. Returns the underlying

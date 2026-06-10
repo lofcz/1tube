@@ -224,6 +224,46 @@ public sealed class OneTubeOptions
     /// </summary>
     public int? ShutdownGraceMs { get; set; }
 
+    // ── Invocation logs ───────────────────────────────────────────────
+
+    /// <summary>
+    /// Persistent per-invocation logging (SQLite + FTS5) in the
+    /// gateway. One row per dispatched request plus the console output
+    /// the function emitted while handling it. Maps to
+    /// <c>--invocation-logs</c> / <c>--no-invocation-logs</c>.
+    /// Default <c>true</c>, matching the gateway.
+    /// </summary>
+    public bool InvocationLogs { get; set; } = true;
+
+    /// <summary>
+    /// Path of the log database file. Maps to <c>--log-db</c>. When
+    /// null, derived as <c>{DataRoot}/onetube/logs/1tube-logs.db</c>
+    /// (or <c>.1tube/logs.db</c> under the host's base directory when
+    /// no <see cref="DataRoot"/> is configured). The same resolution
+    /// is used by the <c>IOneTubeLogReader</c> registered via
+    /// <c>AddOneTubeLogs()</c>, so reader and writer always agree.
+    /// </summary>
+    public string? LogDbPath { get; set; }
+
+    /// <summary>
+    /// Delete log rows older than this many days (0 = keep forever).
+    /// Maps to <c>--log-retention-days</c>. Gateway default: 7.
+    /// </summary>
+    public int? LogRetentionDays { get; set; }
+
+    /// <summary>
+    /// Hard cap on stored console log lines. Maps to
+    /// <c>--log-max-rows</c>. Gateway default: 1,000,000.
+    /// </summary>
+    public long? LogMaxRows { get; set; }
+
+    /// <summary>
+    /// Capture per-function console output into the log store. Maps to
+    /// <c>1TUBE_LOG_CONSOLE</c>. Default <c>true</c>; disable when
+    /// functions log sensitive payloads that must not be persisted.
+    /// </summary>
+    public bool LogConsoleCapture { get; set; } = true;
+
     // ── Auth ──────────────────────────────────────────────────────────
 
     /// <summary>

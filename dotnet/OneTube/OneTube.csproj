@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>OneTube</RootNamespace>
     <PackageId>OneTube</PackageId>
-    <Version>0.2.16</Version>
+    <Version>0.3.1</Version>
     <Authors>OneTube contributors</Authors>
     <Description>Host Supabase-compatible edge functions inside ASP.NET with zero-copy YARP proxying. Supports the deno and workerd backends; operator supplies explicit binary paths.</Description>
     <PackageProjectUrl>https://github.com/lofcz/1tube</PackageProjectUrl>
@@ -18,6 +18,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="OneTube.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!--
       We sit on top of ASP.NET Core (WebApplication, IHostedService,
       ILogger, IOptions, …) so we declare the framework reference
@@ -27,6 +31,12 @@
     -->
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="Yarp.ReverseProxy" Version="2.*" />
+    <!--
+      Read-only access to the gateway's invocation log store
+      (SQLite + FTS5). The gateway owns the schema and migrations;
+      the .NET side only ever issues SELECTs.
+    -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.*" />
   </ItemGroup>
 
   <!--
@@ -53,6 +63,17 @@
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <Pack>true</Pack>
       <PackagePath>contentFiles\any\any\OneTubeGateway\deno.json</PackagePath>
+    </Content>
+    <!--
+      SQL migrations for the invocation log store. Applied by the
+      gateway at boot (drizzle migrator); must travel with src/.
+    -->
+    <Content Include="..\..\drizzle\**\*.*">
+      <Link>OneTubeGateway\drizzle\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <Pack>true</Pack>
+      <PackagePath>contentFiles\any\any\OneTubeGateway\drizzle\%(RecursiveDir)%(Filename)%(Extension)</PackagePath>
     </Content>
     <None Include="buildTransitive\OneTube.targets"
           Pack="true"

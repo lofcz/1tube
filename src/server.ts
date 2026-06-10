@@ -22,7 +22,18 @@ import { currentRequestStorage, FunctionRegistry } from "./registry.ts";
 import { validateRequest } from "./gateway/auth.ts";
 import { watchdogBody } from "./gateway/body-watchdog.ts";
 import { corsMiddleware } from "./gateway/cors.ts";
-import { loggingMiddleware } from "./gateway/logging.ts";
+import {
+  configureInvocationLogging,
+  INVOCATION_ID_HEADER,
+  invocationIdOf,
+  loggingMiddleware,
+  setInvocationError,
+} from "./gateway/logging.ts";
+import { openLogDb } from "./logs/db.ts";
+import { createLogWriter, type LogWriter } from "./logs/writer.ts";
+import { createLogQuery } from "./logs/query.ts";
+import { registerLogRoutes } from "./logs/api.ts";
+import { parseMarkedConsoleLine } from "./logs/console-marker.ts";
 import { createRateLimiter } from "./gateway/rate-limit.ts";
 import { createHealthHandler, createMetricsHandler } from "./health.ts";
 import { FunctionSupervisor } from "./supervisor.ts";
@@ -40,6 +51,7 @@ import {
 import {
   createDenoWorkerHost,
   type DenoWorkerHost,
+  type SpawnProgress,
 } from "./backends/deno/worker-host.ts";
 import {
   createDenoHotReloader,
@@ -115,6 +127,31 @@ interface CliOpts {
   hmr: boolean;
   lazy: boolean;
   /**
+   * Deferred boot (Deno backend only). The gateway starts serving
+   * immediately and function Workers spawn in the background; a request
+   * for a not-yet-ready function bumps it to the front of the queue and
+   * gets a `503` + `X-1tube-Warming: 1` response the frontend can use to
+   * show a "backend is warming up" overlay. Defaults to on in dev/HMR
+   * mode, off otherwise; override with `--defer-boot` / `--no-defer-boot`
+   * or `1TUBE_DEFER_BOOT=1|0`.
+   */
+  deferBoot: boolean;
+  /**
+   * How long (ms) the dispatcher waits for a warming function before
+   * answering with the warming 503. Keeps fast-loading functions from
+   * flashing the frontend overlay. `1TUBE_WARMUP_GRACE_MS`, default 250.
+   */
+  warmupGraceMs: number;
+  /**
+   * How long (ms) a request waits for an in-flight HMR respawn of its
+   * function before falling back to the previous (stale) worker. Fresh
+   * code wins by default — this is the Vite-style "request stalls until
+   * the rebuild lands" behavior. Stale fallbacks are marked with
+   * `X-1tube-Stale: 1`. `1TUBE_HMR_FRESH_WAIT_MS`, default 2500;
+   * 0 disables waiting (always serve whatever worker is live).
+   */
+  hmrFreshWaitMs: number;
+  /**
    * Function execution backend. `"deno"` (default) imports each
    * function as a Deno module in this process — same as 1tube has
    * always done. `"workerd"` bundles each function into a
@@ -188,6 +225,33 @@ interface CliOpts {
    * Docker images can pass both env vars without breaking).
    */
   prebuiltDir?: string;
+  /**
+   * Persistent invocation log store (SQLite + FTS5). On by default;
+   * disable with `--no-invocation-logs` / `1TUBE_INVOCATION_LOGS=0`.
+   * Captures one row per dispatched request plus the console output
+   * the function emitted while handling it — the Supabase-style
+   * invocation log, queryable via `/1tube/api/logs/*` and readable
+   * directly by the OneTube .NET package.
+   */
+  invocationLogs: boolean;
+  /**
+   * Path of the log database file. `--log-db` / `1TUBE_LOG_DB`.
+   * Defaults to `.1tube/logs.db` under the process cwd; embedding
+   * hosts (OneTube) pass an absolute path under their data root.
+   */
+  logDbPath: string;
+  /** Delete log rows older than this many days (0 = keep forever). */
+  logRetentionDays?: number;
+  /** Hard cap on stored console log lines. */
+  logMaxRows?: number;
+  /** Hard cap on stored invocation rows. */
+  logMaxInvocations?: number;
+  /**
+   * Capture per-invocation console output from function code. On by
+   * default; turn off with `1TUBE_LOG_CONSOLE=0` when functions log
+   * sensitive payloads that must not be written to disk.
+   */
+  logConsoleCapture: boolean;
 }
 
 function parseArgs(): CliOpts {
@@ -208,6 +272,20 @@ function parseArgs(): CliOpts {
   let lazy = lazyEnv === undefined
     ? false
     : (lazyEnv === "1" || lazyEnv === "true");
+  // Deferred boot: tri-state until the end of parsing — when neither the
+  // env var nor a CLI flag decides, it follows dev/hmr mode.
+  const deferEnv = Deno.env.get("1TUBE_DEFER_BOOT");
+  let deferBoot: boolean | undefined = deferEnv === undefined
+    ? undefined
+    : (deferEnv === "1" || deferEnv.toLowerCase() === "true");
+  let warmupGraceMs = (() => {
+    const v = parseInt(Deno.env.get("1TUBE_WARMUP_GRACE_MS") || "", 10);
+    return Number.isFinite(v) && v >= 0 ? v : 250;
+  })();
+  const hmrFreshWaitMs = (() => {
+    const v = parseInt(Deno.env.get("1TUBE_HMR_FRESH_WAIT_MS") || "", 10);
+    return Number.isFinite(v) && v >= 0 ? v : 2500;
+  })();
   const backendEnv = (Deno.env.get("1TUBE_BACKEND") ?? "").trim().toLowerCase();
   let backend: "deno" | "workerd" = backendEnv === "workerd"
     ? "workerd"
@@ -268,6 +346,30 @@ function parseArgs(): CliOpts {
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
   let workerdExperimental = envFlag("1TUBE_WORKERD_EXPERIMENTAL");
+  // Invocation log store. Enabled unless explicitly turned off.
+  const invocationLogsEnv = Deno.env.get("1TUBE_INVOCATION_LOGS");
+  let invocationLogs = invocationLogsEnv === undefined
+    ? true
+    : !(invocationLogsEnv === "0" ||
+      invocationLogsEnv.toLowerCase() === "false");
+  let logDbPath = Deno.env.get("1TUBE_LOG_DB") || ".1tube/logs.db";
+  let logRetentionDays: number | undefined = (() => {
+    const v = parseInt(Deno.env.get("1TUBE_LOG_RETENTION_DAYS") || "", 10);
+    return Number.isFinite(v) && v >= 0 ? v : undefined;
+  })();
+  let logMaxRows: number | undefined = (() => {
+    const v = parseInt(Deno.env.get("1TUBE_LOG_MAX_ROWS") || "", 10);
+    return Number.isFinite(v) && v >= 0 ? v : undefined;
+  })();
+  const logMaxInvocations: number | undefined = (() => {
+    const v = parseInt(Deno.env.get("1TUBE_LOG_MAX_INVOCATIONS") || "", 10);
+    return Number.isFinite(v) && v >= 0 ? v : undefined;
+  })();
+  const logConsoleEnv = Deno.env.get("1TUBE_LOG_CONSOLE");
+  const logConsoleCapture = logConsoleEnv === undefined
+    ? true
+    : !(logConsoleEnv === "0" || logConsoleEnv.toLowerCase() === "false");
+
   let port = parseInt(Deno.env.get("PORT") || "3100", 10);
   let host = (Deno.env.get("1TUBE_HOST") || "127.0.0.1").trim();
   let functionsPath = Deno.env.get("FUNCTIONS_PATH") || "./supabase/functions";
@@ -303,6 +405,16 @@ function parseArgs(): CliOpts {
       lazy = false;
     } else if (a === "--lazy") {
       lazy = true;
+    } else if (a === "--defer-boot" || a === "--defer-boot=true") {
+      deferBoot = true;
+    } else if (a === "--defer-boot=false" || a === "--no-defer-boot") {
+      deferBoot = false;
+    } else if (a === "--warmup-grace-ms" && args[i + 1]) {
+      const n = parseInt(args[++i], 10);
+      if (Number.isFinite(n) && n >= 0) warmupGraceMs = n;
+    } else if (a.startsWith("--warmup-grace-ms=")) {
+      const n = parseInt(a.slice("--warmup-grace-ms=".length), 10);
+      if (Number.isFinite(n) && n >= 0) warmupGraceMs = n;
     } else if (a === "--backend" && args[i + 1]) {
       const v = args[++i].toLowerCase();
       if (v !== "deno" && v !== "workerd") {
@@ -403,6 +515,30 @@ function parseArgs(): CliOpts {
       a === "--kill-stale-workerd=false" || a === "--no-kill-stale-workerd"
     ) {
       killStaleWorkerd = false;
+    } else if (a === "--log-db" && args[i + 1]) {
+      logDbPath = args[++i];
+    } else if (a.startsWith("--log-db=")) {
+      logDbPath = a.slice("--log-db=".length);
+    } else if (
+      a === "--invocation-logs" || a === "--invocation-logs=true"
+    ) {
+      invocationLogs = true;
+    } else if (
+      a === "--no-invocation-logs" || a === "--invocation-logs=false"
+    ) {
+      invocationLogs = false;
+    } else if (a === "--log-retention-days" && args[i + 1]) {
+      const n = parseInt(args[++i], 10);
+      if (Number.isFinite(n) && n >= 0) logRetentionDays = n;
+    } else if (a.startsWith("--log-retention-days=")) {
+      const n = parseInt(a.slice("--log-retention-days=".length), 10);
+      if (Number.isFinite(n) && n >= 0) logRetentionDays = n;
+    } else if (a === "--log-max-rows" && args[i + 1]) {
+      const n = parseInt(args[++i], 10);
+      if (Number.isFinite(n) && n >= 0) logMaxRows = n;
+    } else if (a.startsWith("--log-max-rows=")) {
+      const n = parseInt(a.slice("--log-max-rows=".length), 10);
+      if (Number.isFinite(n) && n >= 0) logMaxRows = n;
     }
   }
   if (prebuiltDir !== undefined) {
@@ -422,6 +558,18 @@ function parseArgs(): CliOpts {
   // Make derived dev state observable to other modules via env.
   if (dev) Deno.env.set("1TUBE_DEV", "1");
 
+  // Deferred boot defaults to on whenever the operator is iterating
+  // (dev/HMR) — boot speed is what matters there. Prod keeps the eager
+  // "everything is ready before we accept traffic" contract unless the
+  // operator opts in. Workerd serves every function from one bundle
+  // generation, so deferral only applies to the Deno backend.
+  const deferBootResolved = backend === "deno" && (deferBoot ?? (dev || hmr));
+  if (deferBoot === true && backend === "workerd") {
+    console.warn(
+      "[1tube] --defer-boot is ignored on the workerd backend (functions boot as one bundle generation).",
+    );
+  }
+
   return {
     port,
     host,
@@ -433,6 +581,9 @@ function parseArgs(): CliOpts {
     dev,
     hmr,
     lazy,
+    deferBoot: deferBootResolved,
+    warmupGraceMs,
+    hmrFreshWaitMs,
     backend,
     workerdBin,
     workerdEnv,
@@ -446,6 +597,12 @@ function parseArgs(): CliOpts {
     workerdExperimental,
     killStaleWorkerd,
     prebuiltDir,
+    invocationLogs,
+    logDbPath,
+    logRetentionDays,
+    logMaxRows,
+    logMaxInvocations,
+    logConsoleCapture,
   };
 }
 
@@ -718,7 +875,8 @@ console.log(
 console.log(`\x1b[36m└${bannerLine}┘\x1b[0m`);
 console.log(
   `[1tube] mode=${opts.dev ? "dev" : "prod"} hmr=${opts.hmr ? "on" : "off"} ` +
-    `lazy=${opts.lazy ? "on" : "off"} backend=${opts.backend} ` +
+    `lazy=${opts.lazy ? "on" : "off"} defer=${opts.deferBoot ? "on" : "off"} ` +
+    `backend=${opts.backend} ` +
     `host=${opts.host} bodyLimit=${
       (opts.bodyLimitBytes / 1024 / 1024).toFixed(1)
     }MB ` +
@@ -726,6 +884,61 @@ console.log(
       opts.bodyReadIdleMs > 0 ? opts.bodyReadIdleMs + "ms" : "off"
     }`,
 );
+
+// ---------------------------------------------------------------------------
+// Invocation log store (SQLite + FTS5)
+//
+// One row per dispatched request + the console output captured while
+// handling it. The gateway is the single writer; the OneTube .NET
+// package (and anything else) reads the same file concurrently thanks
+// to WAL. A failure to open the store degrades to "no persistence"
+// rather than refusing to boot — observability must never take the
+// data path down with it.
+// ---------------------------------------------------------------------------
+
+let logWriter: LogWriter | null = null;
+let logDbHandle: Awaited<ReturnType<typeof openLogDb>> | null = null;
+if (opts.invocationLogs) {
+  try {
+    logDbHandle = await openLogDb(opts.logDbPath);
+    logWriter = createLogWriter({
+      db: logDbHandle,
+      // Dev wants every line on disk immediately (the admin UI polls);
+      // prod batches to keep the request hot path allocation-only.
+      flushIntervalMs: opts.dev ? 0 : 100,
+      ...(opts.logRetentionDays !== undefined
+        ? { retentionDays: opts.logRetentionDays }
+        : {}),
+      ...(opts.logMaxRows !== undefined ? { maxLogRows: opts.logMaxRows } : {}),
+      ...(opts.logMaxInvocations !== undefined
+        ? { maxInvocationRows: opts.logMaxInvocations }
+        : {}),
+    });
+    // Enforce retention from previous runs before new traffic lands.
+    logWriter.prune();
+    configureInvocationLogging({
+      sink: (row) => logWriter!.recordInvocation(row),
+      backend: opts.backend,
+    });
+    console.log(
+      `[1tube] Invocation logs: ${opts.logDbPath} ` +
+        `(retention=${opts.logRetentionDays ?? 7}d console=${
+          opts.logConsoleCapture ? "on" : "off"
+        })`,
+    );
+  } catch (err) {
+    console.warn(
+      `[1tube] Invocation log store disabled — could not open ${opts.logDbPath}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    logWriter = null;
+    logDbHandle = null;
+    configureInvocationLogging({ sink: null, backend: opts.backend });
+  }
+} else {
+  console.log("[1tube] Invocation logs: disabled");
+}
 
 const registry = new FunctionRegistry();
 const supervisor = new FunctionSupervisor();
@@ -892,6 +1105,41 @@ if (opts.backend === "workerd") {
     ...(opts.prebuiltDir ? { prebuiltDir: opts.prebuiltDir } : {}),
     sourcemap: opts.dev ? "inline" : "linked",
     logLineSink: (line) => {
+      // Console lines emitted by function code arrive as marked JSON
+      // (injected by the bundler's console shim) — those become
+      // structured rows in the invocation log store, attributed to the
+      // invocation id the gateway stamped on the proxied request.
+      // Everything else is genuine workerd process output.
+      const marked = parseMarkedConsoleLine(line);
+      if (marked) {
+        if (logWriter && opts.logConsoleCapture) {
+          logWriter.recordLog({
+            invocationId: marked.id,
+            tsMs: marked.ts,
+            level: marked.level,
+            functionName: null,
+            source: marked.id ? "function" : "boot",
+            message: marked.msg,
+          });
+        }
+        // Keep the developer-facing console behaviour too.
+        try {
+          Deno.stderr.writeSync(
+            new TextEncoder().encode(`[workerd] ${marked.msg}\n`),
+          );
+        } catch { /* */ }
+        return;
+      }
+      if (logWriter) {
+        logWriter.recordLog({
+          invocationId: null,
+          tsMs: Date.now(),
+          level: "info",
+          functionName: null,
+          source: "gateway",
+          message: line,
+        });
+      }
       // Surface workerd's own logs through stderr with a tag so they
       // interleave with [1tube] output cleanly.
       try {
@@ -1085,6 +1333,18 @@ if (opts.backend === "workerd") {
     functionsDir: resolvedFunctionsPath,
     registry,
     supervisor,
+    captureConsole: opts.logConsoleCapture && logWriter !== null,
+    onConsole: (event) => {
+      if (!logWriter || !opts.logConsoleCapture) return;
+      logWriter.recordLog({
+        invocationId: event.invocationId,
+        tsMs: event.tsMs,
+        level: event.level,
+        functionName: event.functionName,
+        source: event.invocationId ? "function" : "boot",
+        message: event.message,
+      });
+    },
     ...(opts.denoWorkerConcurrency
       ? { concurrency: opts.denoWorkerConcurrency }
       : {}),
@@ -1111,8 +1371,8 @@ if (opts.backend === "workerd") {
   // monotonically. We still get the correct total + per-fn name +
   // duration; the only thing that changes is the column we display.
   let printOrder = 0;
-  const { loaded, errors } = await denoWorkerHost.start({
-    onBatchGraph: (p) => {
+  const startCallbacks = {
+    onBatchGraph: (p: { total: number; durationMs: number }) => {
       if (bootProfile) {
         console.log(
           `[1tube] boot profile: dep graph for ${p.total} function(s) in ${
@@ -1121,14 +1381,14 @@ if (opts.backend === "workerd") {
         );
       }
     },
-    onSpawnStart: (p) => {
+    onSpawnStart: (p: { index: number; total: number; name: string }) => {
       if (!started) {
         progress.start(p.total);
         started = true;
       }
       progress.onStart(p.name);
     },
-    onSpawnFinish: (p) => {
+    onSpawnFinish: (p: SpawnProgress) => {
       const w = String(p.total).length;
       const status = p.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
       const tail = p.ok ? "" : ` — ${p.error ?? "error"}`;
@@ -1144,20 +1404,47 @@ if (opts.backend === "workerd") {
         p.name,
       );
     },
-  });
-  progress.stop();
-  const bootMs = performance.now() - bootStart;
-  console.log(
-    `[1tube] Loaded ${loaded.length} function(s) in ${bootMs.toFixed(0)}ms`,
-  );
-  if (loaded.length > 0) {
-    console.log(`[1tube] Functions: ${[...loaded].sort().join(", ")}`);
-  }
-  if (errors.length > 0) {
-    console.error(
-      `[1tube] ${errors.length} function(s) failed to load (check .env for missing vars):`,
+  };
+  const logBootSummary = (
+    loaded: string[],
+    errors: Array<{ name: string; error: string }>,
+    label: string,
+  ) => {
+    const bootMs = performance.now() - bootStart;
+    console.log(
+      `[1tube] ${label} ${loaded.length} function(s) in ${bootMs.toFixed(0)}ms`,
     );
-    for (const e of errors) console.error(`  ${e.name}: ${e.error}`);
+    if (loaded.length > 0) {
+      console.log(`[1tube] Functions: ${[...loaded].sort().join(", ")}`);
+    }
+    if (errors.length > 0) {
+      console.error(
+        `[1tube] ${errors.length} function(s) failed to load (check .env for missing vars):`,
+      );
+      for (const e of errors) console.error(`  ${e.name}: ${e.error}`);
+    }
+  };
+
+  if (opts.deferBoot) {
+    // Deferred boot: the gateway starts serving right away; Workers spawn
+    // in the background. A request for a not-yet-ready function bumps it
+    // to the front of the queue (see the dispatcher's warming path).
+    const { discovered, done } = await denoWorkerHost.startDeferred(
+      startCallbacks,
+    );
+    console.log(
+      `[1tube] Deferred boot: ${discovered.length} function(s) warming in ` +
+        `the background — gateway is accepting requests now ` +
+        `(requests for cold functions get 503 + X-1tube-Warming until ready)`,
+    );
+    done.then(({ loaded, errors }) => {
+      progress.stop();
+      logBootSummary(loaded, errors, "Warmed");
+    });
+  } else {
+    const { loaded, errors } = await denoWorkerHost.start(startCallbacks);
+    progress.stop();
+    logBootSummary(loaded, errors, "Loaded");
   }
 
   if (opts.hmr) {
@@ -1295,6 +1582,10 @@ app.all("/functions/v1/:name{.+}", async (c) => {
       if (decision.retryAfter) {
         headers["Retry-After"] = String(decision.retryAfter);
       }
+      setInvocationError(c, {
+        kind: "breaker",
+        message: `Circuit breaker rejected the request (${decision.reason})`,
+      });
       return c.json(
         { error: "Service temporarily unavailable", reason: decision.reason },
         decision.status as 503,
@@ -1322,9 +1613,16 @@ app.all("/functions/v1/:name{.+}", async (c) => {
       rewrittenPath + originalUrl.search,
       originalUrl.origin,
     );
+    // Stamp the invocation id on the proxied request so the bundle's
+    // console shim can attribute log lines emitted while handling it.
+    const proxyHeaders = new Headers(c.req.raw.headers);
+    const wdInvocationId = invocationIdOf(c);
+    if (wdInvocationId) {
+      proxyHeaders.set(INVOCATION_ID_HEADER, wdInvocationId);
+    }
     const proxyReq = new Request(rewrittenUrl.toString(), {
       method: c.req.raw.method,
-      headers: c.req.raw.headers,
+      headers: proxyHeaders,
       body: wrappedBody,
       signal: abort.signal,
       // @ts-ignore -- Deno supports duplex on Request
@@ -1362,14 +1660,27 @@ app.all("/functions/v1/:name{.+}", async (c) => {
         err instanceof DOMException && err.name === "AbortError" &&
         reasonMsg.includes("timed out")
       ) {
+        setInvocationError(c, {
+          kind: "timeout",
+          message: `Function execution timed out after ${timeoutMs}ms`,
+        });
         response = c.json({ error: "Function execution timed out" }, 504);
       } else if (
         err instanceof DOMException && err.name === "AbortError" &&
         reasonMsg.includes("Body read stalled")
       ) {
+        setInvocationError(c, {
+          kind: "body_timeout",
+          message: "Request body read timed out",
+        });
         response = c.json({ error: "Request body read timed out" }, 408);
       } else {
         console.error(`[1tube] workerd dispatch failed for "${name}":`, err);
+        setInvocationError(c, {
+          kind: "unhandled",
+          message: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack : undefined,
+        });
         response = c.json({ error: "Internal server error" }, 500);
       }
     } finally {
@@ -1403,9 +1714,85 @@ app.all("/functions/v1/:name{.+}", async (c) => {
   // Worker over postMessage. Each function lives in its own Worker so
   // there's no in-process handler to invoke; HMR works by terminating
   // the worker (clean module cache) and spawning a fresh one.
-  const handle = registry.workerHandle(name);
+  let handle = registry.workerHandle(name);
+  if (!handle && denoWorkerHost) {
+    // Deferred boot: the function is known but its Worker isn't up yet.
+    // Bump it to the front of the boot queue, give it a short grace
+    // window (fast spawns never surface the overlay), then tell the
+    // frontend the backend is warming up. The 503 carries
+    // `X-1tube-Warming: 1` + Retry-After so clients can distinguish
+    // warm-up from real latency, show an overlay, and retry.
+    const bootState = denoWorkerHost.bootState(name);
+    if (bootState === "queued" || bootState === "loading") {
+      denoWorkerHost.prioritize(name);
+      const outcome = await denoWorkerHost.whenReady(name, opts.warmupGraceMs);
+      if (outcome === "ready") {
+        handle = registry.workerHandle(name);
+      } else if (outcome === "timeout") {
+        const status = denoWorkerHost.bootStatus();
+        return c.json(
+          {
+            error: "Backend is warming up",
+            reason: "function_warming",
+            function: name,
+            state: denoWorkerHost.bootState(name) ?? "loading",
+            warmup: {
+              total: status.total,
+              ready: status.ready.length,
+              loading: status.loading.length,
+              queued: status.queued.length,
+              failed: status.failed.length,
+            },
+          },
+          503,
+          { "Retry-After": "1", "X-1tube-Warming": "1" },
+        );
+      }
+      // "failed"/"unknown" fall through to the checks below.
+    }
+    if (!handle && denoWorkerHost.bootState(name) === "failed") {
+      const status = denoWorkerHost.bootStatus();
+      const failure = status.failed.find((f) => f.name === name);
+      console.error(
+        `[1tube] Request for "${name}" but its worker failed to boot: ${
+          failure?.error ?? "unknown error"
+        }`,
+      );
+      setInvocationError(c, {
+        kind: "boot",
+        message: failure?.error ?? "function failed to load",
+      });
+      return c.json(
+        { error: `Function "${name}" failed to load`, reason: "function_boot_failed" },
+        503,
+      );
+    }
+  }
   if (!handle) {
     return c.json({ error: `Function "${name}" not found` }, 404);
+  }
+
+  // HMR freshness: a live handle whose boot state is queued/loading means
+  // an HMR respawn for this function is pending or in flight — the
+  // current worker runs pre-edit code. Bump the respawn to the front and
+  // wait briefly so a save → refresh cycle returns the NEW code (the
+  // Vite model: the request stalls until the rebuild lands). On timeout
+  // or respawn failure we fall back to the previous worker and mark the
+  // response with `X-1tube-Stale: 1`.
+  let staleServe = false;
+  if (denoWorkerHost) {
+    const bootState = denoWorkerHost.bootState(name);
+    if (bootState === "queued" || bootState === "loading") {
+      denoWorkerHost.prioritize(name);
+      const outcome = opts.hmrFreshWaitMs > 0
+        ? await denoWorkerHost.whenReady(name, opts.hmrFreshWaitMs)
+        : "timeout";
+      if (outcome === "ready") {
+        handle = registry.workerHandle(name) ?? handle;
+      } else {
+        staleServe = true;
+      }
+    }
   }
 
   // Circuit breaker: refuse early if the supervisor has tripped this function.
@@ -1415,6 +1802,10 @@ app.all("/functions/v1/:name{.+}", async (c) => {
     if (decision.retryAfter) {
       headers["Retry-After"] = String(decision.retryAfter);
     }
+    setInvocationError(c, {
+      kind: "breaker",
+      message: `Circuit breaker rejected the request (${decision.reason})`,
+    });
     return c.json(
       { error: "Service temporarily unavailable", reason: decision.reason },
       decision.status as 503,
@@ -1475,7 +1866,12 @@ app.all("/functions/v1/:name{.+}", async (c) => {
   let response: Response;
   let errored = false;
   try {
-    response = await handle.dispatch(rewrittenReq, auth, abort.signal);
+    response = await handle.dispatch(
+      rewrittenReq,
+      auth,
+      abort.signal,
+      invocationIdOf(c),
+    );
   } catch (err) {
     errored = true;
     const reasonMsg = (abort.signal.reason as Error | undefined)?.message ?? "";
@@ -1486,14 +1882,27 @@ app.all("/functions/v1/:name{.+}", async (c) => {
       console.error(
         `[1tube] Function "${name}" timed out after ${timeoutMs}ms`,
       );
+      setInvocationError(c, {
+        kind: "timeout",
+        message: `Function execution timed out after ${timeoutMs}ms`,
+      });
       response = c.json({ error: "Function execution timed out" }, 504);
     } else if (
       err instanceof DOMException && err.name === "AbortError" &&
       reasonMsg.includes("Body read stalled")
     ) {
+      setInvocationError(c, {
+        kind: "body_timeout",
+        message: "Request body read timed out",
+      });
       response = c.json({ error: "Request body read timed out" }, 408);
     } else {
       console.error(`[1tube] Unhandled error in "${name}":`, err);
+      setInvocationError(c, {
+        kind: "unhandled",
+        message: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      });
       response = c.json({ error: "Internal server error" }, 500);
     }
   } finally {
@@ -1514,7 +1923,48 @@ app.all("/functions/v1/:name{.+}", async (c) => {
     );
   }
 
+  if (staleServe) {
+    try {
+      response.headers.set("X-1tube-Stale", "1");
+    } catch {
+      // Immutable headers (unlikely on this path) — losing the marker
+      // is preferable to failing the request.
+    }
+  }
+
   return response;
+});
+
+// Warmup status: lets frontends poll boot progress and drive a
+// "backend is warming up" overlay. CORS-enabled (browsers poll this
+// directly); no auth — it only exposes function names, which the
+// fast-fail middleware already distinguishes via 404 vs 401.
+app.use("/1tube/warmup", corsMiddleware);
+app.get("/1tube/warmup", (c) => {
+  if (opts.backend === "deno" && denoWorkerHost) {
+    const s = denoWorkerHost.bootStatus();
+    return c.json({
+      backend: "deno",
+      ready: s.loading.length === 0 && s.queued.length === 0,
+      total: s.total,
+      loaded: s.ready.length,
+      loading: s.loading,
+      queued: s.queued,
+      failed: s.failed,
+    });
+  }
+  // Workerd boots eagerly as a single bundle generation — by the time
+  // the server accepts requests, every function is ready.
+  const names = registry.knownNames();
+  return c.json({
+    backend: opts.backend,
+    ready: true,
+    total: names.length,
+    loaded: names.length,
+    loading: [],
+    queued: [],
+    failed: [],
+  });
 });
 
 // Health & observability
@@ -1666,6 +2116,17 @@ app.post(
       });
     }),
 );
+
+// Invocation log query API. Same INTERNAL_KEY gate as /metrics. Only
+// mounted when the store is live — without it the routes would just
+// 503, and a 404 is the more honest contract for "feature off".
+if (logDbHandle) {
+  const logQuery = createLogQuery(logDbHandle);
+  registerLogRoutes(app, {
+    requireInternal,
+    query: logQuery,
+  });
+}
 
 // Root liveness probe — intentionally minimal so we don't leak the registered
 // function count or endpoint map to unauthenticated callers.
@@ -1837,6 +2298,12 @@ async function shutdown(reason: string) {
   if (denoRewriteCacheRef) {
     await denoRewriteCacheRef.stop().catch(() => {});
   }
+
+  // Persist anything still queued in the invocation log store, then
+  // close it so the WAL is checkpointed and external readers see a
+  // clean file.
+  if (logWriter) logWriter.stop();
+  if (logDbHandle) logDbHandle.close();
 
   flushLogs();
   console.log("[1tube] Drain complete; exiting.");

@@ -172,6 +172,22 @@ function fakeHost(graph: DepGraph): {
     start() {
       return Promise.resolve({ loaded: [], errors: [] });
     },
+    startDeferred() {
+      return Promise.resolve({
+        discovered: [],
+        done: Promise.resolve({ loaded: [], errors: [] }),
+      });
+    },
+    bootState() {
+      return undefined;
+    },
+    bootStatus() {
+      return { total: 0, ready: [], loading: [], queued: [], failed: [] };
+    },
+    prioritize() {},
+    whenReady() {
+      return Promise.resolve("unknown" as const);
+    },
     reload(names) {
       reloads.push(names);
       const summary: ReloadSummary = {

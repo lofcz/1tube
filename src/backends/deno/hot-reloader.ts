@@ -43,6 +43,13 @@ export interface DenoHotReloaderOptions {
   functionsDir: string;
   /** Defaults to 200ms — same as the workerd path. */
   debounceMs?: number;
+  /**
+   * Leading-edge flush delay for the first event of a quiet period.
+   * Defaults to 40ms — a single editor save starts reloading ~160ms
+   * sooner than the trailing debounce alone. Set ≤0 to disable and
+   * fall back to trailing-only debouncing.
+   */
+  leadingMs?: number;
   /** Test seam: factory for the watcher iterable. */
   watch?: (dir: string) => FsEventStream;
   /** Test seams for the debouncer's clock. */
@@ -78,6 +85,16 @@ export interface DenoReloadDebouncer {
 
 export interface DenoReloadDebouncerOptions {
   debounceMs: number;
+  /**
+   * Leading-edge flush: when set, the FIRST event of a quiet period
+   * schedules a flush after `leadingMs` instead of `debounceMs`, and
+   * later events in the same burst do NOT push the timer out. A single
+   * editor save reloads after ~leadingMs instead of always paying the
+   * full trailing debounce; stragglers (multi-file saves, slow fs
+   * event delivery) coalesce into a follow-up flush armed with
+   * `debounceMs`. Unset = classic trailing-only behavior.
+   */
+  leadingMs?: number;
   flushFn: (paths: readonly string[]) => Promise<void>;
   setTimer?: (cb: () => void, ms: number) => number;
   clearTimer?: (id: number) => void;
@@ -96,6 +113,9 @@ export function createDenoReloadDebouncer(
   const setTimer = opts.setTimer ??
     ((cb, ms) => setTimeout(cb, ms) as unknown as number);
   const clearTimer = opts.clearTimer ?? ((id) => clearTimeout(id));
+  const leadingMs = opts.leadingMs !== undefined && opts.leadingMs > 0
+    ? opts.leadingMs
+    : undefined;
 
   const pending = new Set<string>();
   let timerId: number | null = null;
@@ -114,6 +134,9 @@ export function createDenoReloadDebouncer(
       flushing = false;
       if (pending.size > 0) {
         if (timerId !== null) clearTimer(timerId);
+        // Stragglers always get the calmer trailing window — the
+        // leading edge only applies to the first burst of a quiet
+        // period.
         timerId = setTimer(flush, opts.debounceMs);
       }
     }
@@ -129,6 +152,15 @@ export function createDenoReloadDebouncer(
         }
       }
       if (!added) return;
+      if (leadingMs !== undefined) {
+        // Leading mode: arm once per burst and let it fire — don't keep
+        // pushing the flush out while events stream in. Anything that
+        // lands during/after the flush re-arms via the finally above.
+        if (timerId === null && !flushing) {
+          timerId = setTimer(flush, leadingMs);
+        }
+        return;
+      }
       if (timerId !== null) clearTimer(timerId);
       timerId = setTimer(flush, opts.debounceMs);
     },
@@ -236,11 +268,60 @@ export function createDenoHotReloader(
   let stopped = false;
   let consumeLoop: Promise<void> | null = null;
 
+  // Content fingerprints of files seen by previous flushes. Editors,
+  // formatters, and agent tooling routinely re-write files with
+  // identical bytes (format-on-save no-ops, touch, atomic-save
+  // double events); without this check every one of those costs a
+  // full Worker respawn. Digest mismatch or first sighting → reload.
+  const contentDigests = new Map<string, string>();
+
+  async function fileDigest(path: string): Promise<string | null> {
+    try {
+      const st = await Deno.stat(path);
+      if (!st.isFile) return null;
+      const data = await Deno.readFile(path);
+      const hash = await crypto.subtle.digest("SHA-1", data);
+      let hex = "";
+      for (const b of new Uint8Array(hash)) {
+        hex += b.toString(16).padStart(2, "0");
+      }
+      return hex;
+    } catch {
+      // Deleted / unreadable mid-write — treat as a real change.
+      return null;
+    }
+  }
+
+  /**
+   * Drop paths whose file content is byte-identical to what the last
+   * flush saw. Non-files (dirs, deletions) always pass through.
+   */
+  async function filterNoopPaths(
+    paths: readonly string[],
+  ): Promise<string[]> {
+    const out: string[] = [];
+    await Promise.all(paths.map(async (p) => {
+      const digest = await fileDigest(p);
+      if (digest === null) {
+        contentDigests.delete(p);
+        out.push(p);
+        return;
+      }
+      if (contentDigests.get(p) === digest) return;
+      contentDigests.set(p, digest);
+      out.push(p);
+    }));
+    return out;
+  }
+
   const debouncer = createDenoReloadDebouncer({
     debounceMs: opts.debounceMs ?? 200,
+    leadingMs: opts.leadingMs ?? 40,
     setTimer: opts.setTimer,
     clearTimer: opts.clearTimer,
-    flushFn: async (paths) => {
+    flushFn: async (rawPaths) => {
+      const paths = await filterNoopPaths(rawPaths);
+      if (paths.length === 0) return;
       // Shared-module changes need to land BEFORE the rewrite-cache
       // invalidation pass, because the rewriter reads the runtime's
       // current export list to (re)generate stubs. We re-import the

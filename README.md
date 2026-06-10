@@ -73,6 +73,7 @@ dependency install — **1tube’s runtime graph is just Hono + JSR std**.
 | `POST /functions/v1/:name` | Invoke an edge function                                                                                             |
 | `GET /health`              | Auth-gated health (`Authorization: Bearer $INTERNAL_KEY`); without auth returns the same minimal `{"status":"ok"}`. |
 | `GET /metrics`             | Auth-gated Prometheus exposition (same scheme).                                                                     |
+| `GET /1tube/warmup`        | Boot progress (deferred boot): `{ready, total, loaded, loading, queued, failed}`. CORS-enabled so frontends can poll it to drive a warm-up overlay. |
 
 ## Configuration
 
@@ -87,6 +88,9 @@ All knobs default to safe-but-backwards-compatible values. The TS gateway
 | `--timeout` / `FUNCTION_TIMEOUT_MS`                         | `150000`               | Per-request wall-clock cap (also overridable per function)                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `--dev` / `1TUBE_DEV`                                       | off                    | Applies the well-known local Supabase JWT/secrets. **Refuses to start in prod when JWT_SECRET / SUPABASE_SERVICE_ROLE_KEY are missing or are the public dev defaults.**                                                                                                                                                                                                                                                                                                                                                          |
 | `--hmr` / `1TUBE_HMR`                                       | off                    | File-watch + per-function reload (dev only).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `--defer-boot` / `1TUBE_DEFER_BOOT`                         | on in dev/HMR          | Deferred boot (Deno backend only): the gateway accepts requests immediately while function Workers spawn in the background. Requests for cold functions jump the boot queue and get `503` + `X-1tube-Warming: 1` until ready. Disable with `--no-defer-boot` / `1TUBE_DEFER_BOOT=0`. See [Deferred boot & warm-up overlay](#deferred-boot--warm-up-overlay).                                                                                                                                                                     |
+| `--warmup-grace-ms` / `1TUBE_WARMUP_GRACE_MS`               | `250`                  | How long the dispatcher waits for a warming function before answering with the warming 503. Keeps fast-loading functions from flashing the frontend overlay.                                                                                                                                                                                                                                                                                                                                                                     |
+| `1TUBE_HMR_FRESH_WAIT_MS`                                   | `2500`                 | How long a request waits for an in-flight HMR respawn of its function before falling back to the previous (stale) worker. Fresh code wins by default (Vite-style "request stalls until the rebuild lands"). Stale fallbacks carry `X-1tube-Stale: 1`. `0` = never wait.                                                                                                                                                                                                                                                          |
 | `1TUBE_BODY_LIMIT_MB`                                       | `30`                   | Hono `bodyLimit`; matches Supabase. Returns 413 before the handler runs.                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `1TUBE_BODY_READ_MS`                                        | `30000`                | Slow-loris guard. Max idle gap (ms) between body chunks before the request is aborted with **408**. NOT a total body-read deadline — large but fast uploads pass through. Set `0` to disable.                                                                                                                                                                                                                                                                                                                                    |
 | `1TUBE_CORS_ORIGIN`                                         | `*` (dev only)         | Comma-separated allowlist or `*`. In prod, leaving unset disables CORS.                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
@@ -103,6 +107,99 @@ All knobs default to safe-but-backwards-compatible values. The TS gateway
 | `1TUBE_DISABLE_RATE_LIMIT`                                  | unset                  | Set to `1` to bypass rate limiting entirely. **Load-test / dev only** — production deployments must keep the limiter on. The gateway prints a clear warning at boot when this is enabled.                                                                                                                                                                                                                                                                                                                                        |
 
 ````
+## Deferred boot & warm-up overlay
+
+On the Deno backend, eager boot pays the full cost of spawning one Worker per
+function (each transpiling + evaluating its whole import graph) **before** the
+gateway accepts a single request. With dozens of functions importing heavy
+deps, that's tens of seconds of staring at a boot log.
+
+Deferred boot (default whenever `--dev` or `--hmr` is on) flips the order:
+
+1. Functions are **discovered instantly** and registered as known-but-queued —
+   the gateway starts serving right away. Time-to-first-request drops from
+   "sum of all worker spawns" to effectively zero.
+2. Workers spawn in the background with the usual bounded concurrency
+   (`--deno-worker-concurrency`, default 8).
+3. A request for a function whose Worker isn't ready yet **bumps it to the
+   front of the queue** and spawns it immediately, out-of-band. If it becomes
+   ready within the grace window (`--warmup-grace-ms`, default 250 ms) the
+   request is served normally and the client never notices. Otherwise the
+   gateway answers with the **warming contract** below, and the rest of the
+   queue keeps loading in the background.
+
+### The warming contract
+
+```http
+HTTP/1.1 503 Service Unavailable
+X-1tube-Warming: 1
+Retry-After: 1
+
+{"error":"Backend is warming up","reason":"function_warming","function":"hello",
+ "state":"loading","warmup":{"total":53,"ready":12,"loading":8,"queued":33,"failed":0}}
+```
+
+`X-1tube-Warming: 1` is the discriminator — a plain 503 (circuit breaker,
+overload) never carries it. It's in `Access-Control-Expose-Headers`, so browser
+JS can read it cross-origin. This is what lets a frontend distinguish "the
+backend is still warming up" from real latency or a real outage and show an
+honest overlay instead of a spinner.
+
+`GET /1tube/warmup` reports overall progress (also CORS-enabled), e.g. for a
+progress bar inside the overlay.
+
+### Frontend helper
+
+The npm package ships a tiny client (`1tube/warmup-client`, no dependencies):
+
+```ts
+import { createWarmupFetch } from "1tube/warmup-client";
+
+const warmFetch = createWarmupFetch({
+  onWarmingChange: (warming) => setShowWarmupOverlay(warming), // drive the overlay
+  retryDelayMs: 400,
+  maxWaitMs: 120_000,
+});
+
+// Drop-in fetch replacement: retries through warm-up transparently.
+const resp = await warmFetch(`${GATEWAY}/functions/v1/hello`, { method: "POST" });
+```
+
+`isWarmingResponse(resp)` and `fetchWarmupStatus(baseUrl)` are exported for
+hand-rolled integrations.
+
+### Smart HMR reloads
+
+The same queue machinery powers HMR on the Deno backend, so a save costs as
+little as possible:
+
+- **No-op saves are dropped.** Changed files are content-hashed; a re-save
+  with identical bytes (format-on-save no-ops, `touch`, agent tooling
+  re-writing the same file) never respawns a Worker.
+- **Leading-edge debounce.** The first fs event of a quiet period flushes
+  after ~40 ms instead of the full 200 ms trailing window — a single editor
+  save starts reloading almost immediately. Stragglers still coalesce.
+- **MRU-first respawns.** When one edit affects more functions than there are
+  spawn lanes (shared-module edits), the functions you've hit most recently
+  respawn first; idle ones go last.
+- **Request-driven priority + freshness.** A request for a function whose
+  respawn is still queued/in-flight bumps it to the front (out-of-band, above
+  the concurrency bound) and waits up to `1TUBE_HMR_FRESH_WAIT_MS` (default
+  2500 ms) so save → refresh returns the **new** code, like Vite. If the
+  respawn takes longer, the previous worker answers and the response is marked
+  `X-1tube-Stale: 1` (CORS-exposed) so tooling can tell the difference.
+- **Targeted re-discovery.** Reloading one function stats only that function's
+  dir instead of re-scanning the whole functions root.
+
+Notes:
+
+- Deferred boot is **off by default in prod** (eager boot keeps the "everything
+  is ready before traffic" contract); opt in with `--defer-boot`.
+- Functions that fail to boot answer `503 {"reason":"function_boot_failed"}`
+  (not a warming response — retrying won't help).
+- Workerd backend is unaffected: it boots all functions as a single bundle
+  generation.
+
 ## Workerd backend
 
 1tube can optionally run each function inside a [workerd](https://github.com/cloudflare/workerd) subprocess instead of importing it directly into the gateway. This gives:

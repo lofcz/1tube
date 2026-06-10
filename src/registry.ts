@@ -96,6 +96,13 @@ export interface WorkerFunctionHandle {
     req: Request,
     auth: AuthContext | null,
     signal: AbortSignal,
+    /**
+     * Invocation id assigned by the gateway's logging middleware.
+     * Forwarded into the Worker so captured console output can be
+     * attributed to the request that emitted it. Optional — tests and
+     * non-logging callers may omit it.
+     */
+    invocationId?: string,
   ): Promise<Response>;
   terminate(): Promise<void>;
 }

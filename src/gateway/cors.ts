@@ -16,6 +16,12 @@ import type { Context, Next } from "npm:hono@4";
 const ALLOWED_HEADERS =
   "authorization, x-client-info, apikey, content-type, x-application-name, user-agent";
 const ALLOWED_METHODS = "POST, GET, OPTIONS, PUT, PATCH, DELETE";
+// Headers browser JS must be able to read on cross-origin responses.
+// `x-1tube-warming` drives the "backend is warming up" overlay;
+// `x-1tube-stale` marks a response served by a pre-edit worker while
+// its HMR respawn is still in flight; `retry-after` lets clients
+// honour the gateway's suggested backoff.
+const EXPOSED_HEADERS = "x-1tube-warming, x-1tube-stale, retry-after";
 
 interface CorsConfig {
   /** "*" means allow any. Empty array means CORS disabled. */
@@ -114,6 +120,7 @@ function buildCorsHeaders(reqOrigin: string | null): Record<string, string> | nu
     "Access-Control-Allow-Origin": allowed,
     "Access-Control-Allow-Headers": ALLOWED_HEADERS,
     "Access-Control-Allow-Methods": ALLOWED_METHODS,
+    "Access-Control-Expose-Headers": EXPOSED_HEADERS,
   };
   if (allowed !== "*") {
     headers["Vary"] = "Origin";

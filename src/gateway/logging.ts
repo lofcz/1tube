@@ -11,6 +11,11 @@
 
 import type { Context, Next } from "npm:hono@4";
 import { logError, logInfo } from "../log-buffer.ts";
+import { uuidv7 } from "../logs/id.ts";
+import type {
+  InvocationErrorKind,
+  InvocationRow,
+} from "../logs/writer.ts";
 
 export interface FunctionMetrics {
   invocations: number;
@@ -47,15 +52,67 @@ export function safeFnName(raw: string): string {
   return cleaned.length > 80 ? cleaned.slice(0, 80) + "…" : cleaned;
 }
 
+/** Response header carrying the invocation id back to the caller. */
+export const INVOCATION_ID_HEADER = "x-1tube-invocation-id";
+
+/**
+ * Gateway-classified failure info, set by the dispatcher's catch
+ * branches via {@link setInvocationError} so the persisted invocation
+ * row carries the real cause (timeout/breaker/…) instead of just a
+ * status code.
+ */
+export interface InvocationErrorInfo {
+  kind: InvocationErrorKind;
+  message?: string;
+  stack?: string;
+}
+
+/**
+ * Persistence hook for invocation rows. Installed by the gateway at
+ * boot when the invocation log store is enabled; when absent the
+ * middleware behaves exactly as before (stdout line + metrics only).
+ */
+let invocationSink: ((row: InvocationRow) => void) | null = null;
+let invocationBackend: "deno" | "workerd" = "deno";
+
+export function configureInvocationLogging(
+  opts: { sink: ((row: InvocationRow) => void) | null; backend: "deno" | "workerd" },
+): void {
+  invocationSink = opts.sink;
+  invocationBackend = opts.backend;
+}
+
+/** Read the invocation id assigned by the logging middleware, if any. */
+export function invocationIdOf(c: Context): string | undefined {
+  return (c.get("invocationId" as never) as string | undefined) ?? undefined;
+}
+
+/** Attach gateway-side error classification to the current invocation. */
+export function setInvocationError(c: Context, info: InvocationErrorInfo): void {
+  c.set("invocationError" as never, info as never);
+}
+
 export async function loggingMiddleware(c: Context, next: Next) {
   const start = performance.now();
+  const startedAtMs = Date.now();
   const fnName = safeFnName(c.req.path.replace("/functions/v1/", "") || "unknown");
+  // UUIDv7: time-ordered, so the persisted id doubles as a stable sort
+  // tiebreaker. Assigned for every request — even when persistence is
+  // off the header is useful for support tickets / client-side traces.
+  const invocationId = uuidv7();
+  c.set("invocationId" as never, invocationId as never);
 
   await next();
 
   const durationMs = Math.round(performance.now() - start);
   const status = c.res.status;
   const isError = status >= 400;
+  try {
+    c.res.headers.set(INVOCATION_ID_HEADER, invocationId);
+  } catch {
+    // Immutable response headers (e.g. a passthrough Response) — the
+    // id still lands in the log store.
+  }
 
   const m = getMetrics(fnName);
   m.invocations++;
@@ -69,6 +126,30 @@ export async function loggingMiddleware(c: Context, next: Next) {
   }
 
   const userId = (c.get("userId") as string) || null;
+
+  if (invocationSink) {
+    const errorInfo = c.get("invocationError" as never) as
+      | InvocationErrorInfo
+      | undefined;
+    // NOTE: like the stdout line below, the persisted row carries the
+    // pathname only — no headers, no body, no query string — so tokens
+    // in query params can never end up at rest in the log store.
+    invocationSink({
+      id: invocationId,
+      tsMs: startedAtMs,
+      functionName: fnName,
+      method: c.req.method,
+      path: c.req.path,
+      status,
+      durationMs,
+      userId,
+      backend: invocationBackend,
+      errorKind: errorInfo?.kind ?? null,
+      errorMessage: errorInfo?.message ?? null,
+      errorStack: errorInfo?.stack ?? null,
+    });
+  }
+
   const userTag = userId ? ` [user:${userId.slice(0, 8)}]` : "";
   const statusColor = isError ? "\x1b[31m" : "\x1b[32m";
   const reset = "\x1b[0m";
