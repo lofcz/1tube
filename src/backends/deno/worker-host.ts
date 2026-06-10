@@ -818,9 +818,9 @@ export function createDenoWorkerHost(
         manifest: handle.manifest,
         isPublic: handle.isPublic,
         timeoutMs: handle.timeoutMs,
-        dispatch: (req, auth, signal) => {
+        dispatch: (req, auth, signal, invocationId) => {
           lastDispatch.set(cand.name, Date.now());
-          return handle.dispatch(req, auth, signal);
+          return handle.dispatch(req, auth, signal, invocationId);
         },
         terminate: () => handle.terminate(),
       });
