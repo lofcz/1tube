@@ -1,6 +1,6 @@
 {
   "name": "1tube",
-  "version": "0.1.34",
+  "version": "0.1.35",
   "private": false,
   "description": "Self-hosted Supabase Edge Functions gateway for Deno, plus an ESLint plugin for consumers",
   "license": "MIT",
