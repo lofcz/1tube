@@ -195,6 +195,12 @@ export interface LogQuery {
   logsSince(afterId: number, limit?: number): LogRecord[];
   /** Distinct function names seen in the store (for filter dropdowns). */
   functionNames(): string[];
+  /**
+   * Most recent invocation timestamp per function, across the whole
+   * retention window. Seeds the Deno worker host's MRU boot ordering so
+   * deferred boot warms the functions the developer actually uses first.
+   */
+  lastDispatchByFunction(): Map<string, number>;
 }
 
 export function createLogQuery(db: LogDb): LogQuery {
@@ -368,5 +374,23 @@ export function createLogQuery(db: LogDb): LogQuery {
     return rows.map((r) => r.function_name);
   }
 
-  return { queryInvocations, getInvocation, searchLogs, logsSince, functionNames };
+  function lastDispatchByFunction(): Map<string, number> {
+    // Satisfied entirely by idx_invocations_fn_ts (fn, ts) — one index
+    // scan, no table reads.
+    const rows = raw.prepare(
+      `SELECT function_name, MAX(ts_ms) AS last_ts FROM invocations GROUP BY function_name`,
+    ).all() as unknown as Array<{ function_name: string; last_ts: number }>;
+    const out = new Map<string, number>();
+    for (const r of rows) out.set(r.function_name, Number(r.last_ts));
+    return out;
+  }
+
+  return {
+    queryInvocations,
+    getInvocation,
+    searchLogs,
+    logsSince,
+    functionNames,
+    lastDispatchByFunction,
+  };
 }

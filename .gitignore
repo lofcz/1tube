@@ -10,3 +10,4 @@ node_modules/
 /dist
 /dotnet/OneTube.Tests/bin
 /dotnet/OneTube.Tests/obj
+/.1tube

@@ -93,6 +93,14 @@ export interface DenoWorkerHostOptions {
   captureConsole?: boolean;
   /** Sink for captured console lines + worker runtime errors. */
   onConsole?: (event: WorkerConsoleEvent) => void;
+  /**
+   * Last-dispatch timestamp per function from a PREVIOUS run (e.g. the
+   * invocation log store). Seeds the MRU ordering used by deferred
+   * boot and HMR respawns, so the functions the developer was hitting
+   * before a gateway restart warm up first instead of alphabetically.
+   * Fresh in-process dispatches overwrite the seed as traffic arrives.
+   */
+  initialRecency?: ReadonlyMap<string, number>;
 }
 
 export interface ReloadSummary {
@@ -595,7 +603,7 @@ export function createDenoWorkerHost(
   /** Spawns started out-of-band by prioritize(), above the lane bound. */
   const outOfBandSpawns = new Set<Promise<void>>();
   /** Last gateway dispatch per function — drives MRU reload ordering. */
-  const lastDispatch = new Map<string, number>();
+  const lastDispatch = new Map<string, number>(opts.initialRecency ?? []);
   /**
    * Per-name spawn serialization. Deferred boot and HMR reload can both
    * want to spawn the same function concurrently (e.g. an edit lands
@@ -955,6 +963,13 @@ export function createDenoWorkerHost(
     loaded: string[];
     errors: Array<{ name: string; error: string }>;
     nextIndex: number;
+    /**
+     * Resolves when the boot-wide batch dep-graph (shared-rewrite mode
+     * only) has landed. Spawns wait on it instead of each paying a
+     * full per-function graph crawl — one batch graph parses every
+     * `_shared` file once instead of once per function.
+     */
+    batchGraphReady: Promise<void> | null;
   }
   let deferredCtx: DeferredCtx | null = null;
 
@@ -967,7 +982,11 @@ export function createDenoWorkerHost(
     const index = ++ctx.nextIndex;
     ctx.startOpts.onSpawnStart?.({ index, total: ctx.total, name: cand.name });
     const t0 = performance.now();
-    const r = await runSerialized(cand.name, () => spawnAndRegister(cand));
+    if (ctx.batchGraphReady) await ctx.batchGraphReady;
+    const r = await runSerialized(
+      cand.name,
+      () => spawnAndRegister(cand, { graphReady: ctx.batchGraphReady !== null }),
+    );
     const durationMs = performance.now() - t0;
     if ("error" in r) {
       ctx.errors.push({ name: cand.name, error: r.error });
@@ -1003,12 +1022,44 @@ export function createDenoWorkerHost(
     startOpts: StartOptions = {},
   ): Promise<DeferredStart> {
     const candidates = await discoverCandidates(opts.functionsDir);
+    // MRU-first warm-up: the background queue boots the functions the
+    // developer was hitting most recently (seeded from the invocation
+    // log store across restarts) before the ones nobody calls. Ties —
+    // including everything on a first run — keep name order.
+    candidates.sort((a, b) =>
+      (lastDispatch.get(b.name) ?? 0) - (lastDispatch.get(a.name) ?? 0) ||
+      a.name.localeCompare(b.name)
+    );
+    // Shared-rewrite mode needs each function's file list BEFORE its
+    // worker spawns. Build ONE batch graph in the background (the
+    // gateway still starts serving immediately) rather than letting
+    // every spawn crawl its own graph — the per-function crawls
+    // re-parse the same shared files over and over.
+    const useSharedRewrite = Boolean(
+      rewriteCache && sharedRuntime && sharedRuntime.list().length > 0,
+    );
+    let batchGraphReady: Promise<void> | null = null;
+    if (useSharedRewrite && candidates.length > 0) {
+      const graphStart = performance.now();
+      batchGraphReady = depGraph
+        .refreshMany(
+          candidates.map((c) => ({ name: c.name, entryFileUrl: c.entryUrl })),
+        )
+        .then(() => {
+          startOpts.onBatchGraph?.({
+            total: candidates.length,
+            durationMs: performance.now() - graphStart,
+          });
+        })
+        .catch(() => {});
+    }
     const ctx: DeferredCtx = {
       total: candidates.length,
       startOpts,
       loaded: [],
       errors: [],
       nextIndex: 0,
+      batchGraphReady,
     };
     deferredCtx = ctx;
     const items: ClaimItem[] = [];

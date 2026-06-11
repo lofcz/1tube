@@ -138,6 +138,40 @@ Deno.test("deferred boot: prioritize() jumps a queued function past slow ones", 
   }
 });
 
+Deno.test("deferred boot: initialRecency warms recently used functions first", async () => {
+  const tmp = await Deno.makeTempDir({ prefix: "1tube-defer-mru-" });
+  try {
+    // Alphabetical order would be aa, mm, zz. The recency seed says the
+    // developer was hitting zz, then mm — aa goes last.
+    await writeFn(tmp, "aa", "aa");
+    await writeFn(tmp, "mm", "mm");
+    await writeFn(tmp, "zz", "zz");
+
+    const registry = new FunctionRegistry();
+    const supervisor = new FunctionSupervisor();
+    const spawnOrder: string[] = [];
+    const host = createDenoWorkerHost({
+      functionsDir: tmp,
+      registry,
+      supervisor,
+      concurrency: 1,
+      initialRecency: new Map([["zz", 3000], ["mm", 2000]]),
+    });
+    try {
+      const { done } = await host.startDeferred({
+        onSpawnStart: (p) => spawnOrder.push(p.name),
+      });
+      const { errors } = await done;
+      assertEquals(errors, []);
+      assertEquals(spawnOrder, ["zz", "mm", "aa"]);
+    } finally {
+      await host.stop();
+    }
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
 Deno.test("deferred boot: whenReady() times out for a function stuck in the queue", async () => {
   const tmp = await Deno.makeTempDir({ prefix: "1tube-defer-timeout-" });
   try {

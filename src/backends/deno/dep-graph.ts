@@ -164,6 +164,38 @@ function resolveAgainst(target: string, base: string): string {
   return new URL(target, baseUrl).href;
 }
 
+/**
+ * Local-only module loader for `createGraph`.
+ *
+ * The graph exists solely to map fs-watcher events to affected
+ * functions, and only `file://` modules can ever fire those events.
+ * deno_graph's DEFAULT loader, however, follows every specifier —
+ * reading npm/jsr packages and even `fetch()`ing `https:` imports —
+ * which made big functions pay multi-second graph builds for data we
+ * throw away. Marking every non-`file:` specifier as external stops
+ * the crawl at the local-file boundary: remote subtrees are never
+ * read, parsed, or fetched.
+ */
+async function loadLocalOnly(
+  specifier: string,
+): Promise<
+  | { kind: "module"; specifier: string; content: Uint8Array }
+  | { kind: "external"; specifier: string }
+  | undefined
+> {
+  if (!specifier.startsWith("file://")) {
+    return { kind: "external", specifier };
+  }
+  try {
+    const content = await Deno.readFile(fileURLToPath(specifier));
+    return { kind: "module", specifier, content };
+  } catch {
+    // Missing file mid-edit: report "not found" and let deno_graph
+    // record a load error for this module instead of throwing.
+    return undefined;
+  }
+}
+
 export function createDepGraph(options?: DepGraphOptions): DepGraph {
   const perName = new Map<string, Set<string>>();
   const reverse = new Map<string, Set<string>>();
@@ -247,7 +279,10 @@ export function createDepGraph(options?: DepGraphOptions): DepGraph {
       const entry = normalize(entryFileUrl);
       let graph;
       try {
-        graph = await createGraph([entry], resolve ? { resolve } : undefined);
+        graph = await createGraph([entry], {
+          load: loadLocalOnly,
+          ...(resolve ? { resolve } : {}),
+        });
       } catch {
         // A save mid-flush can leave a syntactically broken file on
         // disk; deno_graph throws. Drop the graph for `name` so the
@@ -281,7 +316,10 @@ export function createDepGraph(options?: DepGraphOptions): DepGraph {
       try {
         graph = await createGraph(
           normalized.map((e) => e.entry),
-          resolve ? { resolve } : undefined,
+          {
+            load: loadLocalOnly,
+            ...(resolve ? { resolve } : {}),
+          },
         );
       } catch {
         for (const e of normalized) replaceGraph(e.name, minimalGraph(e.entry));

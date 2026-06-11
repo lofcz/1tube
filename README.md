@@ -120,7 +120,12 @@ Deferred boot (default whenever `--dev` or `--hmr` is on) flips the order:
    the gateway starts serving right away. Time-to-first-request drops from
    "sum of all worker spawns" to effectively zero.
 2. Workers spawn in the background with the usual bounded concurrency
-   (`--deno-worker-concurrency`, default 8).
+   (`--deno-worker-concurrency`, default 8), **most-recently-used first**:
+   the queue is ordered by each function's last invocation time from the
+   invocation log store, so the functions you were actually hitting before
+   the restart are warm within the first few seconds and the long tail of
+   rarely-called functions loads last. First run (empty store) falls back
+   to name order.
 3. A request for a function whose Worker isn't ready yet **bumps it to the
    front of the queue** and spawns it immediately, out-of-band. If it becomes
    ready within the grace window (`--warmup-grace-ms`, default 250 ms) the
@@ -190,6 +195,15 @@ little as possible:
   `X-1tube-Stale: 1` (CORS-exposed) so tooling can tell the difference.
 - **Targeted re-discovery.** Reloading one function stats only that function's
   dir instead of re-scanning the whole functions root.
+- **Local-only dep graphs.** The module graph that maps file changes to
+  affected functions stops at the local-file boundary: `npm:`/`jsr:`/`https:`
+  subtrees are marked external instead of being fetched and parsed. Only
+  `file://` modules can fire watcher events, so nothing is lost — and graph
+  builds for npm-heavy functions drop from seconds to milliseconds.
+- **One batch graph per deferred boot.** With shared modules active, deferred
+  boot builds a single module graph for all functions in the background
+  instead of letting every spawn crawl its own (which re-parsed the same
+  `_shared` files once per function).
 
 Notes:
 

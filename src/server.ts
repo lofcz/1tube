@@ -1329,6 +1329,18 @@ if (opts.backend === "workerd") {
     );
   }
 
+  // MRU warm-up seed: the invocation log store remembers which
+  // functions were hit before the restart; deferred boot warms those
+  // first instead of going alphabetically.
+  let bootRecency: Map<string, number> | undefined;
+  if (logDbHandle) {
+    try {
+      bootRecency = createLogQuery(logDbHandle).lastDispatchByFunction();
+    } catch {
+      // Best-effort: a broken store only costs the smarter boot order.
+    }
+  }
+
   denoWorkerHost = createDenoWorkerHost({
     functionsDir: resolvedFunctionsPath,
     registry,
@@ -1351,6 +1363,9 @@ if (opts.backend === "workerd") {
     ...(denoImportMapOptions ?? {}),
     ...(denoSharedRuntime ? { sharedRuntime: denoSharedRuntime } : {}),
     ...(denoRewriteCache ? { rewriteCache: denoRewriteCache } : {}),
+    ...(bootRecency && bootRecency.size > 0
+      ? { initialRecency: bootRecency }
+      : {}),
   });
 
   // Boot progress: append-only `[i/N] ✓ name (123ms)` per worker plus
