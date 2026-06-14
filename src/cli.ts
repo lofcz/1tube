@@ -36,7 +36,7 @@ if (arg0 === "build") {
 
 Commands:
   serve       Run the gateway (default when no command given)
-  build       Bundle functions into a sealed artifact for prebuilt deploys
+  build       Bundle functions for a target (--target workerd|vercel)
   package     Build and/or wrap dist/ into a signed .1tube firmware payload
   --version   Print version and exit
   --help      Print this help

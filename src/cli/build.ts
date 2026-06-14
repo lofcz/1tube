@@ -419,6 +419,35 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
  *   --workerd-shared path  repeatable; module to run in gateway shared runtime
  */
 export async function runBuild(args: string[]): Promise<number> {
+  // --target selects the backend artifact. Default `workerd` (dist/ +
+  // manifest.json); `--target vercel` delegates to the Vercel Build Output
+  // API builder, which owns its own flags (--path-prefix, --runtime,
+  // --max-duration, …). Pre-scanned here so we route before parsing any
+  // workerd-specific flags.
+  let target = "workerd";
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if ((a === "--target" || a === "-t") && args[i + 1]) {
+      target = args[++i];
+    } else if (a.startsWith("--target=")) {
+      target = a.slice("--target=".length);
+    } else {
+      rest.push(a);
+    }
+  }
+  if (target === "vercel") {
+    const { runVercelBuild } = await import("./vercel-build.ts");
+    return await runVercelBuild(rest);
+  }
+  if (target !== "workerd") {
+    console.error(
+      `[1tube build] unknown --target: ${target} (expected "workerd" or "vercel")`,
+    );
+    return 2;
+  }
+  args = rest;
+
   let functionsDir = Deno.env.get("FUNCTIONS_PATH") || "./supabase/functions";
   let outDir = "./dist";
   let only: string[] | undefined;
@@ -713,6 +742,8 @@ export async function runBuild(args: string[]): Promise<number> {
 const BUILD_USAGE = `Usage: 1tube build [options]
 
 Options:
+  -t, --target NAME          Build target: workerd (default) | vercel
+                             For vercel options: 1tube build --target vercel --help
   -f, --functions <path>     Function source dir (default: ./supabase/functions)
   -o, --out <path>           Output directory (default: ./dist)
       --only A,B,C           Build only the named subset

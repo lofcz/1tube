@@ -44,6 +44,20 @@ import {
   SHARED_RUNTIME_URL_ENV,
   type SharedRuntimeModule,
 } from "./shared-runtime.ts";
+import {
+  NODE_BUILTIN_MODULES,
+  VERCEL_BANNER,
+  VERCEL_FOOTER,
+} from "../vercel/wrapper.ts";
+
+/**
+ * Which runtime the chunked bundler emits for. `workerd` (default) wraps each
+ * function as a workerd `default { fetch }` registered through
+ * `__edgeFunctionRegistry`; `vercel` wraps it as a Vercel Node handler that
+ * captures `Deno.serve` and bridges Node req/res to Web fetch. See
+ * `../vercel/wrapper.ts` for the Vercel banner/footer.
+ */
+export type BundleTarget = "workerd" | "vercel";
 
 /**
  * Banner injected at the top of every bundle. Runs before any user code so
@@ -485,14 +499,19 @@ function toPosix(path: string): string {
   return path.replace(/\\/g, "/");
 }
 
-function entryProxySource(entrypoint: string): string {
-  return `${BANNER}
+function entryProxySource(entrypoint: string, target: BundleTarget): string {
+  const banner = target === "vercel" ? VERCEL_BANNER : BANNER;
+  const footer = target === "vercel" ? VERCEL_FOOTER : FOOTER;
+  return `${banner}
 await import(${JSON.stringify(pathToFileURL(entrypoint).href)});
-${FOOTER}
+${footer}
 `;
 }
 
-function entryProxyPlugin(inputs: readonly BundleInput[]): esbuild.Plugin {
+function entryProxyPlugin(
+  inputs: readonly BundleInput[],
+  target: BundleTarget,
+): esbuild.Plugin {
   const byName = new Map(inputs.map((input) => [input.name, input]));
   return {
     name: "1tube-entry-proxy",
@@ -513,12 +532,46 @@ function entryProxyPlugin(inputs: readonly BundleInput[]): esbuild.Plugin {
             );
           }
           return {
-            contents: entryProxySource(input.entrypoint),
+            contents: entryProxySource(input.entrypoint, target),
             loader: "js",
             resolveDir: dirname(input.entrypoint),
           };
         },
       );
+    },
+  };
+}
+
+const NODE_BUILTIN_SET = new Set<string>(NODE_BUILTIN_MODULES);
+
+function isNodeBuiltinBare(spec: string): boolean {
+  const slash = spec.indexOf("/");
+  const head = slash === -1 ? spec : spec.slice(0, slash);
+  return NODE_BUILTIN_SET.has(head);
+}
+
+/**
+ * For the Vercel (Node) target, leave Node builtins to the host runtime
+ * instead of bundling Deno's polyfills for them. `node:`-prefixed specifiers
+ * are always external; bare builtins (`crypto`, `stream`, `stream/web`, ...)
+ * are rewritten to their `node:` form and externalized. Non-builtins fall
+ * through to the deno loader for npm/jsr resolution. Registered before the
+ * deno plugin so it wins for these specifiers.
+ */
+function nodeBuiltinsExternalPlugin(): esbuild.Plugin {
+  return {
+    name: "1tube-node-builtins-external",
+    setup(build) {
+      build.onResolve({ filter: /^node:/ }, (args) => ({
+        path: args.path,
+        external: true,
+      }));
+      build.onResolve({ filter: /^[A-Za-z][A-Za-z0-9._/-]*$/ }, (args) => {
+        if (isNodeBuiltinBare(args.path)) {
+          return { path: `node:${args.path}`, external: true };
+        }
+        return null;
+      });
     },
   };
 }
@@ -692,14 +745,21 @@ export function createBundler(opts: BundlerOptions): Bundler {
 export async function bundleAllChunked(
   opts: BundlerOptions & {
     inputs: BundleInput[];
+    /** Runtime to emit for. Defaults to `workerd`. */
+    target?: BundleTarget;
   },
 ): Promise<ChunkedBundleAllResult> {
   await ensureDir(opts.outDir);
   const start = performance.now();
+  const target: BundleTarget = opts.target ?? "workerd";
+  const isVercel = target === "vercel";
   const sourcemap = opts.sourcemap ?? "linked";
   const sharedModules = opts.sharedModules ?? [];
   const plugins = [
-    entryProxyPlugin(opts.inputs),
+    // Node builtins must be externalized before the deno loader gets a
+    // chance to substitute its polyfills for the Vercel/Node target.
+    ...(isVercel ? [nodeBuiltinsExternalPlugin()] : []),
+    entryProxyPlugin(opts.inputs, target),
     ...(sharedModules.length > 0
       ? [sharedModulesExternalPlugin(sharedModules)]
       : []),
@@ -722,8 +782,13 @@ export async function bundleAllChunked(
       splitting: true,
       format: "esm",
       target: "es2022",
-      platform: "neutral",
-      conditions: ["worker", "browser", "import", "default"],
+      // Vercel runs on Node, so resolve the node conditions and let the
+      // host runtime provide builtins; workerd uses the leaner
+      // worker/browser conditions with nodejs_compat polyfills.
+      platform: isVercel ? "node" : "neutral",
+      conditions: isVercel
+        ? ["node", "import", "default"]
+        : ["worker", "browser", "import", "default"],
       sourcemap,
       minify: opts.minify ?? false,
       treeShaking: true,
@@ -737,7 +802,7 @@ export async function bundleAllChunked(
     });
   } catch (err) {
     const cause = err instanceof Error ? err.message : String(err);
-    throw new Error(`workerd chunked bundle failed\n${cause}`, {
+    throw new Error(`${target} chunked bundle failed\n${cause}`, {
       cause: err instanceof Error ? err : undefined,
     });
   }

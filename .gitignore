@@ -11,3 +11,4 @@ node_modules/
 /dotnet/OneTube.Tests/bin
 /dotnet/OneTube.Tests/obj
 /.1tube
+/dotnet/artifacts
