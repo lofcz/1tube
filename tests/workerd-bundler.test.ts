@@ -25,7 +25,8 @@ import {
   createBundler,
   discoverEntrypoints,
   discoverSharedModules,
-} from "../src/backends/workerd/bundler.ts";
+} from "../src/bundler/core.ts";
+import { WORKERD_PROFILE } from "../src/backends/workerd/bundle-profile.ts";
 
 const PROJECT_ROOT = resolvePath(new URL("..", import.meta.url).pathname.replace(/^\/(\w:)/, "$1"));
 const PLAYGROUND = join(PROJECT_ROOT, "playground");
@@ -36,12 +37,12 @@ const DENO_JSON = join(PROJECT_ROOT, "deno.json");
 let _shared: Bundler | null = null;
 function sharedBundler(outDir: string): Bundler {
   if (!_shared) {
-    _shared = createBundler({ outDir, configPath: DENO_JSON });
+    _shared = createBundler({ profile: WORKERD_PROFILE, outDir, configPath: DENO_JSON });
     return _shared;
   }
   // Re-create with a different outDir but reuse esbuild's global state by
   // not calling stop on the old one. The factory is cheap (closures only).
-  return createBundler({ outDir, configPath: DENO_JSON });
+  return createBundler({ profile: WORKERD_PROFILE, outDir, configPath: DENO_JSON });
 }
 
 async function makeOutDir(label: string): Promise<string> {
@@ -214,7 +215,7 @@ serve(async () => Response.json(await getCachedProfile("u1")));
     );
 
     const sharedModules = await discoverSharedModules(root);
-    const bundler = createBundler({ outDir, sharedModules, sourcemap: false });
+    const bundler = createBundler({ profile: WORKERD_PROFILE, outDir, sharedModules, sourcemap: false });
     const result = await bundler.bundle({
       name: "needs-profile",
       entrypoint: join(root, "needs-profile", "index.ts"),

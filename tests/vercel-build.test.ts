@@ -255,6 +255,69 @@ Deno.test(
 );
 
 Deno.test(
+  "buildVercel externalises an unresolvable optional dependency instead of failing",
+  TEST_OPTS,
+  async () => {
+    // Regression guard for the optional-dependency resolver: libraries
+    // routinely require()/import() a native or peer package behind a
+    // try/catch and degrade when it's absent (ws→bufferutil, debug→
+    // supports-color, …). Those are uninstalled optionalDependencies the Deno
+    // loader can't resolve, which used to abort the whole bundle unless the
+    // exact package was on a hand-curated allowlist. The Vercel profile now
+    // probes resolution and externalises ON FAILURE, so the build survives any
+    // such package — not just a fixed three — and reports what it externalised.
+    //
+    // The fixture imports a bare specifier with no import-map entry, which the
+    // Deno loader rejects at RESOLVE time (offline, deterministic — exactly the
+    // phase the `Could not find package …` optional-dep failure happens in).
+    // A failure at LOAD time instead — e.g. an import-map alias pointing at a
+    // missing file — is a real error and is intentionally NOT swallowed.
+    const dir = await Deno.makeTempDir({ prefix: "1tube-vercel-optdep-" });
+    const out = await tmpOutDir("optdep");
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    try {
+      await Deno.writeTextFile(
+        join(dir, "deno.json"),
+        JSON.stringify({ imports: {} }),
+      );
+      await Deno.mkdir(join(dir, "opt"), { recursive: true });
+      await Deno.writeTextFile(
+        join(dir, "opt", "index.ts"),
+        `let optional = null;
+try {
+  optional = await import("phantom-optional-dep");
+} catch {
+  // optionalDependency absent — degrade gracefully.
+}
+Deno.serve(() => Response.json({ ok: true, hadOptional: optional !== null }));
+`,
+      );
+
+      const result = await buildVercel({
+        functionsDir: dir,
+        outDir: out,
+        configPath: join(dir, "deno.json"),
+        only: ["opt"],
+        sourcemap: false,
+      });
+
+      assertEquals(result.functions.map((f) => f.name), ["opt"]);
+      const warned = warnings.join("\n");
+      assertStringIncludes(warned, "phantom-optional-dep");
+      assertStringIncludes(warned, "externalised");
+    } finally {
+      console.warn = originalWarn;
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
   "build --target vercel happy path returns 0 and writes artifacts",
   TEST_OPTS,
   async () => {

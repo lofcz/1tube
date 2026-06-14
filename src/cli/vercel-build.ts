@@ -35,9 +35,11 @@ import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import {
   bundleAllChunked,
   type ChunkedBundleAllResult,
+  DEFAULT_ESBUILD_TARGET,
   discoverEntrypoints,
   disposeBundlerResources,
-} from "../backends/workerd/bundler.ts";
+} from "../bundler/core.ts";
+import { VERCEL_PROFILE } from "../backends/vercel/bundle-profile.ts";
 import { loadManifest } from "../manifest.ts";
 import { resolveDenoConfigPath } from "./deno-config.ts";
 
@@ -62,6 +64,8 @@ export interface VercelBuildOptions {
   sourcemap?: boolean | "linked" | "inline";
   /** Minify bundles. Defaults to false. */
   minify?: boolean;
+  /** ECMAScript target forwarded to esbuild. Defaults to {@link DEFAULT_ESBUILD_TARGET}. */
+  esbuildTarget?: string | string[];
   /** Route prefix under `functions/`. Defaults to "functions/v1". */
   pathPrefix?: string;
   /** Vercel runtime identifier. Defaults to "nodejs24.x". */
@@ -202,10 +206,11 @@ async function buildVercelOnce(
     const chunked: ChunkedBundleAllResult = await bundleAllChunked({
       inputs,
       outDir: stageDir,
-      target: "vercel",
+      profile: VERCEL_PROFILE,
       ...(opts.configPath ? { configPath: opts.configPath } : {}),
       sourcemap,
       minify: opts.minify ?? false,
+      ...(opts.esbuildTarget ? { esbuildTarget: opts.esbuildTarget } : {}),
     });
     opts.onProgress?.({
       phase: "bundle-complete",
@@ -331,6 +336,7 @@ export async function runVercelBuild(args: string[]): Promise<number> {
   let only: string[] | undefined;
   let sourcemap: boolean | "linked" | "inline" = "linked";
   let minify = false;
+  let esbuildTarget: string | undefined;
   let pathPrefix = DEFAULT_PATH_PREFIX;
   let runtime = DEFAULT_RUNTIME;
   let defaultMaxDuration = DEFAULT_MAX_DURATION;
@@ -359,6 +365,10 @@ export async function runVercelBuild(args: string[]): Promise<number> {
       }
     } else if (a === "--minify") {
       minify = true;
+    } else if (a === "--ecma-target" && args[i + 1]) {
+      esbuildTarget = args[++i];
+    } else if (a.startsWith("--ecma-target=")) {
+      esbuildTarget = a.slice("--ecma-target=".length);
     } else if (a === "--path-prefix" && args[i + 1]) {
       pathPrefix = args[++i];
     } else if (a.startsWith("--path-prefix=")) {
@@ -431,6 +441,7 @@ export async function runVercelBuild(args: string[]): Promise<number> {
       ...(only ? { only } : {}),
       sourcemap,
       minify,
+      ...(esbuildTarget ? { esbuildTarget } : {}),
       pathPrefix,
       runtime,
       defaultMaxDuration,
@@ -485,6 +496,8 @@ Options:
       --only A,B,C           Build only the named subset
       --sourcemap MODE       none | linked (default) | inline
       --minify               Minify bundles
+      --ecma-target TARGET   esbuild syntax target, e.g. es2024 | esnext
+                             (default: ${DEFAULT_ESBUILD_TARGET})
       --path-prefix <p>      Route prefix under functions/ (default: functions/v1)
       --runtime <id>         Vercel runtime (default: nodejs24.x)
       --max-duration <s>     Fallback maxDuration seconds when no 1tube.json

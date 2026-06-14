@@ -23,7 +23,7 @@
  * Worker-side stub can re-throw with the right shape.
  *
  * Reusing {@link discoverSharedModules} (and the export-name
- * extractor) from `src/backends/workerd/bundler.ts` keeps the
+ * extractor) from `src/bundler/core.ts` keeps the
  * `_shared/profile-cache.ts` convention identical between backends —
  * users don't have to remember which flag corresponds to which
  * runtime, and a single project can target both backends.
@@ -33,7 +33,7 @@ import { pathToFileURL } from "node:url";
 import {
   discoverSharedModules,
   type WorkerdSharedModuleInput,
-} from "../workerd/bundler.ts";
+} from "../../bundler/core.ts";
 
 export type SharedModuleSpec = WorkerdSharedModuleInput;
 
@@ -80,7 +80,7 @@ export interface DenoSharedRuntime {
 /**
  * Discover shared modules under `functionsDir` (Supabase convention
  * + explicit paths) and return their descriptors. Re-exported from
- * the workerd bundler so server.ts has a single import path.
+ * the bundler core so server.ts has a single import path.
  */
 export { discoverSharedModules };
 

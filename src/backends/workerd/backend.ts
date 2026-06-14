@@ -42,7 +42,8 @@ import {
   createBundler,
   discoverEntrypoints,
   discoverSharedModules,
-} from "./bundler.ts";
+} from "../../bundler/core.ts";
+import { WORKERD_PROFILE } from "./bundle-profile.ts";
 import {
   parsePrebuiltManifest,
   type PrebuiltManifest,
@@ -1012,6 +1013,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       if (overlays.length > 0) {
         if (!overlayBundler) {
           overlayBundler = createBundler({
+            profile: WORKERD_PROFILE,
             outDir: join(cacheDir!, "runtime-overrides"),
             configPath,
             sourcemap: "linked",
@@ -1090,6 +1092,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
 
       if (!bundler) {
         bundler = createBundler({
+          profile: WORKERD_PROFILE,
           outDir: cacheDir,
           configPath,
           sourcemap: opts.sourcemap ?? "linked",
@@ -1136,6 +1139,7 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       for (const module of discoveredSharedModules) {
         const shared = await bundleSharedModule({
           module,
+          profile: WORKERD_PROFILE,
           outDir: join(cacheDir, "shared"),
           configPath,
         });

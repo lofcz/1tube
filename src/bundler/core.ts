@@ -1,268 +1,57 @@
 /**
- * Edge-function bundler for the workerd backend.
+ * Target-agnostic edge-function bundler core.
  *
- * Workerd does not resolve `npm:`, `jsr:`, or `https:` specifiers at runtime
- * — every module must be present on disk as a fully-resolved ESM file before
- * the worker boots. This bundler fills that gap by running esbuild over each
- * function's `index.ts`, with `@luca/esbuild-deno-loader` providing
- * Deno-native specifier resolution. The output is a single self-contained
- * ESM file per function, written to a content-addressed cache directory
- * under the project so repeated boots are fast and reproducible.
+ * Runtimes like workerd and Vercel Node both need each function turned into a
+ * single self-contained ESM file: they do not resolve `npm:`, `jsr:`, or
+ * `https:` specifiers at runtime, so every module must be present on disk as a
+ * fully-resolved ESM file before the function boots. This module fills that gap
+ * by running esbuild over each function's `index.ts`, with
+ * `@deno/esbuild-plugin` providing Deno-native specifier resolution.
  *
- * Each bundle is wrapped to bridge two impedance mismatches:
+ * Everything backend-specific — the runtime shims injected as a banner/footer,
+ * which esbuild platform/conditions to resolve under, which specifiers to keep
+ * external, and any extra resolver plugins — is supplied by the caller as a
+ * {@link BundleProfile}. The core never imports a backend, so a single bundling
+ * pipeline serves every target without any of them knowing about the others.
  *
- *  1. **`Deno.env` shim.** User code reads env via `Deno.env.get(...)`.
- *     Workerd injects environment as the per-request `env` binding instead.
- *     The wrapper installs a `globalThis.Deno.env` proxy that reads from a
- *     module-scope variable refreshed on every dispatch.
+ * Two shapes are produced:
  *
- *  2. **`serve()` registry shim.** The 1tube `_shared/handler.ts` shim looks
- *     for `globalThis.__edgeFunctionRegistry` and registers its handler
- *     there at import time. The wrapper supplies a tiny single-handler
- *     registry so the existing shim works unchanged, then exports a workerd
- *     `default { fetch(req, env, ctx) }` that dispatches to whatever the
- *     module registered.
+ *  - {@link createBundler} emits one self-contained file per function (the
+ *    workerd backend's per-function bundle path).
+ *  - {@link bundleAllChunked} emits an entry per function plus shared ESM chunks
+ *    via esbuild code-splitting (the prebuilt/firmware + Vercel Build Output
+ *    paths), so common dependencies are stored once.
  *
- * The auth boundary stays in 1tube's gateway. For non-public handlers the
- * gateway validates the JWT and forwards the verified identity to workerd
- * via `X-1tube-Auth-*` headers (loopback-only socket). The wrapper
- * reconstructs the `AuthContext` shape from those headers so user code is
- * agnostic to which backend is running.
- *
- * This module is pure I/O orchestration around esbuild. The Deno test
- * suite drives it with real bundles against the playground fixtures —
- * there is no mock layer because esbuild's behaviour is the contract.
+ * This module is pure I/O orchestration around esbuild. The Deno test suite
+ * drives it with real bundles against the playground fixtures — there is no mock
+ * layer because esbuild's behaviour is the contract.
  */
 
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
-import * as esbuild from "npm:esbuild@^0.28";
+import * as esbuild from "npm:esbuild@^0.28.1";
 import { denoPlugin } from "jsr:@deno/esbuild-plugin@^1.2";
 import {
   SHARED_RUNTIME_TOKEN_ENV,
   SHARED_RUNTIME_URL_ENV,
   type SharedRuntimeModule,
-} from "./shared-runtime.ts";
-import {
-  NODE_BUILTIN_MODULES,
-  VERCEL_BANNER,
-  VERCEL_FOOTER,
-} from "../vercel/wrapper.ts";
+} from "../backends/workerd/shared-runtime.ts";
+import type { BundleProfile } from "./profile.ts";
+
+export type { BundleProfile };
 
 /**
- * Which runtime the chunked bundler emits for. `workerd` (default) wraps each
- * function as a workerd `default { fetch }` registered through
- * `__edgeFunctionRegistry`; `vercel` wraps it as a Vercel Node handler that
- * captures `Deno.serve` and bridges Node req/res to Web fetch. See
- * `../vercel/wrapper.ts` for the Vercel banner/footer.
- */
-export type BundleTarget = "workerd" | "vercel";
-
-/**
- * Banner injected at the top of every bundle. Runs before any user code so
- * top-level `serve(...)` calls find a registry to register against.
+ * Default ECMAScript syntax level for emitted bundles, passed through to
+ * esbuild's `target`. Both supported runtimes ship a very modern V8 — workerd
+ * tracks the latest V8, and Vercel's `nodejs24.x` is Node 24 (V8 12.4+) — so we
+ * down-level as little as possible: a higher target means smaller, faster output
+ * that preserves modern syntax. `es2024` is the newest fully-ratified standard
+ * (vs. a moving `esnext`), keeping output predictable.
  *
- * The captured handler/options live in module scope; the footer below
- * exports the workerd default fetch handler that calls into them.
- *
- * `__1tubeWorkerEnv` is refreshed by the footer on every fetch so
- * `Deno.env.get()` returns the right values for that invocation. Workerd
- * doesn't change `env` per-request in practice (it's bound at boot), but
- * pinning it on each call makes the contract robust to future bindings.
+ * Override per build via {@link BundlerOptions.esbuildTarget}.
  */
-const BANNER = `// AUTO-GENERATED by 1tube workerd bundler — do not edit
-import { AsyncLocalStorage as __1tubeAsyncLocalStorage } from "node:async_hooks";
-let __1tubeCapturedHandler;
-let __1tubeCapturedOpts = { public: false };
-let __1tubeWorkerEnv = {};
-
-// ---------------------------------------------------------------------------
-// Console capture.
-//
-// workerd has no message channel back to the gateway, but its stdout is
-// already pumped line-by-line into the gateway process. Each console
-// call is serialized as ONE marked JSON line; the gateway's log sink
-// (src/logs/console-marker.ts) parses marked lines into structured log
-// rows and prints the plain message for the operator. The footer runs
-// every dispatch inside __1tubeInvocationCtx so concurrent requests
-// attribute their lines correctly.
-// ---------------------------------------------------------------------------
-const __1tubeInvocationCtx = new __1tubeAsyncLocalStorage();
-const __1tubeLogMarker = "__1TUBE_LOG__";
-const __1tubeRawConsoleLog = console.log.bind(console);
-// Like the Deno shim below: only take over console under real workerd.
-// When a bundle is imported into a host Deno realm (1tube's own tests)
-// the test runner's console must stay untouched.
-const __1tubeConsoleCaptureActive = typeof Deno === "undefined";
-
-function __1tubeFormatArg(a) {
-  if (typeof a === "string") return a;
-  if (a instanceof Error) return a.stack || (a.name + ": " + a.message);
-  try {
-    const s = JSON.stringify(a);
-    if (typeof s === "string") return s;
-  } catch { /* circular / bigint — fall through */ }
-  try { return String(a); } catch { return "[unprintable]"; }
-}
-
-function __1tubeEmitConsole(level, args) {
-  if (!__1tubeConsoleCaptureActive) {
-    __1tubeRawConsoleLog(...args);
-    return;
-  }
-  try {
-    let msg = args.map(__1tubeFormatArg).join(" ");
-    if (msg.length > 8192) msg = msg.slice(0, 8192) + "…";
-    __1tubeRawConsoleLog(__1tubeLogMarker + JSON.stringify({
-      id: __1tubeInvocationCtx.getStore()?.invocationId ?? null,
-      level,
-      msg,
-      ts: Date.now(),
-    }));
-  } catch { /* capture must never break user code */ }
-}
-
-if (__1tubeConsoleCaptureActive) {
-  for (const __1tubeLevel of ["debug", "log", "info", "warn", "error"]) {
-    console[__1tubeLevel] = (...args) => __1tubeEmitConsole(__1tubeLevel, args);
-  }
-}
-
-const __1tubeRegistry = {
-  register(handler, opts) {
-    __1tubeCapturedHandler = handler;
-    __1tubeCapturedOpts = { public: !!opts?.public, timeoutMs: opts?.timeoutMs };
-  },
-};
-
-const __1tubeDenoEnv = {
-  get(key) {
-    const v = __1tubeWorkerEnv?.[key];
-    if (typeof v === "string") return v;
-    const pv = globalThis.process?.env?.[key];
-    return typeof pv === "string" ? pv : undefined;
-  },
-  set() {
-    throw new Error("Deno.env.set is not supported under the workerd backend");
-  },
-  delete() {
-    throw new Error("Deno.env.delete is not supported under the workerd backend");
-  },
-  has(key) {
-    return typeof __1tubeWorkerEnv?.[key] === "string" ||
-      typeof globalThis.process?.env?.[key] === "string";
-  },
-  toObject() {
-    const out = {};
-    for (const k of Object.keys(globalThis.process?.env ?? {})) {
-      const v = globalThis.process.env[k];
-      if (typeof v === "string") out[k] = v;
-    }
-    for (const k of Object.keys(__1tubeWorkerEnv ?? {})) {
-      const v = __1tubeWorkerEnv[k];
-      if (typeof v === "string") out[k] = v;
-    }
-    return out;
-  },
-};
-
-// __edgeFunctionRegistry is *always* replaced with this bundle's own
-// instance. Each bundle has its own module-scope \`__1tubeCapturedHandler\`,
-// so the registry's \`register()\` must close over THIS bundle's locals —
-// even if a previous import (e.g. when several bundles are imported into
-// the same Deno realm during tests) already installed its own.
-globalThis.__edgeFunctionRegistry = __1tubeRegistry;
-
-// Install the \`Deno\` shim only when there is no host Deno — i.e. we're
-// running under real workerd. Under host Deno (e.g. when 1tube's own
-// test suite imports a bundle to verify the bundler) we deliberately
-// leave the host's \`Deno\` global untouched: replacing it would break
-// the test runner's own use of Deno.makeTempDir / Deno.readDir / etc.
-// The runtime contract for the env shim is exercised by the workerd
-// end-to-end test, which runs inside an actual workerd process where
-// \`typeof Deno === "undefined"\`.
-if (typeof Deno === "undefined") {
-  Object.defineProperty(globalThis, "Deno", {
-    value: {
-      env: __1tubeDenoEnv,
-      // Defence in depth: a stray top-level Deno.serve(...) becomes a
-      // no-op instead of a ReferenceError. The registry is the supported
-      // path; this just keeps the failure mode quiet.
-      serve: () => ({
-        finished: Promise.resolve(),
-        shutdown: () => {},
-        ref: () => {},
-        unref: () => {},
-      }),
-    },
-    writable: true,
-    configurable: true,
-    enumerable: false,
-  });
-}
-`;
-
-/**
- * Footer injected at the bottom of every bundle. Exports the workerd
- * default handler. Authentication is the gateway's job; this just rebuilds
- * the AuthContext from the trusted internal headers the gateway forwards.
- */
-const FOOTER = `
-function __1tubeBuildAuth(request) {
-  const h = request.headers;
-  const payloadRaw = h.get("X-1tube-Auth-Payload");
-  let payload = {};
-  if (payloadRaw) {
-    try { payload = JSON.parse(payloadRaw); } catch { payload = {}; }
-  }
-  return {
-    userId: h.get("X-1tube-Auth-User") || "anon",
-    email: h.get("X-1tube-Auth-Email") || "",
-    rawToken: h.get("X-1tube-Auth-Token") || "",
-    payload,
-  };
-}
-
-export default {
-  async fetch(request, env, _ctx) {
-    __1tubeWorkerEnv = env || {};
-    if (typeof __1tubeCapturedHandler !== "function") {
-      return new Response(
-        JSON.stringify({ error: "function did not register a handler" }),
-        { status: 500, headers: { "content-type": "application/json" } },
-      );
-    }
-    // Invocation id stamped by the gateway before proxying. Binds this
-    // dispatch's console output (see the banner's console shim) to the
-    // invocation row the gateway persists.
-    const __1tubeInvocationId = request.headers.get("x-1tube-invocation-id");
-    const __1tubeRun = async () => {
-      if (__1tubeCapturedOpts.public) {
-        return await __1tubeCapturedHandler(request);
-      }
-      return await __1tubeCapturedHandler(request, __1tubeBuildAuth(request));
-    };
-    try {
-      return await __1tubeInvocationCtx.run(
-        { invocationId: __1tubeInvocationId },
-        __1tubeRun,
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // Surface the stack through the capture channel so the log store
-      // keeps it next to the invocation that threw.
-      __1tubeInvocationCtx.run({ invocationId: __1tubeInvocationId }, () => {
-        __1tubeEmitConsole("error", [err instanceof Error ? (err.stack || msg) : msg]);
-      });
-      return new Response(
-        JSON.stringify({ error: msg }),
-        { status: 500, headers: { "content-type": "application/json" } },
-      );
-    }
-  },
-};
-`;
+export const DEFAULT_ESBUILD_TARGET = "es2024";
 
 export interface BundleInput {
   /** Logical function name (used as bundle filename and in capnp config). */
@@ -315,7 +104,7 @@ export interface ChunkedBundleAllResult {
   };
 }
 
-export interface WorkerdSharedModuleInput {
+export interface SharedModuleInput {
   /** Stable id used in the generated RPC path and prebuilt manifest. */
   id: string;
   /** Absolute source module path on disk. */
@@ -324,15 +113,26 @@ export interface WorkerdSharedModuleInput {
   exportNames: readonly string[];
 }
 
+/**
+ * @deprecated Use {@link SharedModuleInput}. Retained as an alias so existing
+ * importers (deno backend, tests) keep compiling.
+ */
+export type WorkerdSharedModuleInput = SharedModuleInput;
+
 export interface BundlerOptions {
+  /**
+   * Backend bundling profile (banner/footer, platform/conditions, externals).
+   * Owned by the backend; the core never branches on a target.
+   */
+  profile: BundleProfile;
   /**
    * Directory to write bundles into. Files are named `<name>.js` (+
    * `<name>.js.map` when `sourcemap` is true). Created if missing.
    */
   outDir: string;
   /**
-   * Path to the host project's `deno.json` so esbuild-deno-loader can pick
-   * up the import map. Optional — when omitted no import map is applied.
+   * Path to the host project's `deno.json` so the Deno loader can pick up the
+   * import map. Optional — when omitted no import map is applied.
    */
   configPath?: string;
   /**
@@ -344,11 +144,17 @@ export interface BundlerOptions {
   /** Emit minified output. Defaults to false (keeps readable stack traces). */
   minify?: boolean;
   /**
-   * Modules that should be owned by the gateway process, not by each
-   * workerd isolate. Imports that resolve to one of these source paths
-   * are replaced with generated RPC stubs.
+   * ECMAScript syntax level forwarded to esbuild's `target`. Accepts any value
+   * esbuild understands (e.g. `"es2022"`, `"es2024"`, `"esnext"`, or an array
+   * like `["es2024", "node24"]`). Defaults to {@link DEFAULT_ESBUILD_TARGET}.
    */
-  sharedModules?: readonly WorkerdSharedModuleInput[];
+  esbuildTarget?: string | string[];
+  /**
+   * Modules that should be owned by the gateway process, not by each isolate.
+   * Imports that resolve to one of these source paths are replaced with
+   * generated RPC stubs.
+   */
+  sharedModules?: readonly SharedModuleInput[];
 }
 
 /** State held by a long-lived bundler so esbuild can be reused across builds. */
@@ -380,7 +186,7 @@ export async function disposeBundlerResources(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function sharedModuleStubSource(module: WorkerdSharedModuleInput): string {
+function sharedModuleStubSource(module: SharedModuleInput): string {
   const exports = module.exportNames.map((name) =>
     `export async function ${name}(...args) {
   return await callShared(${JSON.stringify(name)}, args);
@@ -450,7 +256,7 @@ function resolveLocalImport(args: esbuild.OnResolveArgs): string | null {
 }
 
 function sharedModulesExternalPlugin(
-  sharedModules: readonly WorkerdSharedModuleInput[],
+  sharedModules: readonly SharedModuleInput[],
 ): esbuild.Plugin {
   const byPath = new Map(
     sharedModules.map((m) => [resolvePath(m.sourcePath), m]),
@@ -483,7 +289,7 @@ function patchCjsDefaultInterop(code: string): string {
   // CommonJS module sets `__esModule`. That matches Babel-transpiled
   // modules that also provide a real `.default`, but breaks plain CJS
   // packages such as `tslib` whose UMD wrapper sets `__esModule` while
-  // only exporting named helpers. Workerd's nodejs_compat behavior is
+  // only exporting named helpers. workerd's nodejs_compat behavior is
   // closer to Node's ESM/CJS bridge: a default import from CJS resolves
   // to module.exports. Preserve real default exports, but synthesize one
   // when absent.
@@ -499,18 +305,16 @@ function toPosix(path: string): string {
   return path.replace(/\\/g, "/");
 }
 
-function entryProxySource(entrypoint: string, target: BundleTarget): string {
-  const banner = target === "vercel" ? VERCEL_BANNER : BANNER;
-  const footer = target === "vercel" ? VERCEL_FOOTER : FOOTER;
-  return `${banner}
+function entryProxySource(entrypoint: string, profile: BundleProfile): string {
+  return `${profile.banner}
 await import(${JSON.stringify(pathToFileURL(entrypoint).href)});
-${footer}
+${profile.footer}
 `;
 }
 
 function entryProxyPlugin(
   inputs: readonly BundleInput[],
-  target: BundleTarget,
+  profile: BundleProfile,
 ): esbuild.Plugin {
   const byName = new Map(inputs.map((input) => [input.name, input]));
   return {
@@ -532,65 +336,12 @@ function entryProxyPlugin(
             );
           }
           return {
-            contents: entryProxySource(input.entrypoint, target),
+            contents: entryProxySource(input.entrypoint, profile),
             loader: "js",
             resolveDir: dirname(input.entrypoint),
           };
         },
       );
-    },
-  };
-}
-
-const NODE_BUILTIN_SET = new Set<string>(NODE_BUILTIN_MODULES);
-
-/**
- * Optional native/peer packages that popular Node libraries `require()` from
- * inside a `try/catch` as an opt-in speedup, degrading to a pure-JS path when
- * absent. They are `optionalDependencies` that are not installed, so esbuild's
- * deno loader fails to resolve them when the Vercel (Node) target selects the
- * libraries' `node` build. Marking them external makes esbuild emit its
- * `__require` shim (which throws at the call site); the library catches that
- * and uses its fallback. The workerd target never hits this because its
- * `browser`/`worker` conditions resolve the dependency-free browser builds.
- *
- *  - `bufferutil`, `utf-8-validate` → `ws` (native frame masking / UTF-8 check)
- *  - `supports-color`             → `debug` (TTY colour detection)
- */
-const VERCEL_OPTIONAL_EXTERNALS: readonly string[] = [
-  "bufferutil",
-  "utf-8-validate",
-  "supports-color",
-];
-
-function isNodeBuiltinBare(spec: string): boolean {
-  const slash = spec.indexOf("/");
-  const head = slash === -1 ? spec : spec.slice(0, slash);
-  return NODE_BUILTIN_SET.has(head);
-}
-
-/**
- * For the Vercel (Node) target, leave Node builtins to the host runtime
- * instead of bundling Deno's polyfills for them. `node:`-prefixed specifiers
- * are always external; bare builtins (`crypto`, `stream`, `stream/web`, ...)
- * are rewritten to their `node:` form and externalized. Non-builtins fall
- * through to the deno loader for npm/jsr resolution. Registered before the
- * deno plugin so it wins for these specifiers.
- */
-function nodeBuiltinsExternalPlugin(): esbuild.Plugin {
-  return {
-    name: "1tube-node-builtins-external",
-    setup(build) {
-      build.onResolve({ filter: /^node:/ }, (args) => ({
-        path: args.path,
-        external: true,
-      }));
-      build.onResolve({ filter: /^[A-Za-z][A-Za-z0-9._/-]*$/ }, (args) => {
-        if (isNodeBuiltinBare(args.path)) {
-          return { path: `node:${args.path}`, external: true };
-        }
-        return null;
-      });
     },
   };
 }
@@ -606,6 +357,7 @@ async function patchOutputFile(path: string): Promise<void> {
 async function minifyOutputFile(
   path: string,
   sourcemap: boolean | "linked" | "inline",
+  target: string | string[],
 ): Promise<{
   originalByteLength: number;
   byteLength: number;
@@ -615,7 +367,7 @@ async function minifyOutputFile(
   const result = await esbuild.transform(original, {
     loader: "js",
     format: "esm",
-    target: "es2022",
+    target,
     minify: true,
     legalComments: "none",
     sourcemap: sourcemap === "inline"
@@ -646,7 +398,9 @@ async function minifyOutputFile(
  * configuration is captured in the closure.
  */
 export function createBundler(opts: BundlerOptions): Bundler {
+  const profile = opts.profile;
   const sourcemap = opts.sourcemap ?? "linked";
+  const target = opts.esbuildTarget ?? DEFAULT_ESBUILD_TARGET;
 
   // The Deno plugin uses the same Rust resolver as `deno run` (compiled to
   // WASM), so resolution of npm:/jsr:/https:/file: specifiers matches the
@@ -655,9 +409,11 @@ export function createBundler(opts: BundlerOptions): Bundler {
   // JSR pinning; no explicit lockPath knob is exposed by the plugin.
   const plugin = denoPlugin({ configPath: opts.configPath });
   const sharedModules = opts.sharedModules ?? [];
-  const plugins = sharedModules.length > 0
-    ? [sharedModulesExternalPlugin(sharedModules), plugin]
-    : [plugin];
+  const plugins = [
+    ...(profile.resolverPlugins ?? []),
+    ...(sharedModules.length > 0 ? [sharedModulesExternalPlugin(sharedModules)] : []),
+    plugin,
+  ];
 
   const buildOne = async (input: BundleInput): Promise<BundleResult> => {
     const start = performance.now();
@@ -673,18 +429,12 @@ export function createBundler(opts: BundlerOptions): Bundler {
         plugins,
         bundle: true,
         format: "esm",
-        // Workerd targets a modern V8 — no need to down-level for IE11 etc.
-        // Matches Cloudflare's documented baseline; tightening this further
-        // (e.g. ES2022) caused regressions with some JSR packages historically.
-        target: "es2022",
-        platform: "neutral",
-        // Prefer browser/import conditions over node so packages with both
-        // entrypoints (`@supabase/supabase-js` etc.) pick the leaner ESM
-        // build. `node` is added so `node:`-prefixed imports resolve into
-        // workerd's nodejs_compat polyfills.
-        conditions: ["worker", "browser", "import", "default"],
-        banner: { js: BANNER },
-        footer: { js: FOOTER },
+        target,
+        platform: profile.platform,
+        conditions: [...profile.conditions],
+        ...(profile.external ? { external: [...profile.external] } : {}),
+        banner: { js: profile.banner },
+        footer: { js: profile.footer },
         sourcemap,
         minify: opts.minify ?? false,
         // Tree-shaking is only safe when imports are pure — esbuild assumes
@@ -697,9 +447,7 @@ export function createBundler(opts: BundlerOptions): Bundler {
         // We don't want esbuild to log to stdout — the host gateway controls
         // logging surface. Errors are surfaced via thrown exceptions.
         logLevel: "silent",
-        // Workerd accepts standard ESM; explicit `mainFields` keeps esbuild
-        // honest if a package overrides condition resolution.
-        mainFields: ["module", "main"],
+        mainFields: [...profile.mainFields],
       });
     } catch (err) {
       // esbuild throws on any build error with `logLevel: silent`. Re-raise
@@ -708,7 +456,7 @@ export function createBundler(opts: BundlerOptions): Bundler {
       // esbuild diagnostic block.
       const cause = err instanceof Error ? err.message : String(err);
       throw new Error(
-        `workerd bundle failed for function "${input.name}" (${input.entrypoint})\n${cause}`,
+        `${profile.id} bundle failed for function "${input.name}" (${input.entrypoint})\n${cause}`,
         { cause: err instanceof Error ? err : undefined },
       );
     }
@@ -764,21 +512,19 @@ export function createBundler(opts: BundlerOptions): Bundler {
 export async function bundleAllChunked(
   opts: BundlerOptions & {
     inputs: BundleInput[];
-    /** Runtime to emit for. Defaults to `workerd`. */
-    target?: BundleTarget;
   },
 ): Promise<ChunkedBundleAllResult> {
   await ensureDir(opts.outDir);
   const start = performance.now();
-  const target: BundleTarget = opts.target ?? "workerd";
-  const isVercel = target === "vercel";
+  const profile = opts.profile;
   const sourcemap = opts.sourcemap ?? "linked";
+  const target = opts.esbuildTarget ?? DEFAULT_ESBUILD_TARGET;
   const sharedModules = opts.sharedModules ?? [];
   const plugins = [
-    // Node builtins must be externalized before the deno loader gets a
-    // chance to substitute its polyfills for the Vercel/Node target.
-    ...(isVercel ? [nodeBuiltinsExternalPlugin()] : []),
-    entryProxyPlugin(opts.inputs, target),
+    // Backend resolver plugins (e.g. node-builtin externalisation) must run
+    // before the deno loader gets a chance to resolve those specifiers.
+    ...(profile.resolverPlugins ?? []),
+    entryProxyPlugin(opts.inputs, profile),
     ...(sharedModules.length > 0
       ? [sharedModulesExternalPlugin(sharedModules)]
       : []),
@@ -800,25 +546,19 @@ export async function bundleAllChunked(
       bundle: true,
       splitting: true,
       format: "esm",
-      target: "es2022",
-      // Vercel runs on Node, so resolve the node conditions and let the
-      // host runtime provide builtins; workerd uses the leaner
-      // worker/browser conditions with nodejs_compat polyfills.
-      platform: isVercel ? "node" : "neutral",
-      conditions: isVercel
-        ? ["node", "import", "default"]
-        : ["worker", "browser", "import", "default"],
-      // Optional native deps that `ws`/`debug` require() behind a try/catch.
-      // The deno loader honors esbuild's `external`, short-circuiting them to
-      // external so the Node build resolves without their (uninstalled)
-      // optionalDependencies. Workerd resolves the browser build and needs none.
-      external: isVercel ? [...VERCEL_OPTIONAL_EXTERNALS] : undefined,
+      target,
+      platform: profile.platform,
+      conditions: [...profile.conditions],
+      // The Deno loader honours esbuild's `external`, short-circuiting these
+      // specifiers before resolution (e.g. optional native deps a library
+      // require()s behind a try/catch).
+      ...(profile.external ? { external: [...profile.external] } : {}),
       sourcemap,
       minify: opts.minify ?? false,
       treeShaking: true,
       absWorkingDir: opts.outDir,
       logLevel: "silent",
-      mainFields: ["module", "main"],
+      mainFields: [...profile.mainFields],
       entryNames: "functions/[name]",
       chunkNames: "chunks/[name]-[hash]",
       metafile: true,
@@ -826,7 +566,7 @@ export async function bundleAllChunked(
     });
   } catch (err) {
     const cause = err instanceof Error ? err.message : String(err);
-    throw new Error(`${target} chunked bundle failed\n${cause}`, {
+    throw new Error(`${profile.id} chunked bundle failed\n${cause}`, {
       cause: err instanceof Error ? err : undefined,
     });
   }
@@ -876,7 +616,7 @@ export async function bundleAllChunked(
     emittedJs.map(async (file) => {
       minifiedSizesByFile.set(
         file,
-        await minifyOutputFile(join(opts.outDir, file), sourcemap),
+        await minifyOutputFile(join(opts.outDir, file), sourcemap, target),
       );
     }),
   );
@@ -889,7 +629,7 @@ export async function bundleAllChunked(
     const sizes = minifiedSizesByFile.get(file);
     if (!sizes) {
       throw new Error(
-        `workerd chunked bundle missing minified size for ${file}`,
+        `${profile.id} chunked bundle missing minified size for ${file}`,
       );
     }
     return {
@@ -925,14 +665,14 @@ export async function bundleAllChunked(
     const entry = entryByName.get(input.name);
     if (!entry) {
       throw new Error(
-        `workerd chunked bundle missing entry output for ${input.name}`,
+        `${profile.id} chunked bundle missing entry output for ${input.name}`,
       );
     }
     const bundlePath = join(opts.outDir, entry);
     const sizes = minifiedSizesByFile.get(entry);
     if (!sizes) {
       throw new Error(
-        `workerd chunked bundle missing minified size for ${entry}`,
+        `${profile.id} chunked bundle missing minified size for ${entry}`,
       );
     }
     functions.push({
@@ -950,32 +690,42 @@ export async function bundleAllChunked(
 }
 
 export async function bundleSharedModule(opts: {
-  module: WorkerdSharedModuleInput;
+  /** Backend bundling profile (resolution platform/conditions). */
+  profile: BundleProfile;
+  module: SharedModuleInput;
   outDir: string;
   configPath?: string;
   minify?: boolean;
+  /** ECMAScript target forwarded to esbuild. Defaults to {@link DEFAULT_ESBUILD_TARGET}. */
+  esbuildTarget?: string | string[];
 }): Promise<SharedBundleResult> {
   await ensureDir(opts.outDir);
   const start = performance.now();
+  const profile = opts.profile;
+  const target = opts.esbuildTarget ?? DEFAULT_ESBUILD_TARGET;
   const outfile = join(opts.outDir, `${opts.module.id}.js`);
   await esbuild.build({
     entryPoints: [pathToFileURL(opts.module.sourcePath).href],
     outfile,
-    plugins: [denoPlugin({ configPath: opts.configPath })],
+    plugins: [
+      ...(profile.resolverPlugins ?? []),
+      denoPlugin({ configPath: opts.configPath }),
+    ],
     bundle: true,
     format: "esm",
-    target: "es2022",
-    platform: "neutral",
-    conditions: ["worker", "browser", "import", "default"],
+    target,
+    platform: profile.platform,
+    conditions: [...profile.conditions],
+    ...(profile.external ? { external: [...profile.external] } : {}),
     sourcemap: false,
     minify: opts.minify ?? false,
     treeShaking: true,
     absWorkingDir: opts.outDir,
     logLevel: "silent",
-    mainFields: ["module", "main"],
+    mainFields: [...profile.mainFields],
   });
   await patchOutputFile(outfile);
-  const sizes = await minifyOutputFile(outfile, false);
+  const sizes = await minifyOutputFile(outfile, false, target);
   return {
     id: opts.module.id,
     bundlePath: outfile,
@@ -1019,7 +769,7 @@ function extractExportedFunctionNames(source: string): string[] {
 
 async function maybeSharedModule(
   path: string,
-): Promise<WorkerdSharedModuleInput | null> {
+): Promise<SharedModuleInput | null> {
   try {
     const stat = await Deno.stat(path);
     if (!stat.isFile) return null;
@@ -1042,7 +792,7 @@ async function maybeSharedModule(
 export async function discoverSharedModules(
   functionsDir: string,
   explicitPaths: readonly string[] = [],
-): Promise<WorkerdSharedModuleInput[]> {
+): Promise<SharedModuleInput[]> {
   const root = resolvePath(functionsDir);
   const candidates = explicitPaths.length > 0
     ? explicitPaths.map((p) =>
@@ -1057,7 +807,7 @@ export async function discoverSharedModules(
     candidates.push(defaultProfile);
   }
 
-  const out: WorkerdSharedModuleInput[] = [];
+  const out: SharedModuleInput[] = [];
   const seen = new Set<string>();
   for (const candidate of candidates) {
     const resolved = resolvePath(candidate);
@@ -1073,7 +823,7 @@ export async function discoverSharedModules(
  * Convenience: discover function entrypoints under `functionsDir` (one
  * subdirectory per function, each containing `index.ts`) and return the
  * canonical `BundleInput[]`. Mirrors `src/discovery.ts` filtering rules so
- * the workerd backend sees the same function set as the Deno backend.
+ * every backend sees the same function set as the Deno backend.
  */
 export async function discoverEntrypoints(
   functionsDir: string,

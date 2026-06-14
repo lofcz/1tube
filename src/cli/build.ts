@@ -36,10 +36,12 @@ import { dirname, isAbsolute, join, relative, resolve as resolvePath } from "nod
 import {
   bundleAllChunked,
   bundleSharedModule,
+  DEFAULT_ESBUILD_TARGET,
   discoverEntrypoints,
   discoverSharedModules,
   disposeBundlerResources,
-} from "../backends/workerd/bundler.ts";
+} from "../bundler/core.ts";
+import { WORKERD_PROFILE } from "../backends/workerd/bundle-profile.ts";
 import { loadManifest } from "../manifest.ts";
 import {
   PREBUILT_SCHEMA,
@@ -63,6 +65,8 @@ export interface BuildOptions {
   sourcemap?: boolean | "linked" | "inline";
   /** Minify bundles. Defaults to false. */
   minify?: boolean;
+  /** ECMAScript target forwarded to esbuild. Defaults to {@link DEFAULT_ESBUILD_TARGET}. */
+  esbuildTarget?: string | string[];
   /** Bundler concurrency. Defaults to 4. */
   concurrency?: number;
   /** Compat date baked into the manifest. */
@@ -231,9 +235,11 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
   const chunked = await bundleAllChunked({
     inputs,
     outDir,
+    profile: WORKERD_PROFILE,
     configPath: opts.configPath,
     sourcemap: opts.sourcemap ?? "linked",
     minify: opts.minify ?? false,
+    ...(opts.esbuildTarget ? { esbuildTarget: opts.esbuildTarget } : {}),
     sharedModules,
   });
   opts.onProgress?.({
@@ -254,9 +260,11 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
     const module = sharedModules[i];
     const shared = await bundleSharedModule({
       module,
+      profile: WORKERD_PROFILE,
       outDir: sharedOutDir,
       configPath: opts.configPath,
       minify: opts.minify ?? false,
+      ...(opts.esbuildTarget ? { esbuildTarget: opts.esbuildTarget } : {}),
     });
     const bytes = await Deno.readFile(shared.bundlePath);
     const baseName = shared.bundlePath.split(/[\\/]/).pop()!;
@@ -453,6 +461,7 @@ export async function runBuild(args: string[]): Promise<number> {
   let only: string[] | undefined;
   let sourcemap: boolean | "linked" | "inline" = "linked";
   let minify = false;
+  let esbuildTarget: string | undefined;
   let concurrency = 4;
   let compatDate: string | undefined;
   const compatFlags: string[] = [];
@@ -485,6 +494,10 @@ export async function runBuild(args: string[]): Promise<number> {
       }
     } else if (a === "--minify") {
       minify = true;
+    } else if (a === "--ecma-target" && args[i + 1]) {
+      esbuildTarget = args[++i];
+    } else if (a.startsWith("--ecma-target=")) {
+      esbuildTarget = a.slice("--ecma-target=".length);
     } else if (a === "--concurrency" && args[i + 1]) {
       const n = parseInt(args[++i], 10);
       if (!Number.isFinite(n) || n < 1) {
@@ -607,6 +620,7 @@ export async function runBuild(args: string[]): Promise<number> {
       ...(only ? { only } : {}),
       sourcemap,
       minify,
+      ...(esbuildTarget ? { esbuildTarget } : {}),
       concurrency,
       ...(sharedModules.length > 0 ? { sharedModules } : {}),
       ...(compatDate ? { compatibilityDate: compatDate } : {}),
@@ -749,6 +763,8 @@ Options:
       --only A,B,C           Build only the named subset
       --sourcemap MODE       none | linked (default) | inline
       --minify               Also minify during the initial esbuild pass
+      --ecma-target TARGET   esbuild syntax target, e.g. es2024 | esnext
+                             (default: ${DEFAULT_ESBUILD_TARGET})
       --concurrency N        Bundler concurrency (default: 4)
       --compat-date DATE     Workerd compatibility date (YYYY-MM-DD)
       --compat-flag FLAG     Add a workerd compatibility flag (repeatable)

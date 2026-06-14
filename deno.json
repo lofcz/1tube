@@ -17,7 +17,7 @@
     "hono": "npm:hono@4",
     "drizzle-orm": "npm:drizzle-orm@1.0.0-rc.3",
     "drizzle-orm/": "npm:/drizzle-orm@1.0.0-rc.3/",
-    "esbuild": "npm:esbuild@^0.28",
+    "esbuild": "npm:esbuild@^0.28.1",
     "es-module-lexer": "npm:es-module-lexer@^2",
     "@deno/esbuild-plugin": "jsr:@deno/esbuild-plugin@^1.2",
     "@deno/graph": "jsr:@deno/graph@^0.108",

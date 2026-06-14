@@ -77,7 +77,16 @@ interface Harness {
 async function makeHarness(
   setup: (root: string) => Promise<void>,
 ): Promise<Harness> {
-  const dir = await Deno.makeTempDir({ prefix: "1tube-hmr-e2e-" });
+  // Canonicalize like the gateway does (server.ts realPath's
+  // FUNCTIONS_PATH before handing it to the worker host + hot reloader).
+  // On Windows makeTempDir yields an 8.3 short path ("…\\MSTAGL~1\\…")
+  // while the worker host realPath's it to the long form internally — so
+  // the fs-watcher's change events (short paths) wouldn't match the
+  // dep-graph's file→owner edges (long paths) and `_shared` edits would
+  // never map to their importers.
+  const dir = await Deno.realPath(
+    await Deno.makeTempDir({ prefix: "1tube-hmr-e2e-" }),
+  );
   await setup(dir);
 
   const registry = new FunctionRegistry();
@@ -350,7 +359,11 @@ Deno.test({
   name: "hmr-e2e: real --config import-map library update reloads consumers",
   permissions: { run: true, read: true, write: true, net: true, env: true },
 }, async () => {
-  const root = await Deno.makeTempDir({ prefix: "1tube-hmr-config-" });
+  // Canonicalize so the --config import-map base matches the server's
+  // realPath'd module URLs (see the scoped test for the full rationale).
+  const root = await Deno.realPath(
+    await Deno.makeTempDir({ prefix: "1tube-hmr-config-" }),
+  );
   const functionsDir = join(root, "supabase", "functions");
   const port = await freePort();
   let child: Deno.ChildProcess | null = null;
@@ -401,6 +414,9 @@ Deno.test({
       env: {
         "1TUBE_DEV": "1",
         "1TUBE_BOOT_PROFILE": "",
+        // HMR correctness tests, not rate-limit tests: keep the health-check
+        // poller (~10 req/s) from tripping the gateway limiter into a 429.
+        "1TUBE_DISABLE_RATE_LIMIT": "1",
       },
       stdout: "piped",
       stderr: "piped",
@@ -447,7 +463,17 @@ Deno.test({
     "hmr-e2e: real --config scoped import-map library update reloads consumers",
   permissions: { run: true, read: true, write: true, net: true, env: true },
 }, async () => {
-  const root = await Deno.makeTempDir({ prefix: "1tube-hmr-scoped-config-" });
+  // Canonicalize the temp root. The server realPath's FUNCTIONS_PATH and
+  // loads every function module via that (long) URL, while Deno's import-map
+  // base comes from the --config path we pass below. A `scopes` entry like
+  // "./uses-scoped/" only applies when the importing module's URL is under
+  // the scope prefix — so if --config carries Windows' 8.3 short path
+  // ("…\\MSTAGL~1\\…") but the module loads via the realPath'd long form, the
+  // scope never matches, `@scoped/lib` is unresolved, and the function fails
+  // to boot. Passing the canonical path keeps both sides in agreement.
+  const root = await Deno.realPath(
+    await Deno.makeTempDir({ prefix: "1tube-hmr-scoped-config-" }),
+  );
   const functionsDir = join(root, "supabase", "functions");
   const port = await freePort();
   let child: Deno.ChildProcess | null = null;
@@ -496,6 +522,9 @@ Deno.test({
       env: {
         "1TUBE_DEV": "1",
         "1TUBE_BOOT_PROFILE": "",
+        // HMR correctness tests, not rate-limit tests: keep the health-check
+        // poller (~10 req/s) from tripping the gateway limiter into a 429.
+        "1TUBE_DISABLE_RATE_LIMIT": "1",
       },
       stdout: "piped",
       stderr: "piped",
@@ -537,7 +566,11 @@ Deno.test({
   name: "hmr-e2e: shared profile-cache imported via import-map alias runs once",
   permissions: { run: true, read: true, write: true, net: true, env: true },
 }, async () => {
-  const root = await Deno.makeTempDir({ prefix: "1tube-hmr-shared-alias-" });
+  // Canonicalize so the realPath'd module URLs and the --config import-map
+  // base agree (see the scoped test for the full rationale).
+  const root = await Deno.realPath(
+    await Deno.makeTempDir({ prefix: "1tube-hmr-shared-alias-" }),
+  );
   const functionsDir = join(root, "supabase", "functions");
   const evalLog = join(root, "profile-cache-evals.log");
   const port = await freePort();
@@ -600,6 +633,9 @@ reg.register(async () => {
       cwd: root,
       env: {
         "1TUBE_DEV": "1",
+        // HMR correctness test, not a rate-limit test: keep the health-check
+        // poller (~10 req/s) from tripping the gateway limiter into a 429.
+        "1TUBE_DISABLE_RATE_LIMIT": "1",
       },
       stdout: "piped",
       stderr: "piped",

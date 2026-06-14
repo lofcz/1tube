@@ -51,7 +51,17 @@ interface Project {
  * confirm the RPC actually reaches the gateway.
  */
 async function makeProject(numFns: number): Promise<Project> {
-  const dir = await Deno.makeTempDir({ prefix: "1tube-shared-test-" });
+  // Canonicalize the temp dir the same way the gateway does: server.ts
+  // resolves FUNCTIONS_PATH through Deno.realPath() once and hands that
+  // canonical path to BOTH discoverSharedModules() and the worker host.
+  // Without this, Windows returns an 8.3 short path ("…\\MSTAGL~1\\…")
+  // from makeTempDir while the worker host's own realPath() yields the
+  // long form, so the rewriter's shared-import match (an exact string
+  // compare in bySourcePath) misses and every Worker re-evaluates the
+  // shared module instead of using the RPC stub.
+  const dir = await Deno.realPath(
+    await Deno.makeTempDir({ prefix: "1tube-shared-test-" }),
+  );
   const evalLog = join(dir, ".shared-evals.log");
   // Best-effort: ensure the file exists so the shared module can
   // append. Avoids races where two cache-bust imports try to create
@@ -244,7 +254,11 @@ Deno.test(
     // and the splicer was emitting a bare URL. The handler below
     // imports a constant lazily so the rewriter's dynamic-import
     // branch is exercised end-to-end.
-    const dir = await Deno.makeTempDir({ prefix: "1tube-dyn-import-" });
+    // Canonicalize (see makeProject) so the worker host's realPath'd
+    // entries match the rewriter's shared-import resolution on Windows.
+    const dir = await Deno.realPath(
+      await Deno.makeTempDir({ prefix: "1tube-dyn-import-" }),
+    );
     try {
       const evalLog = join(dir, ".shared-evals.log");
       await Deno.writeTextFile(evalLog, "");

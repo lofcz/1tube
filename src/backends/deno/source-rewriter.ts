@@ -136,7 +136,7 @@ export interface RewriteCache {
  * which the Worker-host wires up to a postMessage RPC.
  *
  * Note: only `function` and `const x = (...) =>` exports survive the
- * extractor in `bundler.ts:extractExportedFunctionNames`. Class /
+ * extractor in `bundler/core.ts:extractExportedFunctionNames`. Class /
  * value exports are not supported as shared and would error during
  * discovery — the user gets a clean message at boot rather than a
  * confusing failure inside a stub.
