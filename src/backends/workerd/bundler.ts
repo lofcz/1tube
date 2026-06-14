@@ -544,6 +544,25 @@ function entryProxyPlugin(
 
 const NODE_BUILTIN_SET = new Set<string>(NODE_BUILTIN_MODULES);
 
+/**
+ * Optional native/peer packages that popular Node libraries `require()` from
+ * inside a `try/catch` as an opt-in speedup, degrading to a pure-JS path when
+ * absent. They are `optionalDependencies` that are not installed, so esbuild's
+ * deno loader fails to resolve them when the Vercel (Node) target selects the
+ * libraries' `node` build. Marking them external makes esbuild emit its
+ * `__require` shim (which throws at the call site); the library catches that
+ * and uses its fallback. The workerd target never hits this because its
+ * `browser`/`worker` conditions resolve the dependency-free browser builds.
+ *
+ *  - `bufferutil`, `utf-8-validate` → `ws` (native frame masking / UTF-8 check)
+ *  - `supports-color`             → `debug` (TTY colour detection)
+ */
+const VERCEL_OPTIONAL_EXTERNALS: readonly string[] = [
+  "bufferutil",
+  "utf-8-validate",
+  "supports-color",
+];
+
 function isNodeBuiltinBare(spec: string): boolean {
   const slash = spec.indexOf("/");
   const head = slash === -1 ? spec : spec.slice(0, slash);
@@ -789,6 +808,11 @@ export async function bundleAllChunked(
       conditions: isVercel
         ? ["node", "import", "default"]
         : ["worker", "browser", "import", "default"],
+      // Optional native deps that `ws`/`debug` require() behind a try/catch.
+      // The deno loader honors esbuild's `external`, short-circuiting them to
+      // external so the Node build resolves without their (uninstalled)
+      // optionalDependencies. Workerd resolves the browser build and needs none.
+      external: isVercel ? [...VERCEL_OPTIONAL_EXTERNALS] : undefined,
       sourcemap,
       minify: opts.minify ?? false,
       treeShaking: true,
