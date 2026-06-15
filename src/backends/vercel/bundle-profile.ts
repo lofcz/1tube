@@ -19,7 +19,12 @@
 
 import * as esbuild from "npm:esbuild@^0.28.1";
 import type { BundleProfile } from "../../bundler/profile.ts";
-import { NODE_BUILTIN_MODULES, VERCEL_BANNER, VERCEL_FOOTER } from "./wrapper.ts";
+import {
+  NODE_BUILTIN_MODULES,
+  VERCEL_BANNER,
+  VERCEL_FOOTER,
+  VERCEL_REQUIRE_SHIM,
+} from "./wrapper.ts";
 
 const NODE_BUILTIN_SET = new Set<string>(NODE_BUILTIN_MODULES);
 
@@ -144,6 +149,7 @@ export const VERCEL_PROFILE: BundleProfile = {
   mainFields: ["module", "main"],
   banner: VERCEL_BANNER,
   footer: VERCEL_FOOTER,
+  outputPreamble: VERCEL_REQUIRE_SHIM,
   resolverPlugins: [
     // node-builtins first so `crypto`/`stream`/… short-circuit to `node:` and
     // never reach the optional-dependency probe.

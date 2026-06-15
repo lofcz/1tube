@@ -358,11 +358,19 @@ async function minifyOutputFile(
   path: string,
   sourcemap: boolean | "linked" | "inline",
   target: string | string[],
+  preamble?: string,
 ): Promise<{
   originalByteLength: number;
   byteLength: number;
 }> {
-  const original = await Deno.readTextFile(path);
+  const raw = await Deno.readTextFile(path);
+  // Prepend the profile preamble (e.g. the Node createRequire shim) before the
+  // minify transform so it reaches the shared chunks where esbuild hoists
+  // helpers like `__require`. esbuild's own `banner` can't do this — it only
+  // injects into entry points, never chunks. The transform keeps the preamble
+  // in every file (it can't prove the initializer is side-effect-free), which
+  // is harmless where unused.
+  const original = preamble ? `${preamble}\n${raw}` : raw;
   const originalByteLength = new TextEncoder().encode(original).byteLength;
   const result = await esbuild.transform(original, {
     loader: "js",
@@ -616,7 +624,12 @@ export async function bundleAllChunked(
     emittedJs.map(async (file) => {
       minifiedSizesByFile.set(
         file,
-        await minifyOutputFile(join(opts.outDir, file), sourcemap, target),
+        await minifyOutputFile(
+          join(opts.outDir, file),
+          sourcemap,
+          target,
+          profile.outputPreamble,
+        ),
       );
     }),
   );
@@ -725,7 +738,12 @@ export async function bundleSharedModule(opts: {
     mainFields: [...profile.mainFields],
   });
   await patchOutputFile(outfile);
-  const sizes = await minifyOutputFile(outfile, false, target);
+  const sizes = await minifyOutputFile(
+    outfile,
+    false,
+    target,
+    profile.outputPreamble,
+  );
   return {
     id: opts.module.id,
     bundlePath: outfile,

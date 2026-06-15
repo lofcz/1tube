@@ -56,4 +56,22 @@ export interface BundleProfile {
    * target). Most profiles need none.
    */
   readonly resolverPlugins?: readonly esbuild.Plugin[];
+  /**
+   * Source prepended to EVERY emitted output file (entry points AND
+   * code-split chunks) before the final minify pass. Unlike {@link banner},
+   * which esbuild only injects into entry points, this reaches chunks too.
+   *
+   * Needed when a runtime shim must be present in the chunk that esbuild
+   * happens to hoist a helper into — e.g. the Node target injects a
+   * `createRequire(import.meta.url)`-backed `require` so esbuild's `__require`
+   * shim (emitted into a shared chunk for CJS deps that `require()` at module
+   * init) works instead of throwing "Dynamic require of … is not supported".
+   *
+   * It is prepended to every file (the per-file minify pass keeps it even where
+   * unused, since it can't prove the initializer is side-effect-free — a few
+   * harmless bytes per chunk). In the chunk that defines the helper, esbuild's
+   * minifier rewrites the helper's `typeof require` checks to the injected
+   * binding, so the shim wires up automatically.
+   */
+  readonly outputPreamble?: string;
 }

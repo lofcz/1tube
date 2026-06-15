@@ -318,6 +318,71 @@ Deno.serve(() => Response.json({ ok: true, hadOptional: optional !== null }));
 );
 
 Deno.test(
+  "buildVercel output survives a CJS dependency that require()s at module init",
+  TEST_OPTS,
+  async () => {
+    // Regression guard for the Node createRequire shim. CJS deps that
+    // `require()` during module initialisation (e.g. google-auth-library →
+    // `require("node:child_process")`) compile to esbuild's `__require` helper,
+    // which esbuild hoists into a SHARED CHUNK. esbuild's `banner` never
+    // reaches chunks, so without the profile's `outputPreamble` that chunk has
+    // no `require` in scope and throws "Dynamic require of … is not supported"
+    // at runtime. The fixture below forces exactly that code path with a local
+    // CommonJS module (offline, deterministic — `node:os` is a builtin).
+    const dir = await Deno.makeTempDir({ prefix: "1tube-vercel-dynreq-" });
+    const out = await tmpOutDir("dynreq");
+    const origServe = (globalThis as { Deno: { serve: unknown } }).Deno.serve;
+    const hadEdge = "EdgeRuntime" in globalThis;
+    const origEdge = (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
+    try {
+      await Deno.writeTextFile(
+        join(dir, "deno.json"),
+        JSON.stringify({ imports: {} }),
+      );
+      await Deno.mkdir(join(dir, "dynreq"), { recursive: true });
+      // CommonJS: esbuild wraps this in __commonJS and rewrites the require()
+      // call to __require(...), evaluated lazily when the module is first used.
+      await Deno.writeTextFile(
+        join(dir, "dynreq", "dep.cjs"),
+        `const os = require("node:os");
+module.exports = { platform: typeof os.platform === "function" ? os.platform() : "unknown" };
+`,
+      );
+      await Deno.writeTextFile(
+        join(dir, "dynreq", "index.ts"),
+        `import dep from "./dep.cjs";
+Deno.serve(() => Response.json({ ok: true, platform: dep.platform }));
+`,
+      );
+
+      const result = await buildVercel({
+        functionsDir: dir,
+        outDir: out,
+        configPath: join(dir, "deno.json"),
+        only: ["dynreq"],
+        sourcemap: false,
+      });
+      const fn = result.functions[0];
+
+      // Importing the emitted module runs the __commonJS wrapper, which invokes
+      // __require("node:os"). Before the fix this threw "Dynamic require…".
+      const entryAbs = join(fn.funcDir, fn.handler);
+      const mod = await import(pathToFileURL(entryAbs).href);
+      assertEquals(typeof mod.default, "function");
+    } finally {
+      (globalThis as { Deno: { serve: unknown } }).Deno.serve = origServe;
+      if (hadEdge) {
+        (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime = origEdge;
+      } else {
+        delete (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
+      }
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
   "build --target vercel happy path returns 0 and writes artifacts",
   TEST_OPTS,
   async () => {

@@ -88,6 +88,30 @@ export const NODE_BUILTIN_MODULES: readonly string[] = [
 ];
 
 /**
+ * Output preamble prepended to EVERY emitted file — entry points and the
+ * code-split chunks alike (see `BundleProfile.outputPreamble`).
+ *
+ * Why this can't live in the banner: esbuild only injects `banner` into entry
+ * points. When CJS dependencies `require()` at module-init time (e.g.
+ * `google-auth-library` → `require("node:child_process")`), esbuild hoists its
+ * `__require` helper into a *shared chunk*. That helper falls back to a real
+ * `require` only `if (typeof require !== "undefined")` — and an ESM module has
+ * no `require` in scope, so the chunk throws "Dynamic require of … is not
+ * supported" at runtime on Vercel.
+ *
+ * Defining a module-scoped `require` backed by `node:module`'s `createRequire`
+ * gives esbuild's `__require` a working delegate in whichever chunk it lands.
+ * The per-file minify pass renames our `require` (and the helper's `typeof
+ * require` checks) consistently, collapsing `__require` to the real delegate.
+ * The shim is kept in every file (minify can't prove `createRequire()` is
+ * side-effect-free) — a few harmless bytes where unused. `import.meta.url` is
+ * always valid because every output is ESM.
+ */
+export const VERCEL_REQUIRE_SHIM =
+  `import { createRequire as __1tubeCreateRequire } from "node:module";
+var require = __1tubeCreateRequire(import.meta.url);`;
+
+/**
  * Banner injected at the top of every Vercel bundle. Runs before the user
  * entrypoint import so top-level `Deno.env.get(...)` / `serve(...)` calls find
  * the shims installed. The captured handler lives in module scope; the footer
