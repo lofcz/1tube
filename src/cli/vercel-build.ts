@@ -20,10 +20,19 @@
  * required: the Vercel bundle wrapper captures `Deno.serve` and bridges Node
  * req/res to the Web fetch handler (see `../backends/vercel/wrapper.ts`).
  *
+ * Vercel's filesystem routing matches a `.func` only on its EXACT path, so
+ * `/functions/v1/rooms/<id>` would 404. Supabase's edge-runtime instead routes
+ * on the first path segment and forwards the whole request to the function, so
+ * path-based routers handle their own sub-paths. To reproduce that, this command
+ * also merges a per-function "main"-phase rewrite into `config.json` mapping
+ * `/<prefix>/<name>/<rest>` back to the bare function path (see
+ * {@link mergeSubpathRoutes}).
+ *
  * This command MERGES into an existing `.vercel/output` (e.g. one produced by
  * `vercel build` for the static frontend). It only creates/replaces the
- * specific `.func` directories; it never wipes the output root, so the
- * frontend's `config.json` and static assets are left untouched.
+ * specific `.func` directories and additively edits `config.json`'s `routes`
+ * (preserving the frontend's existing routes and static assets); it never wipes
+ * the output root.
  *
  * Each function is fully standalone — there is no gateway shared runtime on
  * Vercel, so modules like `_shared/profile-cache.ts` are bundled inline rather
@@ -40,6 +49,7 @@ import {
   disposeBundlerResources,
 } from "../bundler/core.ts";
 import { VERCEL_PROFILE } from "../backends/vercel/bundle-profile.ts";
+import { captureDeclaredServeConfigs } from "../backends/vercel/capture-config.ts";
 import { loadManifest } from "../manifest.ts";
 import { resolveDenoConfigPath } from "./deno-config.ts";
 
@@ -48,9 +58,10 @@ const DEFAULT_RUNTIME = "nodejs24.x";
 /** Default route prefix; matches sciobot's `/functions/v1/<name>` calls. */
 const DEFAULT_PATH_PREFIX = "functions/v1";
 /**
- * Default function timeout (seconds) when no `1tube.json` timeoutMs is set.
- * Defaults to the cap so long-running AI pipelines aren't silently truncated
- * unless a function opts into a shorter timeout via its manifest.
+ * Default function timeout (seconds) when a function declares no timeout via
+ * `serve({ timeoutMs })` (or a `1tube.json` manifest). Defaults to the cap so
+ * long-running AI pipelines aren't silently truncated unless a function opts
+ * into a shorter timeout.
  */
 const DEFAULT_MAX_DURATION = 800;
 /** Upper bound for maxDuration (seconds). Fluid/Pro allows long durations. */
@@ -74,7 +85,10 @@ export interface VercelBuildOptions {
   pathPrefix?: string;
   /** Vercel runtime identifier. Defaults to "nodejs24.x". */
   runtime?: string;
-  /** Fallback maxDuration (seconds) when a function has no timeoutMs. */
+  /**
+   * Fallback maxDuration (seconds) when a function declares no `timeoutMs`
+   * (via `serve({ timeoutMs })` or `1tube.json`).
+   */
   defaultMaxDuration?: number;
   /** Hard cap (seconds) applied to any derived maxDuration. */
   maxDurationCap?: number;
@@ -96,7 +110,14 @@ export type VercelBuildProgress =
     route: string;
     bytes: number;
     maxDuration: number;
-  };
+  }
+  | {
+    phase: "config-merge";
+    configPath: string;
+    routes: number;
+    created: boolean;
+  }
+  | { phase: "capture-warning"; message: string };
 
 export interface VercelFunctionEntry {
   /** Logical function name. */
@@ -126,6 +147,10 @@ export interface VercelBuildResult {
   pathPrefix: string;
   /** Emitted functions, sorted by name. */
   functions: VercelFunctionEntry[];
+  /** Absolute path to the Build Output API `config.json` that was merged. */
+  configPath: string;
+  /** Number of per-function sub-path routes written into `config.json`. */
+  subpathRoutes: number;
   durationMs: number;
 }
 
@@ -168,6 +193,116 @@ function normalizePrefix(prefix: string): string {
     /\\/g,
     "/",
   );
+}
+
+/** Escape a string for safe literal use inside a regular expression. */
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Minimal shape of a Build Output API route entry we read or write. */
+interface VercelRoute {
+  handle?: string;
+  src?: string;
+  dest?: string;
+  [key: string]: unknown;
+}
+
+/** Minimal shape of `.vercel/output/config.json` (Build Output API v3). */
+interface VercelOutputConfig {
+  version?: number;
+  routes?: VercelRoute[];
+  [key: string]: unknown;
+}
+
+/**
+ * Add, per function, a "main"-phase rewrite mapping `/<prefix>/<name>/<rest>`
+ * to the bare function path `/<prefix>/<name>` so a single Vercel Node Function
+ * also serves all of its sub-paths.
+ *
+ * Why this is needed: Vercel's filesystem routing matches a `.func` only on its
+ * exact path, so `/<prefix>/rooms/<id>` would 404. Supabase's edge-runtime
+ * instead routes on the first path segment and forwards the whole request to the
+ * function (`worker.fetch(req)`) — the behaviour path-based routers such as
+ * sciobot's `rooms` handler rely on. A *regular* serverless function receives
+ * the UNMODIFIED original URL through a rewrite (only prerender functions get
+ * the rewritten path), so the function still sees the sub-path in
+ * `url.pathname`.
+ *
+ * The routes go in the main phase (before the first `handle` marker) so each
+ * rewrite is immediately followed by the filesystem lookup that resolves the
+ * `.func`. The exact path (`/<prefix>/<name>`) is intentionally NOT matched — it
+ * already resolves via filesystem routing — keeping the change purely additive.
+ *
+ * Existing routes are preserved; only this builder's own previously-written
+ * sub-path routes (for the functions being built now) are replaced, so repeated
+ * and `--only` builds stay idempotent.
+ */
+async function mergeSubpathRoutes(
+  outDir: string,
+  pathPrefix: string,
+  functionNames: readonly string[],
+): Promise<{ created: boolean; routeCount: number }> {
+  const configPath = join(outDir, "config.json");
+
+  let config: VercelOutputConfig | null = null;
+  try {
+    config = JSON.parse(
+      await Deno.readTextFile(configPath),
+    ) as VercelOutputConfig;
+  } catch (err) {
+    if (!(err instanceof Deno.errors.NotFound)) throw err;
+  }
+  const created = config === null;
+  if (config === null) config = { version: 3, routes: [] };
+  if (typeof config.version !== "number") config.version = 3;
+
+  const existing = Array.isArray(config.routes) ? config.routes : [];
+
+  const prefixRe = escapeRegExp(pathPrefix);
+  const destPrefix = `/${pathPrefix}/`;
+  const builtNames = new Set(functionNames);
+  // The exact route a function `name` maps to. Used for BOTH emit and cleanup
+  // so detection can never drift from generation (e.g. a prefix with regex
+  // metacharacters is escaped identically in both).
+  const routeFor = (name: string): Required<Pick<VercelRoute, "src" | "dest">> => ({
+    src: `^/${prefixRe}/${escapeRegExp(name)}/.*$`,
+    dest: `${destPrefix}${name}`,
+  });
+
+  // Drop our own previously-written routes for the functions being built now: a
+  // route is ours iff its dest is the bare function path AND its src is exactly
+  // what we would emit for that function. Gating on `builtNames` leaves routes
+  // for other functions intact, so `--only` (incremental) builds are safe.
+  const isOwnRoute = (r: VercelRoute): boolean => {
+    if (r.handle !== undefined || typeof r.dest !== "string") return false;
+    if (!r.dest.startsWith(destPrefix)) return false;
+    const name = r.dest.slice(destPrefix.length);
+    return builtNames.has(name) && r.src === routeFor(name).src;
+  };
+  const cleaned = existing.filter((r) => !isOwnRoute(r));
+
+  const subpathRoutes: VercelRoute[] = [...builtNames]
+    .sort((a, b) => a.localeCompare(b))
+    .map((name) => routeFor(name));
+
+  // Place the routes in the main phase — before the first `handle` marker — so
+  // each rewrite is immediately resolved against the filesystem (the `.func`).
+  const markerIdx = cleaned.findIndex((r) => typeof r.handle === "string");
+  config.routes = markerIdx === -1
+    ? [...cleaned, ...subpathRoutes]
+    : [
+      ...cleaned.slice(0, markerIdx),
+      ...subpathRoutes,
+      ...cleaned.slice(markerIdx),
+    ];
+
+  await ensureDir(outDir);
+  await Deno.writeTextFile(
+    configPath,
+    JSON.stringify(config, null, 2) + "\n",
+  );
+  return { created, routeCount: subpathRoutes.length };
 }
 
 async function buildVercelOnce(
@@ -223,6 +358,15 @@ async function buildVercelOnce(
       durationMs: performance.now() - bundleStart,
     });
 
+    // Read each function's declared `serve({ timeoutMs })` so it can drive
+    // `maxDuration` without a side-car manifest. Done after bundling so the
+    // entrypoints' module graph is already warm in Deno's cache; the deployed
+    // function is unaffected (see capture-config.ts).
+    const declaredConfigs = await captureDeclaredServeConfigs(
+      inputs,
+      (m) => opts.onProgress?.({ phase: "capture-warning", message: m }),
+    );
+
     const functionsRoot = join(outDir, "functions", ...pathPrefix.split("/"));
     const entries: VercelFunctionEntry[] = [];
 
@@ -247,8 +391,11 @@ async function buildVercelOnce(
 
       const handler = fn.moduleFiles[0];
       const manifest = await loadManifest(functionsDir, fn.name);
+      // A `serve({ timeoutMs })` declaration wins over the manifest, matching
+      // the runtime precedence in `_shared/handler.ts`.
+      const declaredTimeoutMs = declaredConfigs.get(fn.name)?.timeoutMs;
       const maxDuration = clampMaxDuration(
-        manifest.timeoutMs,
+        declaredTimeoutMs ?? manifest.timeoutMs,
         defaultMaxDuration,
         maxDurationCap,
       );
@@ -293,12 +440,31 @@ async function buildVercelOnce(
     }
 
     entries.sort((a, b) => a.name.localeCompare(b.name));
+
+    // Make every function also serve its sub-paths (e.g. /<prefix>/rooms/<id>),
+    // matching Supabase edge-runtime's first-segment routing. Done after the
+    // `.func` dirs exist so the rewrites resolve to real functions.
+    const configPath = join(outDir, "config.json");
+    const merge = await mergeSubpathRoutes(
+      outDir,
+      pathPrefix,
+      entries.map((e) => e.name),
+    );
+    opts.onProgress?.({
+      phase: "config-merge",
+      configPath,
+      routes: merge.routeCount,
+      created: merge.created,
+    });
+
     return {
       outDir,
       functionsRoot,
       runtime,
       pathPrefix,
       functions: entries,
+      configPath,
+      subpathRoutes: merge.routeCount,
       durationMs: performance.now() - startedAt,
     };
   } finally {
@@ -467,6 +633,14 @@ export async function runVercelBuild(args: string[]): Promise<number> {
               fmt(event.bytes)
             } (maxDuration ${event.maxDuration}s)`,
           );
+        } else if (event.phase === "config-merge") {
+          console.log(
+            `[1tube vercel-build] ${
+              event.created ? "wrote" : "merged"
+            } ${event.routes} sub-path route(s) into ${event.configPath}`,
+          );
+        } else if (event.phase === "capture-warning") {
+          console.warn(`[1tube vercel-build] ${event.message}`);
         }
       },
     });
@@ -504,8 +678,9 @@ Options:
                              (default: ${DEFAULT_ESBUILD_TARGET})
       --path-prefix <p>      Route prefix under functions/ (default: functions/v1)
       --runtime <id>         Vercel runtime (default: nodejs24.x)
-      --max-duration <s>     Fallback maxDuration seconds when no 1tube.json
-                             timeoutMs is set (default: 800)
+      --max-duration <s>     Fallback maxDuration seconds when a function
+                             declares no timeoutMs via serve()/1tube.json
+                             (default: 800)
       --max-duration-cap <s> Hard cap for maxDuration seconds (default: 800)
       --config <path>        Explicit deno.json path for the import map.
                              Default: auto-detect cwd/deno.json[c] then

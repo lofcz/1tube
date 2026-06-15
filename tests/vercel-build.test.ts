@@ -121,6 +121,65 @@ Deno.test(
 );
 
 Deno.test(
+  "buildVercel derives maxDuration from a declared serve({ timeoutMs }) and overrides the manifest",
+  TEST_OPTS,
+  async () => {
+    // Faithful to `_shared/handler.ts`: register against the gateway registry
+    // when present (the capture path), else fall back to Deno.serve (the
+    // bundled-runtime path). No bare imports, so it bundles + imports offline.
+    const serveLike = (timeoutMs: number) =>
+      `const reg = (globalThis as any).__edgeFunctionRegistry;
+const handler = () => new Response("ok");
+if (reg) reg.register(handler, { public: true, timeoutMs: ${timeoutMs} });
+else Deno.serve(handler);
+`;
+    const dir = await Deno.makeTempDir({ prefix: "1tube-vercel-declared-" });
+    const out = await tmpOutDir("declared");
+    try {
+      await Deno.writeTextFile(
+        join(dir, "deno.json"),
+        JSON.stringify({ imports: {} }),
+      );
+      // declared-only: serve() timeout, no manifest -> 45s.
+      await Deno.mkdir(join(dir, "declared-only"), { recursive: true });
+      await Deno.writeTextFile(
+        join(dir, "declared-only", "index.ts"),
+        serveLike(45_000),
+      );
+      // override: serve() timeout (30s) wins over a 1tube.json timeout (300s).
+      await Deno.mkdir(join(dir, "override"), { recursive: true });
+      await Deno.writeTextFile(
+        join(dir, "override", "index.ts"),
+        serveLike(30_000),
+      );
+      await Deno.writeTextFile(
+        join(dir, "override", "1tube.json"),
+        JSON.stringify({ timeoutMs: 300_000 }),
+      );
+
+      const result = await buildVercel({
+        functionsDir: dir,
+        outDir: out,
+        configPath: join(dir, "deno.json"),
+        only: ["declared-only", "override"],
+        sourcemap: false,
+        defaultMaxDuration: 123,
+      });
+
+      const declaredOnly = result.functions.find((f) =>
+        f.name === "declared-only"
+      )!;
+      const override = result.functions.find((f) => f.name === "override")!;
+      assertEquals(declaredOnly.maxDuration, 45);
+      assertEquals(override.maxDuration, 30);
+    } finally {
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
   "buildVercel honours a custom path prefix and runtime",
   TEST_OPTS,
   async () => {
@@ -141,6 +200,140 @@ Deno.test(
       assert(await exists(funcDir));
       const vc = await readJson(join(funcDir, ".vc-config.json"));
       assertEquals(vc.runtime, "nodejs20.x");
+
+      // The sub-path rewrite uses the custom prefix too.
+      const config = await readJson(join(out, "config.json"));
+      const routes = config.routes as Array<Record<string, unknown>>;
+      assert(
+        routes.some((r) =>
+          r.src === "^/api/edge/hello/.*$" && r.dest === "/api/edge/hello"
+        ),
+        "expected a custom-prefix sub-path route",
+      );
+    } finally {
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
+  "buildVercel writes per-function sub-path rewrite routes into config.json",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("routes");
+    try {
+      const result = await buildVercel({
+        functionsDir: PLAYGROUND,
+        outDir: out,
+        configPath: DENO_JSON,
+        only: ["hello", "echo"],
+        sourcemap: false,
+      });
+
+      assertEquals(result.subpathRoutes, 2);
+      const config = await readJson(join(out, "config.json"));
+      assertEquals(config.version, 3);
+      const routes = config.routes as Array<Record<string, unknown>>;
+
+      const hello = routes.find((r) => r.dest === "/functions/v1/hello");
+      assertEquals(hello?.src, "^/functions/v1/hello/.*$");
+      const echo = routes.find((r) => r.dest === "/functions/v1/echo");
+      assertEquals(echo?.src, "^/functions/v1/echo/.*$");
+
+      // The exact path is left to Vercel's filesystem routing — no route claims
+      // it — so the change is purely additive for sub-paths.
+      assert(
+        !routes.some((r) =>
+          typeof r.src === "string" && r.src === "^/functions/v1/hello$"
+        ),
+        "exact path must not be rewritten",
+      );
+    } finally {
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
+  "buildVercel merges sub-path routes before the filesystem handle and preserves existing routes",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("merge");
+    try {
+      // Seed a Build Output API config like `vercel build` emits: a continue
+      // header route, the filesystem marker, then a SPA fallback rewrite.
+      await Deno.mkdir(out, { recursive: true });
+      const seeded = {
+        version: 3,
+        routes: [
+          {
+            src: "^/assets/(.*)$",
+            headers: { "cache-control": "max-age=1" },
+            continue: true,
+          },
+          { handle: "filesystem" },
+          { src: "^/((?!functions/).*)$", dest: "/index.html" },
+        ],
+      };
+      await Deno.writeTextFile(
+        join(out, "config.json"),
+        JSON.stringify(seeded),
+      );
+
+      const result = await buildVercel({
+        functionsDir: PLAYGROUND,
+        outDir: out,
+        configPath: DENO_JSON,
+        only: ["hello", "echo"],
+        sourcemap: false,
+      });
+      assertEquals(result.subpathRoutes, 2);
+
+      const config = await readJson(join(out, "config.json"));
+      const routes = config.routes as Array<Record<string, unknown>>;
+      const headerIdx = routes.findIndex((r) => r.src === "^/assets/(.*)$");
+      const handleIdx = routes.findIndex((r) => r.handle === "filesystem");
+      const helloIdx = routes.findIndex((r) => r.dest === "/functions/v1/hello");
+      const echoIdx = routes.findIndex((r) => r.dest === "/functions/v1/echo");
+
+      // Our routes land in the main phase: after the header route, before the
+      // filesystem marker.
+      assert(headerIdx >= 0 && handleIdx > headerIdx);
+      assert(helloIdx > headerIdx && helloIdx < handleIdx);
+      assert(echoIdx > headerIdx && echoIdx < handleIdx);
+      // The pre-existing SPA fallback survives after the filesystem marker.
+      assert(
+        routes.some((r) => r.dest === "/index.html"),
+        "SPA fallback must be preserved",
+      );
+    } finally {
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
+  "buildVercel sub-path route merge is idempotent across re-runs",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("idem");
+    try {
+      const opts = {
+        functionsDir: PLAYGROUND,
+        outDir: out,
+        configPath: DENO_JSON,
+        only: ["hello", "echo"],
+        sourcemap: false,
+      } as const;
+      await buildVercel(opts);
+      await buildVercel(opts);
+
+      const config = await readJson(join(out, "config.json"));
+      const routes = config.routes as Array<Record<string, unknown>>;
+      const hello = routes.filter((r) => r.dest === "/functions/v1/hello");
+      const echo = routes.filter((r) => r.dest === "/functions/v1/echo");
+      assertEquals(hello.length, 1);
+      assertEquals(echo.length, 1);
     } finally {
       await Deno.remove(out, { recursive: true }).catch(() => {});
     }
