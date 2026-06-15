@@ -47,8 +47,12 @@ import { resolveDenoConfigPath } from "./deno-config.ts";
 const DEFAULT_RUNTIME = "nodejs24.x";
 /** Default route prefix; matches sciobot's `/functions/v1/<name>` calls. */
 const DEFAULT_PATH_PREFIX = "functions/v1";
-/** Default function timeout (seconds) when no `1tube.json` timeoutMs is set. */
-const DEFAULT_MAX_DURATION = 300;
+/**
+ * Default function timeout (seconds) when no `1tube.json` timeoutMs is set.
+ * Defaults to the cap so long-running AI pipelines aren't silently truncated
+ * unless a function opts into a shorter timeout via its manifest.
+ */
+const DEFAULT_MAX_DURATION = 800;
 /** Upper bound for maxDuration (seconds). Fluid/Pro allows long durations. */
 const DEFAULT_MAX_DURATION_CAP = 800;
 
@@ -325,7 +329,7 @@ export async function buildVercel(
  *   --minify               minify bundles
  *   --path-prefix <p>      route prefix under functions/ (default functions/v1)
  *   --runtime <id>         Vercel runtime (default nodejs24.x)
- *   --max-duration <s>     fallback maxDuration seconds (default 300)
+ *   --max-duration <s>     fallback maxDuration seconds (default 800)
  *   --max-duration-cap <s> hard cap for maxDuration (default 800)
  *   --config <path>        explicit deno.json path
  *   --no-config            skip the import map
@@ -501,7 +505,7 @@ Options:
       --path-prefix <p>      Route prefix under functions/ (default: functions/v1)
       --runtime <id>         Vercel runtime (default: nodejs24.x)
       --max-duration <s>     Fallback maxDuration seconds when no 1tube.json
-                             timeoutMs is set (default: 300)
+                             timeoutMs is set (default: 800)
       --max-duration-cap <s> Hard cap for maxDuration seconds (default: 800)
       --config <path>        Explicit deno.json path for the import map.
                              Default: auto-detect cwd/deno.json[c] then
