@@ -9,7 +9,9 @@ interface Props {
   autoComplete?: string;
 }
 
-export function ApiKeyInput({ id, value, onChange, placeholder, autoComplete }: Props) {
+export function ApiKeyInput(
+  { id, value, onChange, placeholder, autoComplete }: Props,
+) {
   const [reveal, setReveal] = useState(false);
   return (
     <div className="key-input">

@@ -134,7 +134,8 @@ export function parseManifest(raw: unknown, fromFile = true): FunctionManifest {
   base.recycle = {
     maxRequests: asPositiveInt(recycle.maxRequests) ?? 0,
     errorRate: asRatio(recycle.errorRate, DEFAULT_RECYCLE.errorRate),
-    errorWindow: asPositiveInt(recycle.errorWindow) ?? DEFAULT_RECYCLE.errorWindow,
+    errorWindow: asPositiveInt(recycle.errorWindow) ??
+      DEFAULT_RECYCLE.errorWindow,
     cooldownMs: asPositiveInt(recycle.cooldownMs) ?? DEFAULT_RECYCLE.cooldownMs,
   };
 

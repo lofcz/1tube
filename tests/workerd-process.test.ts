@@ -20,7 +20,12 @@
  * cannot influence from userland.
  */
 
-import { assert, assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+} from "@std/assert";
 import { join } from "node:path";
 import {
   createWorkerdProcess,
@@ -99,7 +104,9 @@ async function withFakeWorkerd<T>(
   try {
     return await fn(path);
   } finally {
-    try { await Deno.remove(dir, { recursive: true }); } catch { /* */ }
+    try {
+      await Deno.remove(dir, { recursive: true });
+    } catch { /* */ }
   }
 }
 
@@ -138,7 +145,11 @@ Deno.test("workerd-process: isCompatDateAtMost compares lexicographically", () =
 Deno.test("workerd-process: parseVersionOutput rejects garbage", () => {
   for (const bad of ["", "not-workerd\nfoo", "node v22.0.0"]) {
     let threw = false;
-    try { parseVersionOutput(bad); } catch { threw = true; }
+    try {
+      parseVersionOutput(bad);
+    } catch {
+      threw = true;
+    }
     assert(threw, `expected throw for ${JSON.stringify(bad)}`);
   }
 });
@@ -156,7 +167,11 @@ Deno.test("workerd-process: waitForPorts succeeds when a listener is up", async 
 Deno.test("workerd-process: waitForPorts times out when nothing listens", async () => {
   const [port] = await freePorts(1);
   await assertRejects(
-    () => waitForPorts([{ host: "127.0.0.1", port }], { timeoutMs: 200, intervalMs: 25 }),
+    () =>
+      waitForPorts([{ host: "127.0.0.1", port }], {
+        timeoutMs: 200,
+        intervalMs: 25,
+      }),
     Error,
     "not reachable",
   );
@@ -191,7 +206,10 @@ Deno.test("workerd-process: waitForPorts returns once *all* ports are up", async
       { timeoutMs: 5_000, intervalMs: 25 },
     );
     const elapsed = performance.now() - start;
-    assert(elapsed >= 150, `should have waited for slow listener, took ${elapsed}ms`);
+    assert(
+      elapsed >= 150,
+      `should have waited for slow listener, took ${elapsed}ms`,
+    );
   } finally {
     clearTimeout(delay);
     la.close();
@@ -199,24 +217,111 @@ Deno.test("workerd-process: waitForPorts returns once *all* ports are up", async
   }
 });
 
-Deno.test("workerd-process: lifecycle waits for sockets, then stops cleanly", PROC_TEST, async () => {
-  await withFakeWorkerd(async (fakeScript) => {
+Deno.test(
+  "workerd-process: lifecycle waits for sockets, then stops cleanly",
+  PROC_TEST,
+  async () => {
+    await withFakeWorkerd(async (fakeScript) => {
+      const [port] = await freePorts(1);
+      const tmpDir = await Deno.makeTempDir({ prefix: "1tube-proc-life-" });
+      try {
+        const capnpPath = join(tmpDir, "config.capnp");
+        // Fake-workerd only inspects `address = "..."` patterns.
+        await Deno.writeTextFile(capnpPath, `address = "127.0.0.1:${port}"\n`);
+
+        const lines: string[] = [];
+        const proc = createWorkerdProcess({
+          binary: Deno.execPath(),
+          capnpPath,
+          // deno run ... fake.ts -- serve <capnp>
+          // Manager appends `serve <capnp>` after globalArgs, so the `--`
+          // sentinel correctly marks where deno's CLI args end and the
+          // script's argv begins.
+          globalArgs: [
+            "run",
+            "--quiet",
+            "--allow-net",
+            "--allow-read",
+            fakeScript,
+            "--",
+          ],
+          routes: [{
+            name: "x",
+            service: "x",
+            address: "127.0.0.1",
+            port,
+            origin: `http://127.0.0.1:${port}`,
+          }],
+          logLineSink: (l) => lines.push(l),
+          readyTimeoutMs: 10_000,
+          probeIntervalMs: 25,
+          shutdownTimeoutMs: 1_500,
+        });
+
+        let exitCode: number | null | undefined;
+        let exitExpected: boolean | undefined;
+        proc.onExit((code, expected) => {
+          exitCode = code;
+          exitExpected = expected;
+        });
+
+        await proc.start();
+        assert(proc.pid !== null, "pid should be set after start()");
+
+        // Listener was inspected via TCP probe, but verify we can still
+        // open and close a fresh connection — the fake's accept loop
+        // immediately closes, which is exactly the readiness contract.
+        const probe = await Deno.connect({ hostname: "127.0.0.1", port });
+        probe.close();
+
+        // The fake printed both stderr ("info: Listening on ...") and
+        // stdout ("fake workerd ready") lines; both must arrive at the
+        // sink, with the manager's pumps preserving line boundaries.
+        // Wait briefly for pumps to drain initial output.
+        await new Promise((r) => setTimeout(r, 100));
+        const joined = lines.join("\n");
+        assertStringIncludes(joined, "Listening on 127.0.0.1:");
+        assertStringIncludes(joined, "fake workerd ready");
+
+        await proc.stop();
+
+        assertEquals(
+          exitExpected,
+          true,
+          "expected flag should be true after voluntary stop",
+        );
+        // exitCode varies per platform/signal — just confirm it fired.
+        assert(typeof exitCode === "number" || exitCode === null);
+
+        // Idempotency: second stop is a no-op, never throws.
+        await proc.stop();
+      } finally {
+        try {
+          await Deno.remove(tmpDir, { recursive: true });
+        } catch { /* */ }
+      }
+    });
+  },
+);
+
+Deno.test(
+  "workerd-process: start() throws when child exits before ready",
+  PROC_TEST,
+  async () => {
+    // Use deno itself with no script — exits immediately with code 1
+    // because no subcommand. The manager's exit-watch must abort the
+    // readiness probe and surface a useful error.
     const [port] = await freePorts(1);
-    const tmpDir = await Deno.makeTempDir({ prefix: "1tube-proc-life-" });
+    const tmpDir = await Deno.makeTempDir({ prefix: "1tube-proc-crash-" });
     try {
       const capnpPath = join(tmpDir, "config.capnp");
-      // Fake-workerd only inspects `address = "..."` patterns.
       await Deno.writeTextFile(capnpPath, `address = "127.0.0.1:${port}"\n`);
 
-      const lines: string[] = [];
       const proc = createWorkerdProcess({
         binary: Deno.execPath(),
         capnpPath,
-        // deno run ... fake.ts -- serve <capnp>
-        // Manager appends `serve <capnp>` after globalArgs, so the `--`
-        // sentinel correctly marks where deno's CLI args end and the
-        // script's argv begins.
-        globalArgs: ["run", "--quiet", "--allow-net", "--allow-read", fakeScript, "--"],
+        // `--no-such-flag` makes deno exit immediately with non-zero.
+        globalArgs: ["--no-such-flag"],
         routes: [{
           name: "x",
           service: "x",
@@ -224,111 +329,53 @@ Deno.test("workerd-process: lifecycle waits for sockets, then stops cleanly", PR
           port,
           origin: `http://127.0.0.1:${port}`,
         }],
-        logLineSink: (l) => lines.push(l),
+        logLineSink: () => {},
         readyTimeoutMs: 10_000,
         probeIntervalMs: 25,
-        shutdownTimeoutMs: 1_500,
+        shutdownTimeoutMs: 500,
       });
 
-      let exitCode: number | null | undefined;
-      let exitExpected: boolean | undefined;
+      let unexpectedExitCode: number | null = null;
       proc.onExit((code, expected) => {
-        exitCode = code;
-        exitExpected = expected;
+        if (!expected) unexpectedExitCode = code;
       });
 
-      await proc.start();
-      assert(proc.pid !== null, "pid should be set after start()");
+      const err = await assertRejects(
+        () => proc.start(),
+        Error,
+        "exited before sockets became ready",
+      );
+      assertStringIncludes(err.message, "command=");
+      assertStringIncludes(err.message, "capnp=");
+      assertStringIncludes(err.message, "routes=1");
+      assertStringIncludes(err.message, "exitCode=");
 
-      // Listener was inspected via TCP probe, but verify we can still
-      // open and close a fresh connection — the fake's accept loop
-      // immediately closes, which is exactly the readiness contract.
-      const probe = await Deno.connect({ hostname: "127.0.0.1", port });
-      probe.close();
-
-      // The fake printed both stderr ("info: Listening on ...") and
-      // stdout ("fake workerd ready") lines; both must arrive at the
-      // sink, with the manager's pumps preserving line boundaries.
-      // Wait briefly for pumps to drain initial output.
-      await new Promise((r) => setTimeout(r, 100));
-      const joined = lines.join("\n");
-      assertStringIncludes(joined, "Listening on 127.0.0.1:");
-      assertStringIncludes(joined, "fake workerd ready");
-
-      await proc.stop();
-
-      assertEquals(exitExpected, true, "expected flag should be true after voluntary stop");
-      // exitCode varies per platform/signal — just confirm it fired.
-      assert(typeof exitCode === "number" || exitCode === null);
-
-      // Idempotency: second stop is a no-op, never throws.
-      await proc.stop();
+      assert(
+        unexpectedExitCode !== null || unexpectedExitCode === 0,
+        "exit listener should have fired with the early-exit code",
+      );
     } finally {
-      try { await Deno.remove(tmpDir, { recursive: true }); } catch { /* */ }
+      try {
+        await Deno.remove(tmpDir, { recursive: true });
+      } catch { /* */ }
     }
-  });
-});
+  },
+);
 
-Deno.test("workerd-process: start() throws when child exits before ready", PROC_TEST, async () => {
-  // Use deno itself with no script — exits immediately with code 1
-  // because no subcommand. The manager's exit-watch must abort the
-  // readiness probe and surface a useful error.
-  const [port] = await freePorts(1);
-  const tmpDir = await Deno.makeTempDir({ prefix: "1tube-proc-crash-" });
-  try {
-    const capnpPath = join(tmpDir, "config.capnp");
-    await Deno.writeTextFile(capnpPath, `address = "127.0.0.1:${port}"\n`);
-
-    const proc = createWorkerdProcess({
-      binary: Deno.execPath(),
-      capnpPath,
-      // `--no-such-flag` makes deno exit immediately with non-zero.
-      globalArgs: ["--no-such-flag"],
-      routes: [{
-        name: "x",
-        service: "x",
-        address: "127.0.0.1",
-        port,
-        origin: `http://127.0.0.1:${port}`,
-      }],
-      logLineSink: () => {},
-      readyTimeoutMs: 10_000,
-      probeIntervalMs: 25,
-      shutdownTimeoutMs: 500,
-    });
-
-    let unexpectedExitCode: number | null = null;
-    proc.onExit((code, expected) => {
-      if (!expected) unexpectedExitCode = code;
-    });
-
-    const err = await assertRejects(
-      () => proc.start(),
-      Error,
-      "exited before sockets became ready",
-    );
-    assertStringIncludes(err.message, "command=");
-    assertStringIncludes(err.message, "capnp=");
-    assertStringIncludes(err.message, "routes=1");
-    assertStringIncludes(err.message, "exitCode=");
-
-    assert(unexpectedExitCode !== null || unexpectedExitCode === 0,
-      "exit listener should have fired with the early-exit code");
-  } finally {
-    try { await Deno.remove(tmpDir, { recursive: true }); } catch { /* */ }
-  }
-});
-
-Deno.test("workerd-process: probeVersion against real workerd if available", PROC_TEST, async () => {
-  // Opportunistic — confirms the host's installed workerd's --version
-  // output parses through our regex unchanged.
-  const candidate = Deno.env.get("1TUBE_WORKERD_BIN") ?? "workerd";
-  try {
-    const info = await probeVersion(candidate);
-    assert(info.version.length > 0);
-    assertStringIncludes(info.raw.toLowerCase(), "workerd");
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(`[skipped: real workerd not on PATH] ${msg}`);
-  }
-});
+Deno.test(
+  "workerd-process: probeVersion against real workerd if available",
+  PROC_TEST,
+  async () => {
+    // Opportunistic — confirms the host's installed workerd's --version
+    // output parses through our regex unchanged.
+    const candidate = Deno.env.get("1TUBE_WORKERD_BIN") ?? "workerd";
+    try {
+      const info = await probeVersion(candidate);
+      assert(info.version.length > 0);
+      assertStringIncludes(info.raw.toLowerCase(), "workerd");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`[skipped: real workerd not on PATH] ${msg}`);
+    }
+  },
+);

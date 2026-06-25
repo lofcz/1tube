@@ -7,11 +7,7 @@
  */
 
 import type { Context, Hono } from "npm:hono@4";
-import type {
-  InvocationErrorKind,
-  LogLevel,
-  LogSource,
-} from "./writer.ts";
+import type { InvocationErrorKind, LogLevel, LogSource } from "./writer.ts";
 import type { InvocationFilter, LogQuery, LogSearchFilter } from "./query.ts";
 
 const ERROR_KINDS: ReadonlySet<string> = new Set([

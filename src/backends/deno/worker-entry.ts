@@ -62,10 +62,16 @@ interface SharedCallResultMessage {
 
 type HostMessage = InitMessage | DispatchMessage | SharedCallResultMessage;
 
-type Handler = (req: Request, auth?: AuthContext) => Response | Promise<Response>;
+type Handler = (
+  req: Request,
+  auth?: AuthContext,
+) => Response | Promise<Response>;
 
 interface RegistryStub {
-  register(handler: Handler, opts: { public: boolean; timeoutMs?: number }): void;
+  register(
+    handler: Handler,
+    opts: { public: boolean; timeoutMs?: number },
+  ): void;
 }
 
 interface CapturedHandler {
@@ -93,13 +99,23 @@ let initDone = false;
 const invocationContext = new AsyncLocalStorage<{ invocationId?: string }>();
 
 type ConsoleLevel = "debug" | "log" | "info" | "warn" | "error";
-const CONSOLE_LEVELS: ConsoleLevel[] = ["debug", "log", "info", "warn", "error"];
+const CONSOLE_LEVELS: ConsoleLevel[] = [
+  "debug",
+  "log",
+  "info",
+  "warn",
+  "error",
+];
 const MAX_CONSOLE_MESSAGE = 8 * 1024;
 
 function formatConsoleArg(arg: unknown): string {
   if (typeof arg === "string") return arg;
   try {
-    return Deno.inspect(arg, { depth: 4, colors: false, strAbbreviateSize: 4096 });
+    return Deno.inspect(arg, {
+      depth: 4,
+      colors: false,
+      strAbbreviateSize: 4096,
+    });
   } catch {
     try {
       return String(arg);
@@ -178,7 +194,9 @@ const stub: RegistryStub = {
       // The function called serve() twice. Last write wins, matching the
       // in-process registry's behaviour. Surface a warning so authors notice
       // the bug.
-      console.warn(`[1tube] "${functionName}" called serve() twice; using the last handler`);
+      console.warn(
+        `[1tube] "${functionName}" called serve() twice; using the last handler`,
+      );
     }
     captured = {
       handler,
@@ -188,8 +206,8 @@ const stub: RegistryStub = {
   },
 };
 
-(globalThis as { __edgeFunctionRegistry?: RegistryStub }).__edgeFunctionRegistry =
-  stub;
+(globalThis as { __edgeFunctionRegistry?: RegistryStub })
+  .__edgeFunctionRegistry = stub;
 
 self.addEventListener("unhandledrejection", (e) => {
   e.preventDefault();
@@ -221,7 +239,8 @@ async function runDispatch(msg: DispatchMessage): Promise<void> {
     postMessage({
       type: "response_error",
       id: msg.id,
-      message: `Function "${functionName}" did not call serve() before dispatch`,
+      message:
+        `Function "${functionName}" did not call serve() before dispatch`,
     });
     return;
   }

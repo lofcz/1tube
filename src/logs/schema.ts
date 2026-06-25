@@ -29,12 +29,7 @@
  * so the alias always resolves at runtime.
  */
 
-import {
-  index,
-  integer,
-  sqliteTable,
-  text,
-} from "drizzle-orm/sqlite-core";
+import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 /**
  * One row per function invocation that reached the dispatcher (i.e.

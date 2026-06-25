@@ -7,13 +7,12 @@ export function Settings() {
     <section className="card">
       <h1>API keys</h1>
       <p className="dim">
-        Stored in your browser's <code>localStorage</code>. They never leave
-        this tab except as auth headers on requests to each provider's API.
+        Stored in your browser's{" "}
+        <code>localStorage</code>. They never leave this tab except as auth
+        headers on requests to each provider's API.
       </p>
       <div className="provider-list">
-        {PROVIDERS.map((p) => (
-          <ProviderRow key={p.id} provider={p} />
-        ))}
+        {PROVIDERS.map((p) => <ProviderRow key={p.id} provider={p} />)}
       </div>
     </section>
   );
@@ -25,7 +24,12 @@ function ProviderRow({ provider }: { provider: (typeof PROVIDERS)[number] }) {
     <div className="provider-row">
       <div className="provider-row-head">
         <label htmlFor={`key-${provider.id}`}>{provider.label}</label>
-        <a href={provider.consoleUrl} target="_blank" rel="noreferrer" className="dim">
+        <a
+          href={provider.consoleUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="dim"
+        >
           get a key →
         </a>
       </div>

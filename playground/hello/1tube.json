@@ -1,8 +1,8 @@
 {
   "permissions": {
-    "net":   ["api.ipify.org"],
-    "env":   [],
-    "read":  [],
+    "net": ["api.ipify.org"],
+    "env": [],
+    "read": [],
     "write": []
   },
   "memoryMB": 64,

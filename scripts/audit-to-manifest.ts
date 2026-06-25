@@ -318,7 +318,10 @@ async function readExistingManifest(
     return {
       ...defaultManifest(),
       ...parsed,
-      permissions: { ...defaultManifest().permissions, ...(parsed.permissions ?? {}) },
+      permissions: {
+        ...defaultManifest().permissions,
+        ...(parsed.permissions ?? {}),
+      },
       fromFile: true,
     } as FunctionManifest;
   } catch {

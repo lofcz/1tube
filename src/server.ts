@@ -1697,8 +1697,8 @@ app.all(routeDispatchPattern(), async (c) => {
     // Edge Runtime behaviour. Without this strip, hello/echo see the
     // gateway prefix in their `new URL(req.url).pathname`.
     const originalUrl = new URL(c.req.raw.url);
-    const rewrittenPath =
-      stripRoutePrefixFromPathname(originalUrl.pathname) || "/";
+    const rewrittenPath = stripRoutePrefixFromPathname(originalUrl.pathname) ||
+      "/";
     const rewrittenUrl = new URL(
       rewrittenPath + originalUrl.search,
       originalUrl.origin,
@@ -1853,7 +1853,10 @@ app.all(routeDispatchPattern(), async (c) => {
         message: failure?.error ?? "function failed to load",
       });
       return c.json(
-        { error: `Function "${name}" failed to load`, reason: "function_boot_failed" },
+        {
+          error: `Function "${name}" failed to load`,
+          reason: "function_boot_failed",
+        },
         503,
       );
     }

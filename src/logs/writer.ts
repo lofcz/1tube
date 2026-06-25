@@ -321,7 +321,9 @@ export function createLogWriter(opts: LogWriterOptions): LogWriter {
     db.exec("PRAGMA busy_timeout = 250");
     try {
       db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-    } catch { /* reader held the lock; WAL is folded on a later pass */ } finally {
+    } catch {
+      /* reader held the lock; WAL is folded on a later pass */
+    } finally {
       db.exec("PRAGMA busy_timeout = 5000");
     }
   }

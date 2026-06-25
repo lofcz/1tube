@@ -6,7 +6,9 @@
   "description": "Scans standard WER folders + ${DiagDir}/wer-dumps for recent .dmp / Report.wer files. Empty result => WER dump collection is disabled for this identity (see enable-wer-dumps).",
   "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
   "args": [
-    "-NoProfile", "-NonInteractive", "-Command",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
     "$ErrorActionPreference='Continue'; $paths = @(\"$env:LOCALAPPDATA\\CrashDumps\", \"$env:USERPROFILE\\AppData\\Local\\CrashDumps\", '${DiagDir}\\wer-dumps', 'C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportArchive', 'C:\\ProgramData\\Microsoft\\Windows\\WER\\ReportQueue'); foreach ($p in $paths) { Write-Host \"== $p ==\"; if (Test-Path $p) { $items = Get-ChildItem $p -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'workerd|\\.dmp$|Report\\.wer' } | Sort-Object LastWriteTime -Descending | Select-Object -First 20; if ($items) { $items | Format-Table FullName, Length, LastWriteTime -AutoSize | Out-String } else { 'no matching files' } } else { 'not present' } }"
   ],
   "timeoutSec": 10

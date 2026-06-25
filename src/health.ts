@@ -44,7 +44,9 @@ export function readConstrainedMemoryBytes(): number | null {
 }
 
 /** Test-only: stub the memory cap reader. */
-export function _setConstrainedMemoryReaderForTests(fn: MemoryReader | null): void {
+export function _setConstrainedMemoryReaderForTests(
+  fn: MemoryReader | null,
+): void {
   _memReader = fn ?? realReader;
 }
 

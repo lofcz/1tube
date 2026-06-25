@@ -30,7 +30,9 @@ function randomToken(): string {
 
 async function readJson(req: Request): Promise<Record<string, unknown>> {
   const body = await req.json();
-  return body && typeof body === "object" ? body as Record<string, unknown> : {};
+  return body && typeof body === "object"
+    ? body as Record<string, unknown>
+    : {};
 }
 
 /**
@@ -45,15 +47,18 @@ export async function startWorkerdSharedRuntime(
 
   const loaded = new Map<string, Record<string, unknown>>();
   for (const module of modules) {
-    const exports = await import(pathToFileURL(module.bundlePath).href) as Record<string, unknown>;
+    const exports = await import(
+      pathToFileURL(module.bundlePath).href
+    ) as Record<string, unknown>;
     for (const name of module.exportNames) {
       if (typeof exports[name] !== "function") {
-        throw new Error(`shared module ${module.bundlePath} does not export function ${name}()`);
+        throw new Error(
+          `shared module ${module.bundlePath} does not export function ${name}()`,
+        );
       }
     }
     loaded.set(module.id, exports);
   }
-
 
   const token = randomToken();
   const server = Deno.serve({
@@ -73,7 +78,9 @@ export async function startWorkerdSharedRuntime(
         const exports = loaded.get(decodeURIComponent(moduleId));
         if (!exports) return json({ error: "unknown shared module" }, 404);
         const fn = exports[decodeURIComponent(exportName)];
-        if (typeof fn !== "function") return json({ error: "unknown shared export" }, 404);
+        if (typeof fn !== "function") {
+          return json({ error: "unknown shared export" }, 404);
+        }
         const body = await readJson(req);
         const args = Array.isArray(body.args) ? body.args : [];
         return json({ value: await fn(...args) });

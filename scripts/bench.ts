@@ -46,10 +46,13 @@ function parseArgs(): BenchOpts {
   let warmup = 200;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if ((a === "-n" || a === "--total") && args[i + 1]) total = parseInt(args[++i], 10);
-    else if ((a === "-c" || a === "--concurrency") && args[i + 1]) concurrency = parseInt(args[++i], 10);
-    else if (a === "--warmup" && args[i + 1]) warmup = parseInt(args[++i], 10);
-    else if (a === "--backend" && args[i + 1]) {
+    if ((a === "-n" || a === "--total") && args[i + 1]) {
+      total = parseInt(args[++i], 10);
+    } else if ((a === "-c" || a === "--concurrency") && args[i + 1]) {
+      concurrency = parseInt(args[++i], 10);
+    } else if (a === "--warmup" && args[i + 1]) {
+      warmup = parseInt(args[++i], 10);
+    } else if (a === "--backend" && args[i + 1]) {
       const v = args[++i];
       if (v !== "deno" && v !== "workerd") {
         console.error(`--backend must be 'deno' or 'workerd'`);
@@ -72,7 +75,9 @@ async function waitForGateway(port: number, timeoutMs: number): Promise<void> {
   const deadline = performance.now() + timeoutMs;
   while (performance.now() < deadline) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/`, { cache: "no-store" });
+      const res = await fetch(`http://127.0.0.1:${port}/`, {
+        cache: "no-store",
+      });
       await res.body?.cancel();
       if (res.status > 0) return;
     } catch {
@@ -80,7 +85,9 @@ async function waitForGateway(port: number, timeoutMs: number): Promise<void> {
     }
     await new Promise((r) => setTimeout(r, 100));
   }
-  throw new Error(`gateway on :${port} did not become ready within ${timeoutMs}ms`);
+  throw new Error(
+    `gateway on :${port} did not become ready within ${timeoutMs}ms`,
+  );
 }
 
 interface RunResult {
@@ -129,7 +136,12 @@ async function runOne(
   });
   await Promise.all(workers);
 
-  return { samples, errors, durationMs: performance.now() - start, firstBadStatus };
+  return {
+    samples,
+    errors,
+    durationMs: performance.now() - start,
+    firstBadStatus,
+  };
 }
 
 function pct(samples: number[], q: number): number {
@@ -139,7 +151,10 @@ function pct(samples: number[], q: number): number {
   const sorted = [...samples].sort((a, b) => a - b);
   // Nearest-rank percentile — same definition wrk and oha use, which
   // makes our output directly comparable to those tools' reports.
-  const rank = Math.min(sorted.length - 1, Math.ceil((q / 100) * sorted.length) - 1);
+  const rank = Math.min(
+    sorted.length - 1,
+    Math.ceil((q / 100) * sorted.length) - 1,
+  );
   return sorted[Math.max(0, rank)];
 }
 
@@ -209,7 +224,10 @@ async function spawnGateway(
         // gateway prints `[1tube]` banners + workerd's own logs.
         for (const line of text.split(/\r?\n/)) {
           if (!line) continue;
-          if (line.includes("[1tube]") || line.includes("[workerd]") || line.includes("[rate-debug]")) {
+          if (
+            line.includes("[1tube]") || line.includes("[workerd]") ||
+            line.includes("[rate-debug]")
+          ) {
             console.log(`   ⏵ ${line}`);
           }
         }
@@ -225,7 +243,10 @@ async function spawnGateway(
         const text = dec.decode(value);
         for (const line of text.split(/\r?\n/)) {
           if (!line) continue;
-          if (line.includes("[1tube]") || line.includes("[workerd]") || line.includes("[rate-debug]")) {
+          if (
+            line.includes("[1tube]") || line.includes("[workerd]") ||
+            line.includes("[rate-debug]")
+          ) {
             console.log(`   ⏵ ${line}`);
           }
         }
@@ -235,14 +256,18 @@ async function spawnGateway(
   const drain = Promise.all([drainErr, drainOut]);
 
   const teardown = async () => {
-    try { child.kill(Deno.build.os === "windows" ? "SIGKILL" : "SIGTERM"); } catch { /* */ }
+    try {
+      child.kill(Deno.build.os === "windows" ? "SIGKILL" : "SIGTERM");
+    } catch { /* */ }
     try {
       await Promise.race([
         child.status,
         new Promise((r) => setTimeout(r, 5_000)),
       ]);
     } catch { /* */ }
-    try { child.kill("SIGKILL"); } catch { /* */ }
+    try {
+      child.kill("SIGKILL");
+    } catch { /* */ }
     await drain.catch(() => {});
   };
 
@@ -298,7 +323,9 @@ async function benchBackend(
   try {
     // Workerd needs longer to boot because it bundles every fixture.
     await waitForGateway(port, backend === "workerd" ? 60_000 : 15_000);
-    console.log(`ready · warmup=${opts.warmup} timed=${opts.total} concurrency=${opts.concurrency}`);
+    console.log(
+      `ready · warmup=${opts.warmup} timed=${opts.total} concurrency=${opts.concurrency}`,
+    );
 
     for (const route of ROUTES) {
       const { url, init } = route.build(port);
@@ -306,14 +333,16 @@ async function benchBackend(
       await runOne(url, init, opts.warmup, opts.concurrency);
       // Timed sweep.
       const r = await runOne(url, init, opts.total, opts.concurrency);
-      const rps = (opts.total / (r.durationMs / 1000));
+      const rps = opts.total / (r.durationMs / 1000);
       console.log(
         `  ${route.label.padEnd(38)}  ` +
           `RPS ${rps.toFixed(0).padStart(6)}  ` +
           `p50 ${fmtMs(pct(r.samples, 50)).padStart(8)}  ` +
           `p95 ${fmtMs(pct(r.samples, 95)).padStart(8)}  ` +
           `p99 ${fmtMs(pct(r.samples, 99)).padStart(8)}  ` +
-          `errors ${r.errors}${r.firstBadStatus !== null ? `(first=${r.firstBadStatus})` : ""}`,
+          `errors ${r.errors}${
+            r.firstBadStatus !== null ? `(first=${r.firstBadStatus})` : ""
+          }`,
       );
     }
   } finally {

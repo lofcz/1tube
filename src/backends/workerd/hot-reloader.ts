@@ -45,7 +45,10 @@ export function classifyChangedPath(
   absPath: string,
 ): string | null {
   const rel = relative(resolvedFunctionsDir, absPath);
-  if (!rel || rel.startsWith("..") || rel.startsWith(SEPARATOR + "..") || rel === ".") {
+  if (
+    !rel || rel.startsWith("..") || rel.startsWith(SEPARATOR + "..") ||
+    rel === "."
+  ) {
     return null;
   }
   const first = rel.split(/[\\/]/, 1)[0];
@@ -94,14 +97,19 @@ export interface ReloadDebouncerOptions {
    * `sharedChange === true` means "reload everything"; otherwise
    * `functions` lists the changed names.
    */
-  flushFn: (changes: { sharedChange: boolean; functions: string[] }) => Promise<void>;
+  flushFn: (
+    changes: { sharedChange: boolean; functions: string[] },
+  ) => Promise<void>;
   /** Defaults to `setTimeout`/`clearTimeout`; tests inject a fake clock. */
   setTimer?: (cb: () => void, ms: number) => number;
   clearTimer?: (id: number) => void;
 }
 
-export function createReloadDebouncer(opts: ReloadDebouncerOptions): ReloadDebouncer {
-  const setTimer = opts.setTimer ?? ((cb, ms) => setTimeout(cb, ms) as unknown as number);
+export function createReloadDebouncer(
+  opts: ReloadDebouncerOptions,
+): ReloadDebouncer {
+  const setTimer = opts.setTimer ??
+    ((cb, ms) => setTimeout(cb, ms) as unknown as number);
   const clearTimer = opts.clearTimer ?? ((id) => clearTimeout(id));
 
   const pendingFunctions = new Set<string>();
@@ -207,7 +215,10 @@ export interface WorkerdHotReloaderOptions {
    * thrown here are logged but do NOT roll back the reload — the
    * new code is already live.
    */
-  onManifestsUpdated?: (manifests: ReadonlyMap<string, FunctionManifest>, result: WorkerdReloadResult) => void;
+  onManifestsUpdated?: (
+    manifests: ReadonlyMap<string, FunctionManifest>,
+    result: WorkerdReloadResult,
+  ) => void;
   /**
    * Test seam: factory for the underlying watcher. Defaults to
    * `Deno.watchFs(functionsDir, { recursive: true })`. Tests inject
@@ -232,9 +243,9 @@ export function createWorkerdHotReloader(
   opts: WorkerdHotReloaderOptions,
 ): WorkerdHotReloader {
   const log = opts.log ?? ((line) => console.log(line));
-  const watcherFactory = opts.watch ?? ((dir) =>
-    Deno.watchFs(dir, { recursive: true }) as unknown as FsEventStream
-  );
+  const watcherFactory = opts.watch ??
+    ((dir) =>
+      Deno.watchFs(dir, { recursive: true }) as unknown as FsEventStream);
 
   let stream: FsEventStream | null = null;
   let stopped = false;
@@ -262,8 +273,12 @@ export function createWorkerdHotReloader(
         if (result.rebundled.length > 0) {
           parts.push(`rebundled=${result.rebundled.join(",")}`);
         }
-        if (result.added.length > 0) parts.push(`added=${result.added.join(",")}`);
-        if (result.removed.length > 0) parts.push(`removed=${result.removed.join(",")}`);
+        if (result.added.length > 0) {
+          parts.push(`added=${result.added.join(",")}`);
+        }
+        if (result.removed.length > 0) {
+          parts.push(`removed=${result.removed.join(",")}`);
+        }
         log(
           `[1tube] HMR reload ok in ${result.durationMs.toFixed(0)}ms${
             parts.length > 0 ? ` (${parts.join("; ")})` : ""
@@ -278,7 +293,9 @@ export function createWorkerdHotReloader(
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        log(`[1tube] HMR reload FAILED — keeping previous workerd alive. Error: ${msg}`);
+        log(
+          `[1tube] HMR reload FAILED — keeping previous workerd alive. Error: ${msg}`,
+        );
       }
     },
   });

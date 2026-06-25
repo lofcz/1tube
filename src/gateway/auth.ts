@@ -146,7 +146,9 @@ async function verifyToken(token: string): Promise<JWTPayload | null> {
     );
     if (!isValid) return null;
 
-    const payload = JSON.parse(decoder.decode(base64UrlDecode(payloadB64))) as JWTPayload;
+    const payload = JSON.parse(
+      decoder.decode(base64UrlDecode(payloadB64)),
+    ) as JWTPayload;
 
     // `exp` is a NumericDate (seconds since epoch). Per RFC 7519 the token
     // MUST NOT be accepted past `exp`; we treat the second the token expires
@@ -182,7 +184,9 @@ async function verifyToken(token: string): Promise<JWTPayload | null> {
  *    want service-only access should check for `payload.role === "service_role"`
  *    (e.g. via `require: ["service_role"]`).
  */
-export async function validateRequest(req: Request): Promise<AuthContext | null> {
+export async function validateRequest(
+  req: Request,
+): Promise<AuthContext | null> {
   const token = parseBearer(req.headers.get("Authorization"));
   if (!token) return null;
 

@@ -265,7 +265,9 @@ async function mergeSubpathRoutes(
   // The exact route a function `name` maps to. Used for BOTH emit and cleanup
   // so detection can never drift from generation (e.g. a prefix with regex
   // metacharacters is escaped identically in both).
-  const routeFor = (name: string): Required<Pick<VercelRoute, "src" | "dest">> => ({
+  const routeFor = (
+    name: string,
+  ): Required<Pick<VercelRoute, "src" | "dest">> => ({
     src: `^/${prefixRe}/${escapeRegExp(name)}/.*$`,
     dest: `${destPrefix}${name}`,
   });
@@ -289,13 +291,11 @@ async function mergeSubpathRoutes(
   // Place the routes in the main phase — before the first `handle` marker — so
   // each rewrite is immediately resolved against the filesystem (the `.func`).
   const markerIdx = cleaned.findIndex((r) => typeof r.handle === "string");
-  config.routes = markerIdx === -1
-    ? [...cleaned, ...subpathRoutes]
-    : [
-      ...cleaned.slice(0, markerIdx),
-      ...subpathRoutes,
-      ...cleaned.slice(markerIdx),
-    ];
+  config.routes = markerIdx === -1 ? [...cleaned, ...subpathRoutes] : [
+    ...cleaned.slice(0, markerIdx),
+    ...subpathRoutes,
+    ...cleaned.slice(markerIdx),
+  ];
 
   await ensureDir(outDir);
   await Deno.writeTextFile(
@@ -645,7 +645,10 @@ export async function runVercelBuild(args: string[]): Promise<number> {
       },
     });
 
-    const totalBytes = result.functions.reduce((acc, f) => acc + f.byteLength, 0);
+    const totalBytes = result.functions.reduce(
+      (acc, f) => acc + f.byteLength,
+      0,
+    );
     console.log(
       `[1tube vercel-build] emitted ${result.functions.length} function(s) ` +
         `(${fmt(totalBytes)}) into ${result.functionsRoot} in ${

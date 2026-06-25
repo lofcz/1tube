@@ -17,8 +17,14 @@ import { serve } from "../_shared/handler.ts";
 serve(
   (req) => {
     const url = new URL(req.url);
-    const n = Math.min(50, Math.max(1, Number(url.searchParams.get("n") ?? "5")));
-    const gapMs = Math.min(500, Math.max(0, Number(url.searchParams.get("gap") ?? "50")));
+    const n = Math.min(
+      50,
+      Math.max(1, Number(url.searchParams.get("n") ?? "5")),
+    );
+    const gapMs = Math.min(
+      500,
+      Math.max(0, Number(url.searchParams.get("gap") ?? "50")),
+    );
 
     const enc = new TextEncoder();
     let i = 0;

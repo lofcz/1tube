@@ -13,7 +13,9 @@
   "description": "Spawn workerd minimal verbose, wait, probe loopback port. Disambiguates 'crashed' vs 'main thread fine, side thread died'.",
   "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
   "args": [
-    "-NoProfile", "-NonInteractive", "-Command",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
     "$ErrorActionPreference='Continue'; $VerbosePreference='Continue'; $w='${WorkerdPath}'; $probe='${ProbeCapnp}'; $diag='${DiagDir}'; Write-Output \"workerd: $w\"; Write-Output \"probe : $probe\"; if (-not (Test-Path $probe)) { Write-Output 'ERROR: probe capnp missing — run workerd-minimal once first to materialize it'; exit 2 }; $capnp = Get-Content $probe -Raw; if ($capnp -notmatch '127\\.0\\.0\\.1:(\\d+)') { Write-Output 'ERROR: no 127.0.0.1:PORT line found in probe capnp'; exit 3 }; $port = [int]$matches[1]; Write-Output \"port  : $port\"; $proc = Start-Process -FilePath $w -ArgumentList @('serve','--verbose',$probe) -WorkingDirectory $diag -PassThru -WindowStyle Hidden; Write-Output \"spawned PID=$($proc.Id)\"; for ($i=1; $i -le 6; $i++) { Start-Sleep -Milliseconds 500; $alive = $null -ne (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue); Write-Output \"t=+$($i*500)ms alive=$alive\"; if (-not $alive) { break } }; if ($null -ne (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) { try { $r = Invoke-WebRequest -Uri \"http://127.0.0.1:$port/\" -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop; $body = $r.Content; if ($body.Length -gt 200) { $body = $body.Substring(0,200) }; Write-Output \"HTTP status=$($r.StatusCode) body=$body\"; Write-Output 'VERDICT: workerd IS serving — std::terminate is from a side thread, NOT FATAL' } catch { Write-Output \"HTTP error: $($_.Exception.Message)\"; Write-Output 'VERDICT: workerd is alive but socket not responsive (firewall? bind failed?)' }; try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {} } else { try { $exitCode = $proc.ExitCode } catch { $exitCode = '<unknown>' }; Write-Output \"VERDICT: workerd died on its own (ExitCode=$exitCode) — same as 70ms case, just procdump it\" }"
   ],
   "cwd": "${DiagDir}",

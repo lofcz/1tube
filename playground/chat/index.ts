@@ -25,7 +25,7 @@
  */
 
 import { serve } from "../_shared/handler.ts";
-import { streamText, type ModelMessage } from "npm:ai@^6";
+import { type ModelMessage, streamText } from "npm:ai@^6";
 import { createAnthropic } from "npm:@ai-sdk/anthropic@^2";
 import { createOpenAI } from "npm:@ai-sdk/openai@^2";
 import { createGoogleGenerativeAI } from "npm:@ai-sdk/google@^2";
@@ -81,7 +81,10 @@ serve(
     if (!body.provider || !body.model || !Array.isArray(body.messages)) {
       return jsonError(400, "expected { provider, model, apiKey, messages[] }");
     }
-    if (body.provider !== "anthropic" && body.provider !== "openai" && body.provider !== "google") {
+    if (
+      body.provider !== "anthropic" && body.provider !== "openai" &&
+      body.provider !== "google"
+    ) {
       return jsonError(400, `unsupported provider: ${body.provider}`);
     }
     const apiKey = body.apiKey?.trim();

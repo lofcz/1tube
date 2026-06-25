@@ -59,7 +59,11 @@ export interface DenoSharedRuntime {
    * Invoke a function exported by a shared module. Throws if the
    * module or export is unknown, or if the export itself throws.
    */
-  call(moduleId: string, exportName: string, args: readonly unknown[]): Promise<unknown>;
+  call(
+    moduleId: string,
+    exportName: string,
+    args: readonly unknown[],
+  ): Promise<unknown>;
   /**
    * Re-import a shared module after its source file changed. Returns
    * the new record. If the export list changed, callers should

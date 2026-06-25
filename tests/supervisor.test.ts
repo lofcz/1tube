@@ -2,16 +2,18 @@
  * Tests for src/supervisor.ts.
  */
 
-import { assertEquals, assert, assertFalse } from "@std/assert";
+import { assert, assertEquals, assertFalse } from "@std/assert";
 import { FunctionSupervisor } from "../src/supervisor.ts";
 import { defaultManifest } from "../src/manifest.ts";
 
-function withRecycle(opts: Partial<{
-  errorRate: number;
-  errorWindow: number;
-  cooldownMs: number;
-  maxRequests: number;
-}>) {
+function withRecycle(
+  opts: Partial<{
+    errorRate: number;
+    errorWindow: number;
+    cooldownMs: number;
+    maxRequests: number;
+  }>,
+) {
   const m = defaultManifest();
   Object.assign(m.recycle, opts);
   return m;
@@ -19,7 +21,10 @@ function withRecycle(opts: Partial<{
 
 Deno.test("supervisor: trips breaker once errorRate is exceeded over the window", () => {
   const sup = new FunctionSupervisor();
-  sup.setManifest("fn", withRecycle({ errorRate: 0.5, errorWindow: 4, cooldownMs: 1000 }));
+  sup.setManifest(
+    "fn",
+    withRecycle({ errorRate: 0.5, errorWindow: 4, cooldownMs: 1000 }),
+  );
 
   // 4 records: 1 ok, then 3 errors → ratio 0.75 ≥ 0.5 → trip
   let tripped = false;
@@ -38,7 +43,10 @@ Deno.test("supervisor: trips breaker once errorRate is exceeded over the window"
 
 Deno.test("supervisor: breaker re-closes after cooldown elapses", () => {
   const sup = new FunctionSupervisor();
-  sup.setManifest("fn", withRecycle({ errorRate: 0.5, errorWindow: 2, cooldownMs: 50 }));
+  sup.setManifest(
+    "fn",
+    withRecycle({ errorRate: 0.5, errorWindow: 2, cooldownMs: 50 }),
+  );
 
   sup.record("fn", true);
   const trip = sup.record("fn", true);

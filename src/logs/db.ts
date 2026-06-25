@@ -24,7 +24,9 @@ import { migrate } from "npm:drizzle-orm@1.0.0-rc.3/node-sqlite/migrator";
  * gateway assets) because the `drizzle/` folder always travels next to
  * `src/`.
  */
-const MIGRATIONS_FOLDER = fileURLToPath(new URL("../../drizzle", import.meta.url));
+const MIGRATIONS_FOLDER = fileURLToPath(
+  new URL("../../drizzle", import.meta.url),
+);
 
 export interface LogDb {
   /** Synchronous low-level handle used by the hot write path. */

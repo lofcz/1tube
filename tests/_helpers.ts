@@ -7,8 +7,7 @@ import type { Context, Next } from "hono";
 const encoder = new TextEncoder();
 
 function b64url(bytes: Uint8Array | string): string {
-  const arr =
-    typeof bytes === "string" ? encoder.encode(bytes) : bytes;
+  const arr = typeof bytes === "string" ? encoder.encode(bytes) : bytes;
   let bin = "";
   for (const b of arr) bin += String.fromCharCode(b);
   return btoa(bin).replace(/=+$/g, "").replace(/\+/g, "-").replace(/\//g, "_");
@@ -54,7 +53,11 @@ export async function signJwt(
     false,
     ["sign"],
   );
-  const sigBuf = await crypto.subtle.sign("HMAC", key, encoder.encode(signingInput));
+  const sigBuf = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    encoder.encode(signingInput),
+  );
   const sigB64 = b64url(new Uint8Array(sigBuf));
 
   return `${signingInput}.${sigB64}`;

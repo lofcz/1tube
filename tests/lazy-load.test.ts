@@ -60,8 +60,16 @@ Deno.test("lazy-load: discovery in lazy mode registers candidates without import
     assertEquals(reg.pendingCount, 2);
 
     const counts = (globalThis as any).__loadCounts as Record<string, number>;
-    assertEquals(counts["a"], undefined, "fn-a module must not have been imported");
-    assertEquals(counts["b"], undefined, "fn-b module must not have been imported");
+    assertEquals(
+      counts["a"],
+      undefined,
+      "fn-a module must not have been imported",
+    );
+    assertEquals(
+      counts["b"],
+      undefined,
+      "fn-b module must not have been imported",
+    );
   } finally {
     await Deno.remove(tmp, { recursive: true });
   }
@@ -140,7 +148,11 @@ Deno.test("lazy-load: concurrent first-dispatch dedupes on a single import", asy
     }
 
     const counts = (globalThis as any).__loadCounts as Record<string, number>;
-    assertEquals(counts["dedupe"], 1, "module imported exactly once despite 5 racers");
+    assertEquals(
+      counts["dedupe"],
+      1,
+      "module imported exactly once despite 5 racers",
+    );
   } finally {
     await Deno.remove(tmp, { recursive: true });
   }
@@ -204,7 +216,10 @@ Deno.test("lazy-load: manifestFor() reads manifest of unloaded candidates", asyn
   const tmp = await Deno.makeTempDir();
   try {
     const name = `manifest-${crypto.randomUUID().slice(0, 8)}`;
-    await makeFnDir(tmp, name, HANDLER_BODY(name), { rpm: 999, timeoutMs: 1234 });
+    await makeFnDir(tmp, name, HANDLER_BODY(name), {
+      rpm: 999,
+      timeoutMs: 1234,
+    });
 
     const reg = setupRegistry();
     await discoverAndLoad(tmp, reg, { lazy: true });
@@ -227,7 +242,7 @@ Deno.test("lazy-load: eager (non-lazy) discovery is unchanged — handlers loade
     await makeFnDir(tmp, name, HANDLER_BODY("classic"));
 
     const reg = setupRegistry();
-    const result = await discoverAndLoad(tmp, reg, { /* lazy omitted */ });
+    const result = await discoverAndLoad(tmp, reg, {/* lazy omitted */});
 
     assertEquals(result.deferred, []);
     assertEquals(result.loaded, [name]);

@@ -139,5 +139,8 @@ Deno.test("getPrometheusMetrics: label values escape backslash, quote, newline",
 
 Deno.test("getPrometheusMetrics: trailing newline is preserved (Prometheus requires it)", () => {
   const out = getPrometheusMetrics();
-  assert(out.endsWith("\n"), "Prometheus exposition must terminate with a newline");
+  assert(
+    out.endsWith("\n"),
+    "Prometheus exposition must terminate with a newline",
+  );
 });

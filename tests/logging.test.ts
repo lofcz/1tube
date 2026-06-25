@@ -8,7 +8,7 @@
  * - Confirms `safeFnName` clamps & sanitises function names.
  */
 
-import { assertEquals, assert, assertFalse } from "@std/assert";
+import { assert, assertEquals, assertFalse } from "@std/assert";
 import { Hono } from "hono";
 import {
   _configureLogBufferForTests,
@@ -16,9 +16,13 @@ import {
 } from "../src/log-buffer.ts";
 
 let suffix = 0;
-async function freshLogging(): Promise<typeof import("../src/gateway/logging.ts")> {
+async function freshLogging(): Promise<
+  typeof import("../src/gateway/logging.ts")
+> {
   suffix++;
-  return await import(`../src/gateway/logging.ts?test=${suffix}-${crypto.randomUUID()}`);
+  return await import(
+    `../src/gateway/logging.ts?test=${suffix}-${crypto.randomUUID()}`
+  );
 }
 
 interface CapturedLog {
@@ -39,18 +43,27 @@ function captureConsole(): { lines: CapturedLog[]; restore: () => void } {
   const stdout = {
     writeSync(p: Uint8Array): number {
       const text = decoder.decode(p).replace(/\n+$/, "");
-      for (const line of text.split("\n")) lines.push({ level: "log", text: line });
+      for (const line of text.split("\n")) {
+        lines.push({ level: "log", text: line });
+      }
       return p.length;
     },
   };
   const stderr = {
     writeSync(p: Uint8Array): number {
       const text = decoder.decode(p).replace(/\n+$/, "");
-      for (const line of text.split("\n")) lines.push({ level: "error", text: line });
+      for (const line of text.split("\n")) {
+        lines.push({ level: "error", text: line });
+      }
       return p.length;
     },
   };
-  _configureLogBufferForTests({ syncMode: true, flushIntervalMs: 0, stdout, stderr });
+  _configureLogBufferForTests({
+    syncMode: true,
+    flushIntervalMs: 0,
+    stdout,
+    stderr,
+  });
   return {
     lines,
     restore() {
@@ -68,11 +81,14 @@ Deno.test("logging: success request emits a single info line, no auth/body/query
   const cap = captureConsole();
   try {
     const res = await app.fetch(
-      new Request("http://localhost/functions/v1/foo?token=SECRET-QUERY-VALUE", {
-        method: "POST",
-        headers: { Authorization: "Bearer SUPER-SECRET-TOKEN" },
-        body: JSON.stringify({ password: "SUPER-SECRET-BODY" }),
-      }),
+      new Request(
+        "http://localhost/functions/v1/foo?token=SECRET-QUERY-VALUE",
+        {
+          method: "POST",
+          headers: { Authorization: "Bearer SUPER-SECRET-TOKEN" },
+          body: JSON.stringify({ password: "SUPER-SECRET-BODY" }),
+        },
+      ),
     );
     assertEquals(res.status, 200);
   } finally {
@@ -97,7 +113,9 @@ Deno.test("logging: error responses go to console.error and bump the error count
 
   const cap = captureConsole();
   try {
-    await app.fetch(new Request("http://localhost/functions/v1/boom", { method: "POST" }));
+    await app.fetch(
+      new Request("http://localhost/functions/v1/boom", { method: "POST" }),
+    );
   } finally {
     cap.restore();
   }

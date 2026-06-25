@@ -15,10 +15,13 @@
 import { assert, assertEquals, assertFalse } from "@std/assert";
 import { join } from "@std/path";
 import { Hono } from "hono";
-import { openLogDb, type LogDb } from "../src/logs/db.ts";
+import { type LogDb, openLogDb } from "../src/logs/db.ts";
 import { createLogWriter } from "../src/logs/writer.ts";
 import { buildFtsMatch, createLogQuery } from "../src/logs/query.ts";
-import { parseMarkedConsoleLine, WORKERD_LOG_MARKER } from "../src/logs/console-marker.ts";
+import {
+  parseMarkedConsoleLine,
+  WORKERD_LOG_MARKER,
+} from "../src/logs/console-marker.ts";
 import { uuidv7 } from "../src/logs/id.ts";
 import {
   _configureLogBufferForTests,
@@ -107,7 +110,9 @@ Deno.test("logs-db: fresh open creates schema + FTS and is idempotent", async ()
     const again = await openLogDb(path);
     seedInvocation(again, { id: "reopen" });
     assertEquals(
-      (again.raw.prepare("SELECT COUNT(*) AS n FROM invocations").get() as { n: number }).n,
+      (again.raw.prepare("SELECT COUNT(*) AS n FROM invocations").get() as {
+        n: number;
+      }).n,
       1,
     );
     again.close();
@@ -171,12 +176,15 @@ Deno.test("logs-writer: threshold triggers flush; queue overflow drops oldest", 
     }
     assertEquals(writer.stats.dropped, 2);
     writer.flushNow();
-    const n = (db.raw.prepare("SELECT COUNT(*) AS n FROM logs").get() as { n: number }).n;
+    const n =
+      (db.raw.prepare("SELECT COUNT(*) AS n FROM logs").get() as { n: number })
+        .n;
     assertEquals(n, 5);
     // Oldest lines were the ones dropped.
-    const first = db.raw.prepare("SELECT message FROM logs ORDER BY id LIMIT 1").get() as {
-      message: string;
-    };
+    const first = db.raw.prepare("SELECT message FROM logs ORDER BY id LIMIT 1")
+      .get() as {
+        message: string;
+      };
     assertEquals(first.message, "line 2");
     writer.stop();
   });
@@ -204,10 +212,14 @@ Deno.test("logs-writer: prune enforces retention age and row caps", async () => 
     writer.prune();
     writer.stop();
 
-    const invIds = (db.raw.prepare("SELECT id FROM invocations").all() as Array<{ id: string }>)
+    const invIds = (db.raw.prepare("SELECT id FROM invocations").all() as Array<
+      { id: string }
+    >)
       .map((r) => r.id);
     assertEquals(invIds, ["new"]);
-    const logCount = (db.raw.prepare("SELECT COUNT(*) AS n FROM logs").get() as { n: number }).n;
+    const logCount =
+      (db.raw.prepare("SELECT COUNT(*) AS n FROM logs").get() as { n: number })
+        .n;
     assertEquals(logCount, 4);
     // FTS index follows deletes via triggers — searching pruned text finds nothing.
     const q = createLogQuery(db);
@@ -238,7 +250,9 @@ Deno.test("logs-fts: hostile search input never throws and matches literally", a
     seedLog(db, inv, 'user said "DROP TABLE" loudly');
     const q = createLogQuery(db);
     // None of these may throw a SQL/FTS syntax error.
-    for (const evil of ['" OR 1=1 --', "NOT (", "a AND", "col:val", "*", '"" ""']) {
+    for (
+      const evil of ['" OR 1=1 --', "NOT (", "a AND", "col:val", "*", '"" ""']
+    ) {
       q.searchLogs({ q: evil });
       q.queryInvocations({ q: evil });
     }
@@ -306,7 +320,10 @@ Deno.test("logs-query: getInvocation returns row + its console lines; tail is as
     const detail = q.getInvocation("wanted");
     assert(detail);
     assertEquals(detail.invocation.logCount, 2);
-    assertEquals(detail.logs.map((l) => l.message), ["first line", "second line"]);
+    assertEquals(detail.logs.map((l) => l.message), [
+      "first line",
+      "second line",
+    ]);
     assertEquals(detail.logs[1].level, "warn");
     assertEquals(q.getInvocation("missing"), null);
 
@@ -321,14 +338,19 @@ Deno.test("logs-query: getInvocation returns row + its console lines; tail is as
 // loggingMiddleware → invocation rows
 // ---------------------------------------------------------------------------
 
-async function freshLogging(): Promise<typeof import("../src/gateway/logging.ts")> {
+async function freshLogging(): Promise<
+  typeof import("../src/gateway/logging.ts")
+> {
   return await import(`../src/gateway/logging.ts?test=${crypto.randomUUID()}`);
 }
 
 Deno.test("logging: middleware persists an invocation row and echoes the id header", async () => {
   const mod = await freshLogging();
   const rows: import("../src/logs/writer.ts").InvocationRow[] = [];
-  mod.configureInvocationLogging({ sink: (r) => rows.push(r), backend: "deno" });
+  mod.configureInvocationLogging({
+    sink: (r) => rows.push(r),
+    backend: "deno",
+  });
 
   const app = new Hono();
   app.use("/functions/v1/*", mod.loggingMiddleware);
@@ -363,7 +385,10 @@ Deno.test("logging: middleware persists an invocation row and echoes the id head
 Deno.test("logging: setInvocationError classification lands on the persisted row", async () => {
   const mod = await freshLogging();
   const rows: import("../src/logs/writer.ts").InvocationRow[] = [];
-  mod.configureInvocationLogging({ sink: (r) => rows.push(r), backend: "workerd" });
+  mod.configureInvocationLogging({
+    sink: (r) => rows.push(r),
+    backend: "workerd",
+  });
 
   const app = new Hono();
   app.use("/functions/v1/*", mod.loggingMiddleware);
@@ -384,7 +409,10 @@ Deno.test("logging: setInvocationError classification lands on the persisted row
     assertEquals(rows.length, 1);
     assertEquals(rows[0].status, 504);
     assertEquals(rows[0].errorKind, "timeout");
-    assertEquals(rows[0].errorMessage, "Function execution timed out after 150ms");
+    assertEquals(
+      rows[0].errorMessage,
+      "Function execution timed out after 150ms",
+    );
     assertEquals(rows[0].backend, "workerd");
   } finally {
     _resetLogBufferForTests();
@@ -396,7 +424,12 @@ Deno.test("logging: setInvocationError classification lands on the persisted row
 // ---------------------------------------------------------------------------
 
 Deno.test("console-marker: round-trips a marked line; ignores ordinary output", () => {
-  const payload = { id: "inv-1", level: "warn", msg: "rate limit\nnear", ts: 1234 };
+  const payload = {
+    id: "inv-1",
+    level: "warn",
+    msg: "rate limit\nnear",
+    ts: 1234,
+  };
   const line = WORKERD_LOG_MARKER + JSON.stringify(payload);
   const parsed = parseMarkedConsoleLine(line);
   assert(parsed);
@@ -414,7 +447,8 @@ Deno.test("console-marker: round-trips a marked line; ignores ordinary output", 
   assertEquals(parseMarkedConsoleLine(WORKERD_LOG_MARKER + "{not json"), null);
   // Unknown levels degrade to "log" instead of being dropped.
   const odd = parseMarkedConsoleLine(
-    WORKERD_LOG_MARKER + JSON.stringify({ id: null, level: "silly", msg: "x", ts: 1 }),
+    WORKERD_LOG_MARKER +
+      JSON.stringify({ id: null, level: "silly", msg: "x", ts: 1 }),
   );
   assert(odd);
   assertEquals(odd.level, "log");
@@ -466,7 +500,10 @@ reg.register(async (req: Request) => {
           new AbortController().signal,
           inv,
         );
-      const [r1, r2] = await Promise.all([mk("one", "inv-one"), mk("two", "inv-two")]);
+      const [r1, r2] = await Promise.all([
+        mk("one", "inv-one"),
+        mk("two", "inv-two"),
+      ]);
       assertEquals(await r1.text(), "one");
       assertEquals(await r2.text(), "two");
 
@@ -478,7 +515,9 @@ reg.register(async (req: Request) => {
       assertEquals(bootLines[0].invocationId, null);
       assertEquals(bootLines[0].functionName, "echo");
 
-      for (const [tag, inv] of [["one", "inv-one"], ["two", "inv-two"]] as const) {
+      for (
+        const [tag, inv] of [["one", "inv-one"], ["two", "inv-two"]] as const
+      ) {
         const start = events.find((e) => e.message === `start ${tag}`);
         const end = events.find((e) => e.message === `end ${tag}`);
         assert(start, `missing start line for ${tag}`);

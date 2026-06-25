@@ -1,10 +1,17 @@
-import { basename, dirname, join, normalize, relative, resolve as resolvePath } from "node:path";
+import {
+  basename,
+  dirname,
+  join,
+  normalize,
+  relative,
+  resolve as resolvePath,
+} from "node:path";
 import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
 import {
   defaultManifest,
+  type FunctionManifest,
   MANIFEST_FILENAME,
   parseManifest,
-  type FunctionManifest,
 } from "../../manifest.ts";
 import type { PrebuiltManifest } from "./prebuilt.ts";
 
@@ -31,7 +38,13 @@ export interface EditableFunctionSummary {
   files: string[];
   manifest: FunctionManifest;
   bundleBytes: number | null;
-  source: "overlay" | "snapshot" | "sourcemap" | "bundle" | "source-tree" | "missing";
+  source:
+    | "overlay"
+    | "snapshot"
+    | "sourcemap"
+    | "bundle"
+    | "source-tree"
+    | "missing";
   degraded: boolean;
 }
 
@@ -78,17 +91,24 @@ export interface RuntimeOverrideStoreOptions {
 
 export function defaultRuntimeOverrideRoot(cwd: string): string {
   const env = Deno.env.get("1TUBE_RUNTIME_FUNCTIONS_DIR")?.trim();
-  return env ? (isAbsolutePath(env) ? env : resolvePath(cwd, env)) : resolvePath(cwd, ".1tube-cache", "runtime-functions");
+  return env
+    ? (isAbsolutePath(env) ? env : resolvePath(cwd, env))
+    : resolvePath(cwd, ".1tube-cache", "runtime-functions");
 }
 
 function isAbsolutePath(path: string): boolean {
-  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("/") || path.startsWith("\\\\");
+  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("/") ||
+    path.startsWith("\\\\");
 }
 
 function safeName(name: string): string {
   const trimmed = name.trim();
   if (!NAME_RX.test(trimmed)) {
-    throw new Error(`invalid function name ${JSON.stringify(name)}; expected ${NAME_RX.source}`);
+    throw new Error(
+      `invalid function name ${
+        JSON.stringify(name)
+      }; expected ${NAME_RX.source}`,
+    );
   }
   return trimmed;
 }
@@ -109,7 +129,9 @@ function langFor(path: string): EditableSourceFile["language"] {
   const lower = path.toLowerCase();
   if (lower.endsWith(".json")) return "json";
   if (lower.endsWith(".ts") || lower.endsWith(".tsx")) return "typescript";
-  if (lower.endsWith(".js") || lower.endsWith(".mjs") || lower.endsWith(".jsx")) return "javascript";
+  if (
+    lower.endsWith(".js") || lower.endsWith(".mjs") || lower.endsWith(".jsx")
+  ) return "javascript";
   return "text";
 }
 
@@ -164,7 +186,9 @@ async function listFiles(root: string): Promise<string[]> {
 async function hashSha256Hex(text: string): Promise<string> {
   const bytes = new TextEncoder().encode(text);
   const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
-  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(new Uint8Array(digest)).map((b) =>
+    b.toString(16).padStart(2, "0")
+  ).join("");
 }
 
 function parseManifestText(text: string | null): FunctionManifest {
@@ -180,7 +204,10 @@ export class RuntimeOverrideStore {
   readonly rootDir: string;
   private readonly functionsRoot: string;
   private readonly indexPath: string;
-  private index: RuntimeOverrideIndex = { schema: OVERLAY_SCHEMA, functions: [] };
+  private index: RuntimeOverrideIndex = {
+    schema: OVERLAY_SCHEMA,
+    functions: [],
+  };
   private loaded = false;
 
   constructor(private readonly opts: RuntimeOverrideStoreOptions) {
@@ -196,29 +223,42 @@ export class RuntimeOverrideStore {
     if (raw) {
       try {
         const parsed = JSON.parse(raw) as RuntimeOverrideIndex;
-        if (parsed.schema === OVERLAY_SCHEMA && Array.isArray(parsed.functions)) {
+        if (
+          parsed.schema === OVERLAY_SCHEMA && Array.isArray(parsed.functions)
+        ) {
           this.index = {
             schema: OVERLAY_SCHEMA,
             functions: parsed.functions
-              .filter((f) => NAME_RX.test(f.name) && (f.origin === "added" || f.origin === "patched"))
+              .filter((f) =>
+                NAME_RX.test(f.name) &&
+                (f.origin === "added" || f.origin === "patched")
+              )
               .map((f) => ({
                 name: f.name,
                 origin: f.origin,
-                updatedAt: typeof f.updatedAt === "string" ? f.updatedAt : new Date(0).toISOString(),
-                files: Array.isArray(f.files) ? f.files.map(safeRelPath).sort() : [],
+                updatedAt: typeof f.updatedAt === "string"
+                  ? f.updatedAt
+                  : new Date(0).toISOString(),
+                files: Array.isArray(f.files)
+                  ? f.files.map(safeRelPath).sort()
+                  : [],
               }))
               .sort((a, b) => a.name.localeCompare(b.name)),
           };
         }
       } catch (err) {
-        console.warn(`[1tube] ignoring invalid runtime override index ${this.indexPath}: ${err}`);
+        console.warn(
+          `[1tube] ignoring invalid runtime override index ${this.indexPath}: ${err}`,
+        );
       }
     }
     this.loaded = true;
     await this.persist();
   }
 
-  async list(baseNames: ReadonlySet<string>): Promise<EditableFunctionSummary[]> {
+  async list(
+    baseNames: ReadonlySet<string>,
+  ): Promise<EditableFunctionSummary[]> {
     await this.load();
     const names = new Set<string>(baseNames);
     for (const e of this.index.functions) names.add(e.name);
@@ -231,8 +271,12 @@ export class RuntimeOverrideStore {
       rows.push({
         name,
         origin,
-        files: overlay?.files.length ? overlay.files : await this.baseFileList(name),
-        manifest: overlay ? await this.readOverlayManifest(name) : this.baseManifest(name),
+        files: overlay?.files.length
+          ? overlay.files
+          : await this.baseFileList(name),
+        manifest: overlay
+          ? await this.readOverlayManifest(name)
+          : this.baseManifest(name),
         bundleBytes: bundleBytes.get(name) ?? null,
         source,
         degraded: source === "bundle" || source === "missing",
@@ -241,7 +285,10 @@ export class RuntimeOverrideStore {
     return rows;
   }
 
-  async read(name: string, baseNames: ReadonlySet<string>): Promise<EditableSourceResponse> {
+  async read(
+    name: string,
+    baseNames: ReadonlySet<string>,
+  ): Promise<EditableSourceResponse> {
     await this.load();
     name = safeName(name);
     const overlay = this.index.functions.find((e) => e.name === name);
@@ -251,11 +298,14 @@ export class RuntimeOverrideStore {
         name,
         origin: overlay.origin,
         files,
-        selected: files.find((f) => f.path === "index.ts")?.path ?? files[0]?.path ?? "index.ts",
+        selected: files.find((f) => f.path === "index.ts")?.path ??
+          files[0]?.path ?? "index.ts",
         degraded: false,
       };
     }
-    if (!baseNames.has(name)) throw new Error(`function "${name}" does not exist`);
+    if (!baseNames.has(name)) {
+      throw new Error(`function "${name}" does not exist`);
+    }
     return await this.readBaseSource(name);
   }
 
@@ -265,25 +315,39 @@ export class RuntimeOverrideStore {
     if (this.index.functions.some((e) => e.name === name)) {
       throw new Error(`function "${name}" already has a runtime override`);
     }
-    const baseNames = new Set(this.opts.getPrebuiltManifest?.()?.functions.map((f) => f.name) ?? []);
+    const baseNames = new Set(
+      this.opts.getPrebuiltManifest?.()?.functions.map((f) => f.name) ?? [],
+    );
     if (baseNames.has(name)) {
-      throw new Error(`function "${name}" exists in firmware; open Code and save a patch instead`);
+      throw new Error(
+        `function "${name}" exists in firmware; open Code and save a patch instead`,
+      );
     }
     await this.writeFiles(name, {
       "index.ts": [
         "export default async function handler(req: Request): Promise<Response> {",
-        "  const body = req.method === \"GET\" ? null : await req.text();",
+        '  const body = req.method === "GET" ? null : await req.text();',
         "  return Response.json({ ok: true, method: req.method, body });",
         "}",
         "",
       ].join("\n"),
-      [MANIFEST_FILENAME]: JSON.stringify(defaultManifestForFile(), null, 2) + "\n",
+      [MANIFEST_FILENAME]: JSON.stringify(defaultManifestForFile(), null, 2) +
+        "\n",
     });
-    await this.upsertIndex({ name, origin: "added", updatedAt: new Date().toISOString(), files: await listFiles(this.fnDir(name)) });
+    await this.upsertIndex({
+      name,
+      origin: "added",
+      updatedAt: new Date().toISOString(),
+      files: await listFiles(this.fnDir(name)),
+    });
     return await this.read(name, new Set());
   }
 
-  async save(name: string, input: SaveEditableSourceInput, baseNames: ReadonlySet<string>): Promise<RuntimeOverrideEntry> {
+  async save(
+    name: string,
+    input: SaveEditableSourceInput,
+    baseNames: ReadonlySet<string>,
+  ): Promise<RuntimeOverrideEntry> {
     await this.load();
     name = safeName(name);
     const existsInBase = baseNames.has(name);
@@ -296,10 +360,13 @@ export class RuntimeOverrideStore {
       files[safeRelPath(rawPath)] = String(content ?? "");
     }
     if (!files["index.ts"] && !files["index.js"]) {
-      throw new Error(`runtime function "${name}" must include index.ts or index.js`);
+      throw new Error(
+        `runtime function "${name}" must include index.ts or index.js`,
+      );
     }
     if (!files[MANIFEST_FILENAME]) {
-      files[MANIFEST_FILENAME] = JSON.stringify(defaultManifestForFile(), null, 2) + "\n";
+      files[MANIFEST_FILENAME] =
+        JSON.stringify(defaultManifestForFile(), null, 2) + "\n";
     }
     await this.writeFiles(name, files);
     const entry: RuntimeOverrideEntry = {
@@ -318,7 +385,9 @@ export class RuntimeOverrideStore {
     const entry = this.index.functions.find((e) => e.name === name);
     if (!entry) return;
     if (entry.origin !== "added") {
-      throw new Error(`function "${name}" is from firmware; use revert instead`);
+      throw new Error(
+        `function "${name}" is from firmware; use revert instead`,
+      );
     }
     await removeDirIfExists(this.fnDir(name));
     this.index.functions = this.index.functions.filter((e) => e.name !== name);
@@ -338,7 +407,9 @@ export class RuntimeOverrideStore {
     await this.persist();
   }
 
-  async compose(baseNames: ReadonlySet<string>): Promise<OverlayComposeEntry[]> {
+  async compose(
+    baseNames: ReadonlySet<string>,
+  ): Promise<OverlayComposeEntry[]> {
     await this.load();
     const out: OverlayComposeEntry[] = [];
     for (const entry of this.index.functions) {
@@ -363,11 +434,16 @@ export class RuntimeOverrideStore {
   private async persist(): Promise<void> {
     await ensureDir(this.rootDir);
     this.index.functions.sort((a, b) => a.name.localeCompare(b.name));
-    await Deno.writeTextFile(this.indexPath, JSON.stringify(this.index, null, 2) + "\n");
+    await Deno.writeTextFile(
+      this.indexPath,
+      JSON.stringify(this.index, null, 2) + "\n",
+    );
   }
 
   private async upsertIndex(entry: RuntimeOverrideEntry): Promise<void> {
-    this.index.functions = this.index.functions.filter((e) => e.name !== entry.name);
+    this.index.functions = this.index.functions.filter((e) =>
+      e.name !== entry.name
+    );
     this.index.functions.push(entry);
     await this.persist();
   }
@@ -376,24 +452,34 @@ export class RuntimeOverrideStore {
     return join(this.functionsRoot, safeName(name));
   }
 
-  private async writeFiles(name: string, files: Record<string, string>): Promise<void> {
+  private async writeFiles(
+    name: string,
+    files: Record<string, string>,
+  ): Promise<void> {
     const dir = this.fnDir(name);
     await removeDirIfExists(dir);
     await ensureDir(dir);
     for (const [path, content] of Object.entries(files)) {
       const rel = safeRelPath(path);
       const abs = normalize(join(dir, rel));
-      if (!abs.startsWith(dir)) throw new Error(`source path escapes function dir: ${rel}`);
+      if (!abs.startsWith(dir)) {
+        throw new Error(`source path escapes function dir: ${rel}`);
+      }
       await ensureDir(dirname(abs));
       await Deno.writeTextFile(abs, content);
     }
   }
 
   private async readOverlayManifest(name: string): Promise<FunctionManifest> {
-    return parseManifestText(await readTextIfExists(join(this.fnDir(name), MANIFEST_FILENAME)));
+    return parseManifestText(
+      await readTextIfExists(join(this.fnDir(name), MANIFEST_FILENAME)),
+    );
   }
 
-  private async readOverlayFiles(name: string, paths: string[]): Promise<EditableSourceFile[]> {
+  private async readOverlayFiles(
+    name: string,
+    paths: string[],
+  ): Promise<EditableSourceFile[]> {
     const dir = this.fnDir(name);
     const listed = paths.length ? paths : await listFiles(dir);
     const files: EditableSourceFile[] = [];
@@ -404,12 +490,15 @@ export class RuntimeOverrideStore {
         language: langFor(path),
       });
     }
-    return files.sort((a, b) => sourceSortKey(a.path).localeCompare(sourceSortKey(b.path)));
+    return files.sort((a, b) =>
+      sourceSortKey(a.path).localeCompare(sourceSortKey(b.path))
+    );
   }
 
   private baseManifest(name: string): FunctionManifest {
     const prebuilt = this.opts.getPrebuiltManifest?.();
-    const fromPrebuilt = prebuilt?.functions.find((f) => f.name === name)?.manifest;
+    const fromPrebuilt = prebuilt?.functions.find((f) => f.name === name)
+      ?.manifest;
     if (fromPrebuilt) return fromPrebuilt;
     return this.opts.getLiveManifests?.()?.get(name) ?? defaultManifest();
   }
@@ -421,9 +510,14 @@ export class RuntimeOverrideStore {
     return [MANIFEST_FILENAME, "index.ts"];
   }
 
-  private async detectBaseSource(name: string): Promise<EditableFunctionSummary["source"]> {
+  private async detectBaseSource(
+    name: string,
+  ): Promise<EditableFunctionSummary["source"]> {
     const sourceDir = join(this.opts.sourceFunctionsDir, name);
-    if (await pathExists(join(sourceDir, "index.ts")) || await pathExists(join(sourceDir, "index.js"))) return "source-tree";
+    if (
+      await pathExists(join(sourceDir, "index.ts")) ||
+      await pathExists(join(sourceDir, "index.js"))
+    ) return "source-tree";
     const source = await this.readPrebuiltSource(name);
     return source.source;
   }
@@ -443,8 +537,11 @@ export class RuntimeOverrideStore {
       return {
         name,
         origin: "manifest",
-        files: files.sort((a, b) => sourceSortKey(a.path).localeCompare(sourceSortKey(b.path))),
-        selected: files.find((f) => f.path === "index.ts")?.path ?? files[0]?.path ?? "index.ts",
+        files: files.sort((a, b) =>
+          sourceSortKey(a.path).localeCompare(sourceSortKey(b.path))
+        ),
+        selected: files.find((f) => f.path === "index.ts")?.path ??
+          files[0]?.path ?? "index.ts",
         degraded: false,
       };
     }
@@ -477,14 +574,26 @@ export class RuntimeOverrideStore {
     const snapshot = await this.readSourceSnapshot(name);
     if (snapshot.length > 0) return { source: "snapshot", files: snapshot };
 
-    for (const moduleFile of entry.moduleFiles.length ? entry.moduleFiles : [entry.bundleFile]) {
-      const map = await readTextIfExists(join(prebuiltDir, `${moduleFile}.map`));
+    for (
+      const moduleFile of entry.moduleFiles.length
+        ? entry.moduleFiles
+        : [entry.bundleFile]
+    ) {
+      const map = await readTextIfExists(
+        join(prebuiltDir, `${moduleFile}.map`),
+      );
       if (!map) continue;
       const extracted = extractSourcesContent(map);
-      if (extracted.length > 0) return { source: "sourcemap", files: extracted };
+      if (extracted.length > 0) {
+        return { source: "sourcemap", files: extracted };
+      }
     }
 
-    const emittedFiles = [...new Set(entry.moduleFiles.length ? entry.moduleFiles : [entry.bundleFile])];
+    const emittedFiles = [
+      ...new Set(
+        entry.moduleFiles.length ? entry.moduleFiles : [entry.bundleFile],
+      ),
+    ];
     const emittedSources: EditableSourceFile[] = [];
     for (const moduleFile of emittedFiles) {
       const bundle = await readTextIfExists(join(prebuiltDir, moduleFile));
@@ -499,8 +608,13 @@ export class RuntimeOverrideStore {
     if (emittedSources.length > 0) {
       return {
         source: "bundle",
-        files: emittedSources.sort((a, b) => emittedSortKey(entry.bundleFile, a.path).localeCompare(emittedSortKey(entry.bundleFile, b.path))),
-        warning: "Authored source was not packaged with this firmware; showing emitted JS fallback modules.",
+        files: emittedSources.sort((a, b) =>
+          emittedSortKey(entry.bundleFile, a.path).localeCompare(
+            emittedSortKey(entry.bundleFile, b.path),
+          )
+        ),
+        warning:
+          "Authored source was not packaged with this firmware; showing emitted JS fallback modules.",
       };
     }
     return {
@@ -510,7 +624,9 @@ export class RuntimeOverrideStore {
     };
   }
 
-  private async readSourceSnapshot(name: string): Promise<EditableSourceFile[]> {
+  private async readSourceSnapshot(
+    name: string,
+  ): Promise<EditableSourceFile[]> {
     const prebuiltDir = this.opts.prebuiltDir;
     if (!prebuiltDir) return [];
     const snapshotDir = join(prebuiltDir, "sources", name);
@@ -523,7 +639,9 @@ export class RuntimeOverrideStore {
         language: langFor(path),
       });
     }
-    return out.sort((a, b) => sourceSortKey(a.path).localeCompare(sourceSortKey(b.path)));
+    return out.sort((a, b) =>
+      sourceSortKey(a.path).localeCompare(sourceSortKey(b.path))
+    );
   }
 
   private async resolveEntrypoint(dir: string): Promise<string> {
@@ -531,27 +649,39 @@ export class RuntimeOverrideStore {
     if (await pathExists(ts)) return ts;
     const js = join(dir, "index.js");
     if (await pathExists(js)) return js;
-    throw new Error(`runtime override at ${dir} is missing index.ts or index.js`);
+    throw new Error(
+      `runtime override at ${dir} is missing index.ts or index.js`,
+    );
   }
 }
 
 function extractSourcesContent(rawMap: string): EditableSourceFile[] {
   try {
-    const map = JSON.parse(rawMap) as { sources?: unknown; sourcesContent?: unknown };
-    if (!Array.isArray(map.sources) || !Array.isArray(map.sourcesContent)) return [];
+    const map = JSON.parse(rawMap) as {
+      sources?: unknown;
+      sourcesContent?: unknown;
+    };
+    if (!Array.isArray(map.sources) || !Array.isArray(map.sourcesContent)) {
+      return [];
+    }
     const files: EditableSourceFile[] = [];
     for (let i = 0; i < map.sources.length; i++) {
       const source = map.sources[i];
       const content = map.sourcesContent[i];
       if (typeof source !== "string" || typeof content !== "string") continue;
-      const name = source.replace(/^file:\/+/, "").replaceAll("\\", "/").split("/").filter(Boolean).pop() ?? `source-${i}.ts`;
+      const name =
+        source.replace(/^file:\/+/, "").replaceAll("\\", "/").split("/").filter(
+          Boolean,
+        ).pop() ?? `source-${i}.ts`;
       files.push({
         path: safeRelPath(name),
         content,
         language: langFor(name),
       });
     }
-    return files.sort((a, b) => sourceSortKey(a.path).localeCompare(sourceSortKey(b.path)));
+    return files.sort((a, b) =>
+      sourceSortKey(a.path).localeCompare(sourceSortKey(b.path))
+    );
   } catch {
     return [];
   }
@@ -577,7 +707,11 @@ function defaultManifestForFile(): Record<string, unknown> {
   };
 }
 
-export async function copyPrebuiltRuntimeFiles(prebuilt: PrebuiltManifest, prebuiltDir: string, cacheDir: string): Promise<void> {
+export async function copyPrebuiltRuntimeFiles(
+  prebuilt: PrebuiltManifest,
+  prebuiltDir: string,
+  cacheDir: string,
+): Promise<void> {
   await ensureDir(cacheDir);
   const copied = new Set<string>();
   async function copyRel(rel: string) {
@@ -598,16 +732,22 @@ export async function copyPrebuiltRuntimeFiles(prebuilt: PrebuiltManifest, prebu
   for (const shared of prebuilt.sharedModules) await copyRel(shared.bundleFile);
 }
 
-export async function readTextDigestFile(path: string): Promise<{ bytes: number; sha256: string }> {
+export async function readTextDigestFile(
+  path: string,
+): Promise<{ bytes: number; sha256: string }> {
   const data = await Deno.readFile(path);
   const digest = await crypto.subtle.digest("SHA-256", data as BufferSource);
   return {
     bytes: data.byteLength,
-    sha256: Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join(""),
+    sha256: Array.from(new Uint8Array(digest)).map((b) =>
+      b.toString(16).padStart(2, "0")
+    ).join(""),
   };
 }
 
-export async function sourceFingerprint(files: readonly EditableSourceFile[]): Promise<string> {
+export async function sourceFingerprint(
+  files: readonly EditableSourceFile[],
+): Promise<string> {
   const canonical = files
     .map((f) => `${safeRelPath(f.path)}\0${f.content}`)
     .sort()

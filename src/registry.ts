@@ -36,9 +36,9 @@ export type PublicHandler = (req: Request) => Response | Promise<Response>;
 export interface RegisteredFunction {
   handler: AuthenticatedHandler | PublicHandler;
   isPublic: boolean;
-  /** Per-function wall clock timeout in ms. Undefined = use gateway default. 
+  /** Per-function wall clock timeout in ms. Undefined = use gateway default.
    *  Only compatible with 1tube edge functions runtime. Ignored by Supabase Edge Functions runtime.
-  */
+   */
   timeoutMs?: number;
   /**
    * Per-function manifest (`1tube.json`). Always populated; defaults are used
@@ -156,7 +156,10 @@ export class FunctionRegistry {
    * asynchronous `register()` calls reached from within. Safe under parallel
    * imports.
    */
-  runWithCurrentFunction<T>(name: string, fn: () => Promise<T> | T): Promise<T> | T {
+  runWithCurrentFunction<T>(
+    name: string,
+    fn: () => Promise<T> | T,
+  ): Promise<T> | T {
     return currentNameStorage.run(name, fn);
   }
 
@@ -172,7 +175,7 @@ export class FunctionRegistry {
     if (!name) {
       throw new Error(
         "[1tube] registry.register() called without an active function context. " +
-        "This is a bug in the function loader — must be wrapped in runWithCurrentFunction().",
+          "This is a bug in the function loader — must be wrapped in runWithCurrentFunction().",
       );
     }
     const manifest = this.pendingManifests.get(name) ?? defaultManifest();
@@ -251,9 +254,9 @@ export class FunctionRegistry {
   manifestFor(name: string): FunctionManifest | undefined {
     return (
       this.handlers.get(name)?.manifest ??
-      this.candidates.get(name)?.manifest ??
-      this.workerHandles.get(name)?.manifest ??
-      this.externalManifests.get(name)
+        this.candidates.get(name)?.manifest ??
+        this.workerHandles.get(name)?.manifest ??
+        this.externalManifests.get(name)
     );
   }
 
@@ -280,7 +283,9 @@ export class FunctionRegistry {
    * resulting handler. Returns `undefined` when neither a handler nor a
    * candidate exists, and `null` when import fails.
    */
-  async getOrLoad(name: string): Promise<RegisteredFunction | null | undefined> {
+  async getOrLoad(
+    name: string,
+  ): Promise<RegisteredFunction | null | undefined> {
     const fn = this.handlers.get(name);
     if (fn) return fn;
     const cand = this.candidates.get(name);

@@ -4,7 +4,9 @@
   "description": "Dumps on the first kj::ExceptionImpl throw. Filter uses the MANGLED name (?AVExceptionImpl@kj@@) because procdump matches the raw exception code string, not the demangled C++ form. Open the .dmp in WinDbg: '.ecxr; kn 50; !analyze -v'.",
   "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
   "args": [
-    "-NoProfile", "-NonInteractive", "-Command",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
     "$ErrorActionPreference='Continue'; $w='${WorkerdPath}'; $probe='${ProbeCapnp}'; $diag='${DiagDir}'; $dumps=\"$diag\\dumps\"; New-Item -ItemType Directory -Force -Path $dumps | Out-Null; $procdump = Join-Path (Split-Path $w) 'procdump.exe'; if (-not (Test-Path $procdump)) { Write-Error \"procdump.exe not found at $procdump\"; exit 2 }; if (-not (Test-Path $probe)) { Write-Error \"probe capnp missing: $probe\"; exit 3 }; Write-Output \"procdump: $procdump\"; Write-Output \"dumps   : $dumps\"; & $procdump -accepteula -ma -e 1 -f 'ExceptionImpl@kj' -n 1 -x $dumps $w serve $probe 2>&1 | Out-String; Write-Output '== resulting dumps =='; Get-ChildItem $dumps -File -Filter 'workerd*.dmp' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 5 FullName, Length, LastWriteTime | Format-Table -AutoSize | Out-String"
   ],
   "cwd": "${DiagDir}",

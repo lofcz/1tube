@@ -10,7 +10,12 @@
  * capture + Node<->Web bridge works end-to-end.
  */
 
-import { assert, assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+} from "@std/assert";
 import { join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runBuild } from "../src/cli/build.ts";
@@ -293,7 +298,9 @@ Deno.test(
       const routes = config.routes as Array<Record<string, unknown>>;
       const headerIdx = routes.findIndex((r) => r.src === "^/assets/(.*)$");
       const handleIdx = routes.findIndex((r) => r.handle === "filesystem");
-      const helloIdx = routes.findIndex((r) => r.dest === "/functions/v1/hello");
+      const helloIdx = routes.findIndex((r) =>
+        r.dest === "/functions/v1/hello"
+      );
       const echoIdx = routes.findIndex((r) => r.dest === "/functions/v1/echo");
 
       // Our routes land in the main phase: after the header route, before the
@@ -619,7 +626,12 @@ Deno.test(
   "build --target vercel returns 2 on unknown flag",
   TEST_OPTS,
   async () => {
-    const code = await runBuild(["--target", "vercel", "--made-up-flag", "foo"]);
+    const code = await runBuild([
+      "--target",
+      "vercel",
+      "--made-up-flag",
+      "foo",
+    ]);
     assertEquals(code, 2);
   },
 );

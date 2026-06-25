@@ -8,7 +8,9 @@
   "description": "Identity, Job Object membership, workerd file metadata, VC runtime versions, drive map. Run this first.",
   "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
   "args": [
-    "-NoProfile", "-NonInteractive", "-Command",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
     "$ErrorActionPreference='Continue'; Write-Host '== whoami =='; whoami /all 2>&1 | Out-String; Write-Host '== process =='; Get-Process -Id $PID | Format-List Name, Id, Path, StartTime | Out-String; Write-Host '== job object =='; Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public static class J{[DllImport(\"kernel32\")]public static extern bool IsProcessInJob(IntPtr h, IntPtr j, out bool r);[DllImport(\"kernel32\")]public static extern IntPtr GetCurrentProcess();}'; $r=$false; [J]::IsProcessInJob([J]::GetCurrentProcess(),[IntPtr]::Zero,[ref]$r) | Out-Null; \"InJob=$r\"; Write-Host '== workerd file info =='; Get-Item '${WorkerdPath}' | Format-List FullName, Length, LastWriteTime | Out-String; (Get-Command '${WorkerdPath}').FileVersionInfo | Format-List FileVersion, ProductVersion, OriginalFilename | Out-String; Write-Host '== vcruntime =='; Get-ChildItem 'C:\\Windows\\System32\\vcruntime*.dll','C:\\Windows\\System32\\msvcp*.dll','C:\\Windows\\System32\\ucrtbase.dll' -ErrorAction SilentlyContinue | Select-Object Name, @{n='Ver';e={(Get-Command $_.FullName).FileVersionInfo.FileVersion}} | Format-Table -AutoSize | Out-String; Write-Host '== drives =='; Get-PSDrive -PSProvider FileSystem | Format-Table -AutoSize | Out-String"
   ],
   "timeoutSec": 15

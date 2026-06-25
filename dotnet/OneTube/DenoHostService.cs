@@ -840,6 +840,20 @@ const config :Workerd.Config = (
         startInfo.Environment["DENO_DIR"] = denoCacheDir;
         startInfo.Environment["DENO_NO_UPDATE_CHECK"] = "1";
 
+        // Deno 2.9 enables a 24h "minimum dependency age" by default,
+        // which makes a function that pins a freshly published npm
+        // version fail to resolve. NPM_CONFIG_MIN_RELEASE_AGE is the
+        // lowest explicit tier in Deno's precedence chain, so setting it
+        // to 0 cancels ONLY that built-in default — a project's .npmrc,
+        // deno.json `minimumDependencyAge`, or `--minimum-dependency-age`
+        // still wins, as does anything an operator passed via EnvVars
+        // (already layered into Environment above) or the parent process.
+        if (!startInfo.Environment.ContainsKey("NPM_CONFIG_MIN_RELEASE_AGE") &&
+            !startInfo.Environment.ContainsKey("npm_config_min_release_age"))
+        {
+            startInfo.Environment["NPM_CONFIG_MIN_RELEASE_AGE"] = "0";
+        }
+
         try
         {
             Directory.CreateDirectory(denoCacheDir);

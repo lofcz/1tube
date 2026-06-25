@@ -1197,7 +1197,8 @@ export function createDenoWorkerHost(
     if (ctx.batchGraphReady) await ctx.batchGraphReady;
     const r = await runSerialized(
       cand.name,
-      () => spawnAndRegister(cand, { graphReady: ctx.batchGraphReady !== null }),
+      () =>
+        spawnAndRegister(cand, { graphReady: ctx.batchGraphReady !== null }),
     );
     const durationMs = performance.now() - t0;
     if ("error" in r) {

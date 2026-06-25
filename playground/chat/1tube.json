@@ -3,6 +3,10 @@
   "timeoutMs": 120000,
   "warm": true,
   "permissions": {
-    "net": ["api.anthropic.com", "api.openai.com", "generativelanguage.googleapis.com"]
+    "net": [
+      "api.anthropic.com",
+      "api.openai.com",
+      "generativelanguage.googleapis.com"
+    ]
   }
 }

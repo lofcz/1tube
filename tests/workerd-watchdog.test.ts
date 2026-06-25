@@ -76,7 +76,9 @@ Deno.test("parseTasklistCsv: handles non-en locale separators", () => {
 
 Deno.test("parseTasklistCsv: 'no tasks' message returns null", () => {
   assertEquals(
-    parseTasklistCsv("INFO: No tasks are running which match the specified criteria."),
+    parseTasklistCsv(
+      "INFO: No tasks are running which match the specified criteria.",
+    ),
     null,
   );
 });
@@ -134,7 +136,9 @@ function manualClock() {
   let t = 0;
   return {
     now: () => t,
-    advance: (ms: number) => { t += ms; },
+    advance: (ms: number) => {
+      t += ms;
+    },
   };
 }
 
@@ -311,7 +315,9 @@ Deno.test("watchdog: a failed reload still updates counters and respects cooldow
     cooldownMs: 5_000,
     getRss: () => Promise.resolve(200 * 1024 * 1024),
     now: clock.now,
-    log: (l) => { logs.push(l); },
+    log: (l) => {
+      logs.push(l);
+    },
   });
 
   await w.sample();

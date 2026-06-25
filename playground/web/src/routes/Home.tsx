@@ -10,17 +10,23 @@ export function Home() {
       </p>
       <p>
         Keys are kept in <code>localStorage</code> and only sent as
-        <code>Authorization</code> headers on requests directly to the
-        provider's own API — there is no server proxy here.
+        <code>Authorization</code>{" "}
+        headers on requests directly to the provider's own API — there is no
+        server proxy here.
       </p>
       <ol>
-        <li>Drop your key(s) into <Link to="/settings">Settings</Link>.</li>
-        <li>Pick a provider + model and start chatting on <Link to="/chat">/chat</Link>.</li>
+        <li>
+          Drop your key(s) into <Link to="/settings">Settings</Link>.
+        </li>
+        <li>
+          Pick a provider + model and start chatting on{" "}
+          <Link to="/chat">/chat</Link>.
+        </li>
       </ol>
       <p className="dim">
         This page is the static frontend that sits alongside the 1tube edge
-        functions in <code>playground/</code>. It does not require the gateway
-        to be running.
+        functions in{" "}
+        <code>playground/</code>. It does not require the gateway to be running.
       </p>
     </section>
   );

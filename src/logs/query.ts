@@ -272,7 +272,9 @@ export function createLogQuery(db: LogDb): LogQuery {
       LIMIT ?`;
     params.push(limit + 1);
 
-    const rows = raw.prepare(sql).all(...params) as unknown as InvocationDbRow[];
+    const rows = raw.prepare(sql).all(
+      ...params,
+    ) as unknown as InvocationDbRow[];
     const hasMore = rows.length > limit;
     const items = rows.slice(0, limit).map(mapInvocation);
     const last = items[items.length - 1];

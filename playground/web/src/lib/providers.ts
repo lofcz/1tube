@@ -24,9 +24,21 @@ export const PROVIDERS: ProviderInfo[] = [
     keyPlaceholder: "sk-ant-…",
     consoleUrl: "https://console.anthropic.com/settings/keys",
     models: [
-      { id: "claude-opus-4-7", label: "Claude Opus 4.7", hint: "flagship · 2026-04-16" },
-      { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", hint: "balanced · 2026-02" },
-      { id: "claude-haiku-4-5", label: "Claude Haiku 4.5", hint: "fast/cheap · 2025-10" },
+      {
+        id: "claude-opus-4-7",
+        label: "Claude Opus 4.7",
+        hint: "flagship · 2026-04-16",
+      },
+      {
+        id: "claude-sonnet-4-6",
+        label: "Claude Sonnet 4.6",
+        hint: "balanced · 2026-02",
+      },
+      {
+        id: "claude-haiku-4-5",
+        label: "Claude Haiku 4.5",
+        hint: "fast/cheap · 2025-10",
+      },
     ],
   },
   {
@@ -48,12 +60,28 @@ export const PROVIDERS: ProviderInfo[] = [
     keyPlaceholder: "AIza…",
     consoleUrl: "https://aistudio.google.com/app/apikey",
     models: [
-      { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", hint: "flagship · 2026-02" },
-      { id: "gemini-3-flash-preview", label: "Gemini 3 Flash", hint: "fast frontier" },
-      { id: "gemini-3.1-flash-lite-preview", label: "Gemini 3.1 Flash-Lite", hint: "cheapest" },
+      {
+        id: "gemini-3.1-pro-preview",
+        label: "Gemini 3.1 Pro",
+        hint: "flagship · 2026-02",
+      },
+      {
+        id: "gemini-3-flash-preview",
+        label: "Gemini 3 Flash",
+        hint: "fast frontier",
+      },
+      {
+        id: "gemini-3.1-flash-lite-preview",
+        label: "Gemini 3.1 Flash-Lite",
+        hint: "cheapest",
+      },
       { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", hint: "GA fallback" },
       { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", hint: "GA fast" },
-      { id: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash-Lite", hint: "GA cheap" },
+      {
+        id: "gemini-2.5-flash-lite",
+        label: "Gemini 2.5 Flash-Lite",
+        hint: "GA cheap",
+      },
     ],
   },
 ];

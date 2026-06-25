@@ -138,14 +138,20 @@ export function createRateLimiter(config: Partial<RateLimitConfig> = {}) {
     // (configurable) prefix, before any nested route.
     const fnName = routeRemainder(c.req.path).split("/", 1)[0] || "";
 
-    const manifestRpm = fnName ? cfg.registry?.manifestFor(fnName)?.rpm : undefined;
-    const rpm = manifestRpm ?? ((fnName && cfg.overrides[fnName]) || cfg.defaultRpm);
+    const manifestRpm = fnName
+      ? cfg.registry?.manifestFor(fnName)?.rpm
+      : undefined;
+    const rpm = manifestRpm ??
+      ((fnName && cfg.overrides[fnName]) || cfg.defaultRpm);
     const key = `${resolveKey(c)}:${fnName || "global"}`;
     const bucket = getOrCreateBucket(key, rpm);
 
     if (bucket.tokens <= 0) {
       return c.json(
-        { error: "Rate limit exceeded", retryAfterSeconds: Math.ceil(60 / rpm) },
+        {
+          error: "Rate limit exceeded",
+          retryAfterSeconds: Math.ceil(60 / rpm),
+        },
         429,
       );
     }

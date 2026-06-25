@@ -143,7 +143,11 @@ export async function discoverAndLoad(
       // on demand. This is the single biggest startup-time win for sites
       // with many rarely-called functions.
       if (options?.lazy && !manifest.warm) {
-        registry.registerCandidate({ name, moduleUrl: moduleUrl.href, manifest });
+        registry.registerCandidate({
+          name,
+          moduleUrl: moduleUrl.href,
+          manifest,
+        });
         deferred.push(name);
         const durationMs = performance.now() - start;
         options?.onProgress?.({
@@ -160,7 +164,11 @@ export async function discoverAndLoad(
       // Even in lazy mode, eagerly-warm functions still register a candidate
       // so HMR reloads can re-import via the same URL.
       if (options?.lazy && manifest.warm) {
-        registry.registerCandidate({ name, moduleUrl: moduleUrl.href, manifest });
+        registry.registerCandidate({
+          name,
+          moduleUrl: moduleUrl.href,
+          manifest,
+        });
       }
       await registry.runWithCurrentFunction(name, async () => {
         await import(moduleUrl.href);
@@ -193,13 +201,16 @@ export async function discoverAndLoad(
   // internally, but we still benefit from overlapping transpile + JSR fetches.
   const concurrency = Math.max(1, options?.concurrency ?? 8);
   let cursor = 0;
-  const workers = Array.from({ length: Math.min(concurrency, work.length) }, async () => {
-    while (true) {
-      const i = cursor++;
-      if (i >= work.length) return;
-      await loadOne(work[i]);
-    }
-  });
+  const workers = Array.from(
+    { length: Math.min(concurrency, work.length) },
+    async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= work.length) return;
+        await loadOne(work[i]);
+      }
+    },
+  );
   await Promise.all(workers);
 
   return { loaded, skipped, errors, removed, deferred };

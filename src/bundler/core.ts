@@ -419,7 +419,9 @@ export function createBundler(opts: BundlerOptions): Bundler {
   const sharedModules = opts.sharedModules ?? [];
   const plugins = [
     ...(profile.resolverPlugins ?? []),
-    ...(sharedModules.length > 0 ? [sharedModulesExternalPlugin(sharedModules)] : []),
+    ...(sharedModules.length > 0
+      ? [sharedModulesExternalPlugin(sharedModules)]
+      : []),
     plugin,
   ];
 

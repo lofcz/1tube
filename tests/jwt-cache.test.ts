@@ -19,7 +19,9 @@ const SECRET_A = "test-secret-a-at-least-32-characters-please-ok";
 const SECRET_B = "test-secret-b-at-least-32-characters-please-ok";
 
 function reqWith(token: string): Request {
-  return new Request("http://x/", { headers: { Authorization: `Bearer ${token}` } });
+  return new Request("http://x/", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 }
 
 function setup(secret = SECRET_A) {
@@ -82,9 +84,14 @@ Deno.test("jwt-cache: tampered tokens never enter the cache", async () => {
   const midChar = sig[mid];
   // Map any base64url char to a different one in the same alphabet.
   const flipped = midChar === "A" ? "B" : "A";
-  const tampered = `${parts[0]}.${parts[1]}.${sig.slice(0, mid)}${flipped}${sig.slice(mid + 1)}`;
+  const tampered = `${parts[0]}.${parts[1]}.${sig.slice(0, mid)}${flipped}${
+    sig.slice(mid + 1)
+  }`;
   // Sanity: make sure we actually mutated the string.
-  assert(tampered !== good, "test setup: tampered token must differ from original");
+  assert(
+    tampered !== good,
+    "test setup: tampered token must differ from original",
+  );
 
   const result = await validateRequest(reqWith(tampered));
   assertEquals(result, null);
@@ -125,7 +132,11 @@ Deno.test("jwt-cache: rotating JWT_SECRET invalidates the cache", async () => {
   // old token (since it was signed with the previous key).
   Deno.env.set("JWT_SECRET", SECRET_B);
   const ok2 = await validateRequest(reqWith(tokenA));
-  assertEquals(ok2, null, "token signed with rotated-out secret must be rejected");
+  assertEquals(
+    ok2,
+    null,
+    "token signed with rotated-out secret must be rejected",
+  );
 
   const stats = getVerifyCacheStats();
   assertEquals(stats.size, 0, "rotation must clear all cached entries");
@@ -177,11 +188,19 @@ Deno.test("jwt-cache: LRU bump — recent hits survive eviction", async () => {
 
   const beforeT1 = getVerifyCacheStats().misses;
   await validateRequest(reqWith(t1));
-  assertEquals(getVerifyCacheStats().misses, beforeT1, "t1 must still be a hit");
+  assertEquals(
+    getVerifyCacheStats().misses,
+    beforeT1,
+    "t1 must still be a hit",
+  );
 
   const beforeT2 = getVerifyCacheStats().misses;
   await validateRequest(reqWith(t2));
-  assertEquals(getVerifyCacheStats().misses, beforeT2 + 1, "t2 must have been evicted");
+  assertEquals(
+    getVerifyCacheStats().misses,
+    beforeT2 + 1,
+    "t2 must have been evicted",
+  );
 });
 
 Deno.test("jwt-cache: empty/missing Authorization never touches the cache", async () => {

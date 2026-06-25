@@ -31,7 +31,10 @@ Deno.test("auth: returns null without an Authorization header", async () => {
 Deno.test("auth: validates a freshly signed token and exposes the user id", async () => {
   resetTubeEnv();
   Deno.env.set("JWT_SECRET", SECRET);
-  const token = await signJwt(SECRET, { sub: "user-abc", email: "abc@example.com" });
+  const token = await signJwt(SECRET, {
+    sub: "user-abc",
+    email: "abc@example.com",
+  });
   const auth = await validateRequest(reqWith(token));
   assertExists(auth);
   assertEquals(auth.userId, "user-abc");

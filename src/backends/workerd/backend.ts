@@ -36,32 +36,29 @@ import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
 import { type AuthContext } from "../../registry.ts";
 import { type FunctionManifest, loadManifest } from "../../manifest.ts";
 import {
-  bundleSharedModule,
-  type BundleResult,
   type Bundler,
+  type BundleResult,
+  bundleSharedModule,
   createBundler,
   discoverEntrypoints,
   discoverSharedModules,
 } from "../../bundler/core.ts";
 import { WORKERD_PROFILE } from "./bundle-profile.ts";
-import {
-  parsePrebuiltManifest,
-  type PrebuiltManifest,
-} from "./prebuilt.ts";
+import { parsePrebuiltManifest, type PrebuiltManifest } from "./prebuilt.ts";
 import {
   copyPrebuiltRuntimeFiles,
   defaultRuntimeOverrideRoot,
-  RuntimeOverrideStore,
-  type EditableSourceResponse,
   type EditableFunctionSummary,
+  type EditableSourceResponse,
+  RuntimeOverrideStore,
   type SaveEditableSourceInput,
 } from "./runtime-overrides.ts";
 import { type CapnpRoute, generateCapnp } from "./capnp.ts";
 import {
   SHARED_RUNTIME_TOKEN_ENV,
   SHARED_RUNTIME_URL_ENV,
-  startWorkerdSharedRuntime,
   type SharedRuntimeModule,
+  startWorkerdSharedRuntime,
   type WorkerdSharedRuntime,
 } from "./shared-runtime.ts";
 import {
@@ -344,7 +341,10 @@ export interface WorkerdBackend {
   readonly lastReloadDurationMs: number | null;
   listEditableFunctions(): Promise<EditableFunctionSummary[]>;
   readEditableSource(name: string): Promise<EditableSourceResponse>;
-  saveEditableSource(name: string, input: SaveEditableSourceInput): Promise<WorkerdReloadResult>;
+  saveEditableSource(
+    name: string,
+    input: SaveEditableSourceInput,
+  ): Promise<WorkerdReloadResult>;
   createEditableFunction(name: string): Promise<EditableSourceResponse>;
   deleteEditableFunction(name: string): Promise<WorkerdReloadResult>;
   revertEditableFunction(name: string): Promise<WorkerdReloadResult>;
@@ -423,7 +423,11 @@ export function probeSocketsFree(
   const conflicts: PortConflict[] = [];
   for (const s of sockets) {
     try {
-      const l = Deno.listen({ hostname: s.address, port: s.port, transport: "tcp" });
+      const l = Deno.listen({
+        hostname: s.address,
+        port: s.port,
+        transport: "tcp",
+      });
       l.close();
     } catch (err) {
       if (err instanceof Deno.errors.AddrInUse) {
@@ -493,7 +497,13 @@ Write-Output ("killed=" + ($killed -join ","))
 if ($skipped.Count -gt 0) { Write-Output ("skipped=" + ($skipped -join ",")) }
 `;
 
-  const cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script];
+  const cmd = [
+    "powershell",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    script,
+  ];
   try {
     const { code, stdout, stderr } = await new Deno.Command(cmd[0], {
       args: cmd.slice(1),
@@ -563,7 +573,9 @@ export async function killStaleWorkerd(): Promise<KillStaleResult> {
  * message. Splitting message-formatting from probing keeps the
  * preflight pure and tests stable across platforms.
  */
-export function formatPortConflictError(conflicts: readonly PortConflict[]): string {
+export function formatPortConflictError(
+  conflicts: readonly PortConflict[],
+): string {
   const list = conflicts
     .map((c) => `  - ${c.name} → ${c.address}:${c.port}`)
     .join("\n");
@@ -743,7 +755,10 @@ export function buildInspectorExtraArgs(
  * without spawning workerd.
  */
 export function buildMaxHeapExtraArgs(maxHeapMB: number | undefined): string[] {
-  if (typeof maxHeapMB !== "number" || !Number.isFinite(maxHeapMB) || maxHeapMB <= 0) {
+  if (
+    typeof maxHeapMB !== "number" || !Number.isFinite(maxHeapMB) ||
+    maxHeapMB <= 0
+  ) {
     return [];
   }
   return [`--v8-max-heap-size=${Math.floor(maxHeapMB)}`];
@@ -785,7 +800,10 @@ async function forwardToWorkerd(
   const headers = new Headers();
   for (const [k, v] of req.headers) {
     const key = k.toLowerCase();
-    if (key === "host" || key === "content-length" || key === "connection" || key === "transfer-encoding") {
+    if (
+      key === "host" || key === "content-length" || key === "connection" ||
+      key === "transfer-encoding"
+    ) {
       continue;
     }
     headers.set(k, v);
@@ -830,7 +848,9 @@ async function forwardToWorkerd(
   });
 }
 
-export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBackend {
+export function createWorkerdBackend(
+  opts: WorkerdBackendOptions,
+): WorkerdBackend {
   const cwd = Deno.cwd();
   const functionsDir = isAbsolute(opts.functionsDir)
     ? opts.functionsDir
@@ -838,7 +858,8 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
   const configPath = isAbsolute(opts.configPath)
     ? opts.configPath
     : resolvePath(cwd, opts.configPath);
-  const workerdBin = opts.workerdBin ?? Deno.env.get("1TUBE_WORKERD_BIN") ?? "workerd";
+  const workerdBin = opts.workerdBin ?? Deno.env.get("1TUBE_WORKERD_BIN") ??
+    "workerd";
 
   // Mutable state set during start(). Kept in closure scope so dispatch()
   // can reach it without an extra indirection layer.
@@ -892,7 +913,9 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
   let sharedRuntime: WorkerdSharedRuntime | null = null;
   const runtimeOverrides = new RuntimeOverrideStore({
     rootDir: opts.runtimeOverrideDir
-      ? (isAbsolute(opts.runtimeOverrideDir) ? opts.runtimeOverrideDir : resolvePath(cwd, opts.runtimeOverrideDir))
+      ? (isAbsolute(opts.runtimeOverrideDir)
+        ? opts.runtimeOverrideDir
+        : resolvePath(cwd, opts.runtimeOverrideDir))
       : defaultRuntimeOverrideRoot(cwd),
     sourceFunctionsDir: resolvedFunctionsDir,
     prebuiltDir,
@@ -948,13 +971,17 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     if (cacheDir === null) {
       if (prebuiltDir !== null) {
         cacheDir = opts.cacheDir
-          ? (isAbsolute(opts.cacheDir) ? opts.cacheDir : resolvePath(cwd, opts.cacheDir))
+          ? (isAbsolute(opts.cacheDir)
+            ? opts.cacheDir
+            : resolvePath(cwd, opts.cacheDir))
           : join(await defaultCacheDir(cwd), "prebuilt-runtime");
         await ensureDir(cacheDir);
         await writeGitignore(cacheDir);
       } else {
         cacheDir = opts.cacheDir
-          ? (isAbsolute(opts.cacheDir) ? opts.cacheDir : resolvePath(cwd, opts.cacheDir))
+          ? (isAbsolute(opts.cacheDir)
+            ? opts.cacheDir
+            : resolvePath(cwd, opts.cacheDir))
           : await defaultCacheDir(cwd);
         await ensureDir(cacheDir);
         await writeGitignore(cacheDir);
@@ -986,15 +1013,23 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       const overlays = runtimeEditorEnabled
         ? await runtimeOverrides.compose(baseNames)
         : [];
-      for (const overlay of overlays) overlayManifests.set(overlay.name, overlay.manifest);
-      const patchedNames = new Set(overlays.filter((e) => e.origin === "patched").map((e) => e.name));
-      let entries = prebuiltManifest.functions.filter((e) => !patchedNames.has(e.name));
+      for (const overlay of overlays) {
+        overlayManifests.set(overlay.name, overlay.manifest);
+      }
+      const patchedNames = new Set(
+        overlays.filter((e) => e.origin === "patched").map((e) => e.name),
+      );
+      let entries = prebuiltManifest.functions.filter((e) =>
+        !patchedNames.has(e.name)
+      );
       if (opts.only && opts.only.length > 0) {
         const allow = new Set(opts.only);
         entries = entries.filter((e) => allow.has(e.name));
         if (entries.length === 0) {
           throw new Error(
-            `workerd backend: no prebuilt functions matched 'only' filter ${JSON.stringify(opts.only)}`,
+            `workerd backend: no prebuilt functions matched 'only' filter ${
+              JSON.stringify(opts.only)
+            }`,
           );
         }
       }
@@ -1021,7 +1056,10 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
           });
         }
         const overlayResults = await overlayBundler.bundleAll(
-          overlays.map((entry) => ({ name: entry.name, entrypoint: entry.entrypoint })),
+          overlays.map((entry) => ({
+            name: entry.name,
+            entrypoint: entry.entrypoint,
+          })),
           { concurrency: opts.bundleConcurrency ?? 4 },
         );
         bundleResults.push(...overlayResults);
@@ -1041,7 +1079,9 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
         inputs = inputs.filter((i) => allow.has(i.name));
         if (inputs.length === 0) {
           throw new Error(
-            `workerd backend: no functions matched 'only' filter ${JSON.stringify(opts.only)}`,
+            `workerd backend: no functions matched 'only' filter ${
+              JSON.stringify(opts.only)
+            }`,
           );
         }
       }
@@ -1049,12 +1089,17 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       const overlays = runtimeEditorEnabled
         ? await runtimeOverrides.compose(baseNames)
         : [];
-      for (const overlay of overlays) overlayManifests.set(overlay.name, overlay.manifest);
+      for (const overlay of overlays) {
+        overlayManifests.set(overlay.name, overlay.manifest);
+      }
       if (overlays.length > 0) {
         const overlayNames = new Set(overlays.map((entry) => entry.name));
         inputs = [
           ...inputs.filter((input) => !overlayNames.has(input.name)),
-          ...overlays.map((entry) => ({ name: entry.name, entrypoint: entry.entrypoint })),
+          ...overlays.map((entry) => ({
+            name: entry.name,
+            entrypoint: entry.entrypoint,
+          })),
         ].sort((a, b) => a.name.localeCompare(b.name));
       }
       if (inputs.length === 0) {
@@ -1147,13 +1192,15 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       }
     }
 
-      // Surface per-function bundle stats at boot so operators can spot
-      // a 50MB bundle (usually the result of an unintended deep import)
-      // before it OOMs the workerd isolate. On HMR reloads we only log
-      // the bundles that actually got rebuilt (passthroughs would have
-      // a misleading 0B / 0ms entry).
+    // Surface per-function bundle stats at boot so operators can spot
+    // a 50MB bundle (usually the result of an unintended deep import)
+    // before it OOMs the workerd isolate. On HMR reloads we only log
+    // the bundles that actually got rebuilt (passthroughs would have
+    // a misleading 0B / 0ms entry).
     if (args.gen === 0) {
-      const sorted = [...bundleResults].sort((a, b) => b.byteLength - a.byteLength);
+      const sorted = [...bundleResults].sort((a, b) =>
+        b.byteLength - a.byteLength
+      );
       const total = sorted.reduce((acc, r) => acc + r.byteLength, 0);
       const totalMs = sorted.reduce((acc, r) => acc + r.durationMs, 0);
       const fmtBytes = (n: number) => {
@@ -1166,330 +1213,367 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
       console.log(`[1tube] workerd bundle sizes (sorted, largest first):`);
       for (const r of sorted) {
         console.log(
-          `  ${r.name.padEnd(namePad)}  ${fmtBytes(r.byteLength).padStart(8)}  (${r.durationMs.toFixed(0)}ms)`,
+          `  ${r.name.padEnd(namePad)}  ${
+            fmtBytes(r.byteLength).padStart(8)
+          }  (${r.durationMs.toFixed(0)}ms)`,
         );
       }
       console.log(
-        `  ${"total".padEnd(namePad)}  ${fmtBytes(total).padStart(8)}  (${totalMs.toFixed(0)}ms across ${sorted.length} fn${sorted.length === 1 ? "" : "s"})`,
+        `  ${"total".padEnd(namePad)}  ${fmtBytes(total).padStart(8)}  (${
+          totalMs.toFixed(0)
+        }ms across ${sorted.length} fn${sorted.length === 1 ? "" : "s"})`,
       );
     }
 
-      // Capnp. Clamp the configured compat date down to what this
-      // binary actually accepts: workerd refuses any date later than
-      // its build date with `compatibility date "..." is too new`. We
-      // derive that ceiling from the version string we already
-      // probed, which avoids a second subprocess and avoids relying
-      // on workerd's own error message format. When the version
-      // doesn't parse into a recognisable build date (custom builds,
-      // `--version` output we don't yet understand) we leave the
-      // operator's choice alone and let workerd's own boot error
-      // surface if it's wrong.
-      const ceiling = workerdVersion
-        ? maxCompatDateFromVersion(workerdVersion)
-        : null;
-      let effectiveCompatDate = opts.compatibilityDate;
-      if (ceiling) {
-        const requested = opts.compatibilityDate;
-        if (requested && !isCompatDateAtMost(requested, ceiling)) {
-          console.warn(
-            `[1tube] workerd v${workerdVersion} accepts compatibility dates up to ` +
-              `${ceiling}; clamping requested ${requested} down to ${ceiling}.`,
-          );
-          effectiveCompatDate = ceiling;
-        } else if (!requested) {
-          // No explicit override — clamp the implicit default if the
-          // binary is older than today's date. This is the common
-          // path for users on a pinned-but-not-bleeding-edge build.
-          effectiveCompatDate = ceiling;
-        }
+    // Capnp. Clamp the configured compat date down to what this
+    // binary actually accepts: workerd refuses any date later than
+    // its build date with `compatibility date "..." is too new`. We
+    // derive that ceiling from the version string we already
+    // probed, which avoids a second subprocess and avoids relying
+    // on workerd's own error message format. When the version
+    // doesn't parse into a recognisable build date (custom builds,
+    // `--version` output we don't yet understand) we leave the
+    // operator's choice alone and let workerd's own boot error
+    // surface if it's wrong.
+    const ceiling = workerdVersion
+      ? maxCompatDateFromVersion(workerdVersion)
+      : null;
+    let effectiveCompatDate = opts.compatibilityDate;
+    if (ceiling) {
+      const requested = opts.compatibilityDate;
+      if (requested && !isCompatDateAtMost(requested, ceiling)) {
+        console.warn(
+          `[1tube] workerd v${workerdVersion} accepts compatibility dates up to ` +
+            `${ceiling}; clamping requested ${requested} down to ${ceiling}.`,
+        );
+        effectiveCompatDate = ceiling;
+      } else if (!requested) {
+        // No explicit override — clamp the implicit default if the
+        // binary is older than today's date. This is the common
+        // path for users on a pinned-but-not-bleeding-edge build.
+        effectiveCompatDate = ceiling;
       }
+    }
 
-      // Resolve the gateway-wide env policy. Workerd gets live secrets
-      // plus the operator's explicit allowlist. We deliberately do not
-      // infer source usage here: dynamic access is common, and secrets
-      // are runtime configuration.
-      const hasConfiguredEnvPolicy = (opts.envAllowlist?.length ?? 0) > 0 ||
-        ((Deno.env.get("1TUBE_WORKERD_ENV") ?? "").trim().length > 0);
-      const secretNames = runtimeSecretNames();
-      const {
-        resolved: configuredEnvBindings,
-        missing: missingEnv,
-        mode: configuredEnvMode,
-      } = resolveEnvAllowlist(opts.envAllowlist);
-      const gatewayEnvBindings = [...new Set([
+    // Resolve the gateway-wide env policy. Workerd gets live secrets
+    // plus the operator's explicit allowlist. We deliberately do not
+    // infer source usage here: dynamic access is common, and secrets
+    // are runtime configuration.
+    const hasConfiguredEnvPolicy = (opts.envAllowlist?.length ?? 0) > 0 ||
+      ((Deno.env.get("1TUBE_WORKERD_ENV") ?? "").trim().length > 0);
+    const secretNames = runtimeSecretNames();
+    const {
+      resolved: configuredEnvBindings,
+      missing: missingEnv,
+      mode: configuredEnvMode,
+    } = resolveEnvAllowlist(opts.envAllowlist);
+    const gatewayEnvBindings = [
+      ...new Set([
         ...secretNames,
         ...(hasConfiguredEnvPolicy ? configuredEnvBindings : []),
-      ])].sort();
-      if (missingEnv.length > 0) {
-        console.warn(
-          `[1tube] workerd env allowlist references vars not present in the gateway env: ` +
-            `${missingEnv.join(", ")} — these will be unavailable to functions. ` +
-            `Set them before starting the gateway, or remove them from the allowlist.`,
+      ]),
+    ].sort();
+    if (missingEnv.length > 0) {
+      console.warn(
+        `[1tube] workerd env allowlist references vars not present in the gateway env: ` +
+          `${
+            missingEnv.join(", ")
+          } — these will be unavailable to functions. ` +
+          `Set them before starting the gateway, or remove them from the allowlist.`,
+      );
+    }
+    if (hasConfiguredEnvPolicy && configuredEnvBindings.length > 0) {
+      if (configuredEnvMode === "all") {
+        console.log(
+          `[1tube] forwarding all ${configuredEnvBindings.length} env var(s) to workerd ` +
+            `plus ${secretNames.length} runtime secret name(s) (explicit '*')`,
         );
-      }
-      if (hasConfiguredEnvPolicy && configuredEnvBindings.length > 0) {
-        if (configuredEnvMode === "all") {
-          console.log(
-            `[1tube] forwarding all ${configuredEnvBindings.length} env var(s) to workerd ` +
-              `plus ${secretNames.length} runtime secret name(s) (explicit '*')`,
-          );
-        } else {
-          console.log(
-            `[1tube] forwarding ${gatewayEnvBindings.length} env var(s) to workerd ` +
-              `(${secretNames.length} secret(s), ${configuredEnvBindings.length} explicit): ${gatewayEnvBindings.join(", ")}`,
-          );
-        }
-      } else if (secretNames.length > 0) {
-        console.log(`[1tube] forwarding ${secretNames.length} runtime secret env var(s) to workerd: ${secretNames.join(", ")}`);
-      }
-
-      // Load each function's 1tube.json. Missing files yield
-      // defaultManifest() so per-function knobs (timeoutMs, rpm,
-      // permissions.env, recycle) are always available downstream
-      // even when the operator hasn't authored a manifest. Always
-      // re-read on reload — a manifest-only edit ships through the
-      // hot reloader as a non-bundle change, so the JSON has to be
-      // re-parsed even when no bundle is rebuilt.
-      //
-      // Prebuilt mode short-circuits the disk read: each manifest is
-      // already inline in the artifact's index, and the source tree
-      // is not assumed to exist on the serve box.
-      const newManifests = new Map<string, FunctionManifest>();
-      if (prebuiltDir !== null && prebuiltManifest) {
-        for (const e of prebuiltManifest.functions) {
-          if (!overlayManifests.has(e.name)) newManifests.set(e.name, e.manifest);
-        }
       } else {
-        await Promise.all(
-          bundleResults.map(async (r) => {
-            const m = overlayManifests.get(r.name) ?? await loadManifest(resolvedFunctionsDir, r.name);
-            newManifests.set(r.name, m);
-          }),
-        );
-      }
-      for (const [name, manifest] of overlayManifests) {
-        newManifests.set(name, manifest);
-      }
-
-      // Mirror the Deno backend's two-mode env story:
-      //   - Default: every function sees the full gateway allowlist.
-      //     Manifest `permissions.env` is documentation only.
-      //   - `1TUBE_ENFORCE_MANIFEST=1`: each function only sees its
-      //     declared subset (intersection with the gateway list).
-      //     `permissions.env: ["*"]` opts back into "everything".
-      // This keeps a single env-policy switch across both backends,
-      // and avoids surprising operators who flip enforcement on after
-      // shipping for a while.
-      const enforceManifest = (Deno.env.get("1TUBE_ENFORCE_MANIFEST") ?? "") === "1";
-      const prebuiltBundleFiles = prebuiltManifest
-        ? new Map(prebuiltManifest.functions.map((e) => [e.name, e.bundleFile]))
-        : null;
-      const prebuiltModuleFiles = prebuiltManifest
-        ? new Map(prebuiltManifest.functions.map((e) => [e.name, e.moduleFiles]))
-        : null;
-      if (!sharedRuntime && sharedModules.length > 0) {
-        sharedRuntime = await startWorkerdSharedRuntime(sharedModules);
-      }
-      const internalEnvBindings = sharedRuntime
-        ? [SHARED_RUNTIME_URL_ENV, SHARED_RUNTIME_TOKEN_ENV]
-        : [];
-      const capnpInputs = bundleResults.map((r) => {
-        const m = newManifests.get(r.name)!;
-        const bundleEmbedPath = overlayManifests.has(r.name)
-          ? relative(cacheDir!, r.bundlePath).replaceAll("\\", "/")
-          : prebuiltBundleFiles?.get(r.name) ??
-            relative(cacheDir!, r.bundlePath).replaceAll("\\", "/");
-        const fnEnvBindings = intersectEnvForFunction(gatewayEnvBindings, m.permissions.env, enforceManifest);
-        for (const internalName of internalEnvBindings) {
-          if (!fnEnvBindings.includes(internalName)) fnEnvBindings.push(internalName);
-        }
-        return {
-          name: r.name,
-          // Live mode writes capnp next to the bundles, so basename is
-          // enough. Prebuilt artifacts keep bundles under dist/functions/
-          // and capnp is written at dist/, so use the manifest-relative
-          // path ("functions/<fn>.js") or workerd cannot resolve embeds.
-          bundleBasename: bundleEmbedPath,
-          moduleFiles: overlayManifests.has(r.name) ? undefined : prebuiltModuleFiles?.get(r.name),
-          envBindings: fnEnvBindings,
-        };
-      });
-
-      // Shift the basePort by an even/odd slot so a reload's new
-      // process never collides with the still-serving old one. Two
-      // slots is enough — we only ever overlap during the swap.
-      // 500 ports of headroom per slot is plenty for any realistic
-      // function count (basePort default is 8800; 8800..9300 even,
-      // 9300..9800 odd).
-      const slot = args.gen % 2;
-      const shiftedBasePort = (opts.basePort ?? 8800) + slot * 500;
-
-      const capnp = generateCapnp(capnpInputs, {
-        bindAddress: opts.bindAddress,
-        basePort: shiftedBasePort,
-        compatibilityDate: effectiveCompatDate,
-        compatibilityFlags: opts.compatibilityFlags,
-        allowLocalOutbound: sharedRuntime !== null,
-      });
-      // Per-generation capnp filename so a crashed reload can't leave
-      // an old process pointed at a half-written config.
-      const capnpPath = join(cacheDir, `config.gen-${slot}.capnp`);
-      await Deno.writeTextFile(capnpPath, capnp.text);
-
-      const newRoutesByName = new Map(capnp.routes.map((r) => [r.name, r]));
-      const newNames = capnp.routes.map((r) => r.name).sort();
-      if (args.gen === 0) {
-        const ports = capnp.routes.map((r) => r.port);
-        const minPort = Math.min(...ports);
-        const maxPort = Math.max(...ports);
-        const totalEnvBindings = capnpInputs.reduce((sum, input) => sum + (input.envBindings?.length ?? 0), 0);
-        const maxEnvBindings = capnpInputs.reduce((max, input) => Math.max(max, input.envBindings?.length ?? 0), 0);
         console.log(
-          `[1tube] workerd config: path=${capnpPath} services=${capnp.routes.length} ` +
-            `ports=${minPort}${minPort === maxPort ? "" : `-${maxPort}`} ` +
-            `compat=${effectiveCompatDate ?? "default"} ` +
-            `flags=${(opts.compatibilityFlags ?? ["default"]).join(",")} ` +
-            `envMode=${hasConfiguredEnvPolicy ? configuredEnvMode : "secrets"} ` +
-            `envBindingsTotal=${totalEnvBindings} envBindingsMaxPerFn=${maxEnvBindings}`,
+          `[1tube] forwarding ${gatewayEnvBindings.length} env var(s) to workerd ` +
+            `(${secretNames.length} secret(s), ${configuredEnvBindings.length} explicit): ${
+              gatewayEnvBindings.join(", ")
+            }`,
         );
       }
+    } else if (secretNames.length > 0) {
+      console.log(
+        `[1tube] forwarding ${secretNames.length} runtime secret env var(s) to workerd: ${
+          secretNames.join(", ")
+        }`,
+      );
+    }
 
-      // Preflight: refuse to spawn workerd against ports that are
-      // already in use. Without this, a leftover workerd from a
-      // previous run can satisfy the readiness probe and silently
-      // steal our traffic; the failure then surfaces only as stale
-      // response bodies. On reload the still-serving current process
-      // occupies the OTHER slot's ports by design, so probing the next
-      // slot is safe and catches orphaned older generations.
-      let conflicts = probeSocketsFree(capnp.routes);
-      if (conflicts.length > 0 && opts.killStaleWorkerd) {
-        console.log(
-          `[1tube] port preflight found ${conflicts.length} conflict(s)` +
-            (args.gen > 0 ? ` for reload gen=${args.gen}` : "") +
-            `; --kill-stale-workerd is set, attempting cleanup...`,
-        );
+    // Load each function's 1tube.json. Missing files yield
+    // defaultManifest() so per-function knobs (timeoutMs, rpm,
+    // permissions.env, recycle) are always available downstream
+    // even when the operator hasn't authored a manifest. Always
+    // re-read on reload — a manifest-only edit ships through the
+    // hot reloader as a non-bundle change, so the JSON has to be
+    // re-parsed even when no bundle is rebuilt.
+    //
+    // Prebuilt mode short-circuits the disk read: each manifest is
+    // already inline in the artifact's index, and the source tree
+    // is not assumed to exist on the serve box.
+    const newManifests = new Map<string, FunctionManifest>();
+    if (prebuiltDir !== null && prebuiltManifest) {
+      for (const e of prebuiltManifest.functions) {
+        if (!overlayManifests.has(e.name)) newManifests.set(e.name, e.manifest);
+      }
+    } else {
+      await Promise.all(
+        bundleResults.map(async (r) => {
+          const m = overlayManifests.get(r.name) ??
+            await loadManifest(resolvedFunctionsDir, r.name);
+          newManifests.set(r.name, m);
+        }),
+      );
+    }
+    for (const [name, manifest] of overlayManifests) {
+      newManifests.set(name, manifest);
+    }
 
-        // First try the precise fix: resolve the conflicted port(s)
-        // to their owning PID(s), and kill only owners named workerd.
-        // That is the behavior we want during firmware flashing:
-        // remove the stale candidate that owns 8800, but never kill
-        // a random non-workerd process that happens to be there.
-        const targeted = await killWorkerdOwnersOfPorts(conflicts);
-        if (targeted.attempted) {
-          if (targeted.code === 0) {
-            const details = targeted.stdout?.trim();
-            console.log(
-              `[1tube] targeted stale-workerd cleanup by port complete` +
-                (details ? ` (${details})` : "") +
-                `; re-probing...`,
-            );
-          } else {
-            console.warn(
-              `[1tube] targeted stale-workerd cleanup exited ${targeted.code}` +
-                (targeted.stderr ? `: ${targeted.stderr.trim()}` : ""),
-            );
-          }
-          await new Promise((r) => setTimeout(r, 250));
-          conflicts = probeSocketsFree(capnp.routes);
+    // Mirror the Deno backend's two-mode env story:
+    //   - Default: every function sees the full gateway allowlist.
+    //     Manifest `permissions.env` is documentation only.
+    //   - `1TUBE_ENFORCE_MANIFEST=1`: each function only sees its
+    //     declared subset (intersection with the gateway list).
+    //     `permissions.env: ["*"]` opts back into "everything".
+    // This keeps a single env-policy switch across both backends,
+    // and avoids surprising operators who flip enforcement on after
+    // shipping for a while.
+    const enforceManifest =
+      (Deno.env.get("1TUBE_ENFORCE_MANIFEST") ?? "") === "1";
+    const prebuiltBundleFiles = prebuiltManifest
+      ? new Map(prebuiltManifest.functions.map((e) => [e.name, e.bundleFile]))
+      : null;
+    const prebuiltModuleFiles = prebuiltManifest
+      ? new Map(prebuiltManifest.functions.map((e) => [e.name, e.moduleFiles]))
+      : null;
+    if (!sharedRuntime && sharedModules.length > 0) {
+      sharedRuntime = await startWorkerdSharedRuntime(sharedModules);
+    }
+    const internalEnvBindings = sharedRuntime
+      ? [SHARED_RUNTIME_URL_ENV, SHARED_RUNTIME_TOKEN_ENV]
+      : [];
+    const capnpInputs = bundleResults.map((r) => {
+      const m = newManifests.get(r.name)!;
+      const bundleEmbedPath = overlayManifests.has(r.name)
+        ? relative(cacheDir!, r.bundlePath).replaceAll("\\", "/")
+        : prebuiltBundleFiles?.get(r.name) ??
+          relative(cacheDir!, r.bundlePath).replaceAll("\\", "/");
+      const fnEnvBindings = intersectEnvForFunction(
+        gatewayEnvBindings,
+        m.permissions.env,
+        enforceManifest,
+      );
+      for (const internalName of internalEnvBindings) {
+        if (!fnEnvBindings.includes(internalName)) {
+          fnEnvBindings.push(internalName);
         }
+      }
+      return {
+        name: r.name,
+        // Live mode writes capnp next to the bundles, so basename is
+        // enough. Prebuilt artifacts keep bundles under dist/functions/
+        // and capnp is written at dist/, so use the manifest-relative
+        // path ("functions/<fn>.js") or workerd cannot resolve embeds.
+        bundleBasename: bundleEmbedPath,
+        moduleFiles: overlayManifests.has(r.name)
+          ? undefined
+          : prebuiltModuleFiles?.get(r.name),
+        envBindings: fnEnvBindings,
+      };
+    });
 
-        // If targeted cleanup did not exist on this platform, or it
-        // found no matching workerd owner, fall back to the old typed
-        // process-name cleanup.
-        const result = conflicts.length > 0 ? await killStaleWorkerd() : null;
-        if (result === null) {
-          // Already clear.
-        } else if (result.attempted) {
-          // taskkill returns 128 when no matching image is running —
-          // that's not an error in our context (means the offender
-          // wasn't workerd, which is fine; preflight will catch it).
-          // pkill returns 1 in the same case.
-          const noMatch = (Deno.build.os === "windows" && result.code === 128) ||
-            (Deno.build.os !== "windows" && result.code === 1);
-          if (result.code === 0) {
-            console.log(`[1tube] killed leftover workerd process(es); re-probing...`);
-          } else if (noMatch) {
-            console.log(
-              `[1tube] no leftover workerd processes found; the conflict is held ` +
-                `by something else (re-probing to confirm)...`,
-            );
-          } else {
-            console.warn(
-              `[1tube] ${result.command?.join(" ")} exited ${result.code}` +
-                (result.stderr ? `: ${result.stderr.trim()}` : ""),
-            );
-          }
-          // Brief settle time: Windows TCP sockets in CLOSE_WAIT can
-          // hold the port for a fraction of a second after the owner
-          // process is killed. 250ms is empirically enough on the
-          // dev boxes we've tested without making the boot path feel
-          // sluggish.
-          await new Promise((r) => setTimeout(r, 250));
-          conflicts = probeSocketsFree(capnp.routes);
+    // Shift the basePort by an even/odd slot so a reload's new
+    // process never collides with the still-serving old one. Two
+    // slots is enough — we only ever overlap during the swap.
+    // 500 ports of headroom per slot is plenty for any realistic
+    // function count (basePort default is 8800; 8800..9300 even,
+    // 9300..9800 odd).
+    const slot = args.gen % 2;
+    const shiftedBasePort = (opts.basePort ?? 8800) + slot * 500;
+
+    const capnp = generateCapnp(capnpInputs, {
+      bindAddress: opts.bindAddress,
+      basePort: shiftedBasePort,
+      compatibilityDate: effectiveCompatDate,
+      compatibilityFlags: opts.compatibilityFlags,
+      allowLocalOutbound: sharedRuntime !== null,
+    });
+    // Per-generation capnp filename so a crashed reload can't leave
+    // an old process pointed at a half-written config.
+    const capnpPath = join(cacheDir, `config.gen-${slot}.capnp`);
+    await Deno.writeTextFile(capnpPath, capnp.text);
+
+    const newRoutesByName = new Map(capnp.routes.map((r) => [r.name, r]));
+    const newNames = capnp.routes.map((r) => r.name).sort();
+    if (args.gen === 0) {
+      const ports = capnp.routes.map((r) => r.port);
+      const minPort = Math.min(...ports);
+      const maxPort = Math.max(...ports);
+      const totalEnvBindings = capnpInputs.reduce(
+        (sum, input) => sum + (input.envBindings?.length ?? 0),
+        0,
+      );
+      const maxEnvBindings = capnpInputs.reduce(
+        (max, input) => Math.max(max, input.envBindings?.length ?? 0),
+        0,
+      );
+      console.log(
+        `[1tube] workerd config: path=${capnpPath} services=${capnp.routes.length} ` +
+          `ports=${minPort}${minPort === maxPort ? "" : `-${maxPort}`} ` +
+          `compat=${effectiveCompatDate ?? "default"} ` +
+          `flags=${(opts.compatibilityFlags ?? ["default"]).join(",")} ` +
+          `envMode=${hasConfiguredEnvPolicy ? configuredEnvMode : "secrets"} ` +
+          `envBindingsTotal=${totalEnvBindings} envBindingsMaxPerFn=${maxEnvBindings}`,
+      );
+    }
+
+    // Preflight: refuse to spawn workerd against ports that are
+    // already in use. Without this, a leftover workerd from a
+    // previous run can satisfy the readiness probe and silently
+    // steal our traffic; the failure then surfaces only as stale
+    // response bodies. On reload the still-serving current process
+    // occupies the OTHER slot's ports by design, so probing the next
+    // slot is safe and catches orphaned older generations.
+    let conflicts = probeSocketsFree(capnp.routes);
+    if (conflicts.length > 0 && opts.killStaleWorkerd) {
+      console.log(
+        `[1tube] port preflight found ${conflicts.length} conflict(s)` +
+          (args.gen > 0 ? ` for reload gen=${args.gen}` : "") +
+          `; --kill-stale-workerd is set, attempting cleanup...`,
+      );
+
+      // First try the precise fix: resolve the conflicted port(s)
+      // to their owning PID(s), and kill only owners named workerd.
+      // That is the behavior we want during firmware flashing:
+      // remove the stale candidate that owns 8800, but never kill
+      // a random non-workerd process that happens to be there.
+      const targeted = await killWorkerdOwnersOfPorts(conflicts);
+      if (targeted.attempted) {
+        if (targeted.code === 0) {
+          const details = targeted.stdout?.trim();
+          console.log(
+            `[1tube] targeted stale-workerd cleanup by port complete` +
+              (details ? ` (${details})` : "") +
+              `; re-probing...`,
+          );
         } else {
           console.warn(
-            `[1tube] could not run ${result.command?.join(" ")}: ` +
-              `${result.stderr ?? "unknown error"}`,
+            `[1tube] targeted stale-workerd cleanup exited ${targeted.code}` +
+              (targeted.stderr ? `: ${targeted.stderr.trim()}` : ""),
           );
         }
-      }
-      if (conflicts.length > 0) {
-        throw new Error(formatPortConflictError(conflicts));
+        await new Promise((r) => setTimeout(r, 250));
+        conflicts = probeSocketsFree(capnp.routes);
       }
 
-      const inspectorArgs = buildInspectorExtraArgs(opts.inspectorAddr, slot);
-      if (inspectorArgs.length > 0) {
-        // One log per spawn so operators can see exactly which port
-        // the new generation listens on after an HMR reload.
-        console.log(
-          `[1tube] workerd V8 inspector: ${inspectorArgs[0].replace(/^--inspector-addr=/, "")} ` +
-            `(gen=${args.gen}) — open chrome://inspect to attach`,
+      // If targeted cleanup did not exist on this platform, or it
+      // found no matching workerd owner, fall back to the old typed
+      // process-name cleanup.
+      const result = conflicts.length > 0 ? await killStaleWorkerd() : null;
+      if (result === null) {
+        // Already clear.
+      } else if (result.attempted) {
+        // taskkill returns 128 when no matching image is running —
+        // that's not an error in our context (means the offender
+        // wasn't workerd, which is fine; preflight will catch it).
+        // pkill returns 1 in the same case.
+        const noMatch = (Deno.build.os === "windows" && result.code === 128) ||
+          (Deno.build.os !== "windows" && result.code === 1);
+        if (result.code === 0) {
+          console.log(
+            `[1tube] killed leftover workerd process(es); re-probing...`,
+          );
+        } else if (noMatch) {
+          console.log(
+            `[1tube] no leftover workerd processes found; the conflict is held ` +
+              `by something else (re-probing to confirm)...`,
+          );
+        } else {
+          console.warn(
+            `[1tube] ${result.command?.join(" ")} exited ${result.code}` +
+              (result.stderr ? `: ${result.stderr.trim()}` : ""),
+          );
+        }
+        // Brief settle time: Windows TCP sockets in CLOSE_WAIT can
+        // hold the port for a fraction of a second after the owner
+        // process is killed. 250ms is empirically enough on the
+        // dev boxes we've tested without making the boot path feel
+        // sluggish.
+        await new Promise((r) => setTimeout(r, 250));
+        conflicts = probeSocketsFree(capnp.routes);
+      } else {
+        console.warn(
+          `[1tube] could not run ${result.command?.join(" ")}: ` +
+            `${result.stderr ?? "unknown error"}`,
         );
       }
+    }
+    if (conflicts.length > 0) {
+      throw new Error(formatPortConflictError(conflicts));
+    }
 
-      const maxHeapArgs = buildMaxHeapExtraArgs(opts.maxHeapMB);
-      const extraArgs = [...inspectorArgs, ...maxHeapArgs];
-      const verboseWorkerd = (Deno.env.get("1TUBE_WORKERD_VERBOSE") ?? "") === "1";
-      if (verboseWorkerd) {
-        console.log(`[1tube] workerd verbose logging enabled (1TUBE_WORKERD_VERBOSE=1)`);
-      }
-      const globalArgs = [
-        ...(verboseWorkerd ? ["-v"] : []),
-        ...(opts.experimental ? ["--experimental"] : []),
-      ];
+    const inspectorArgs = buildInspectorExtraArgs(opts.inspectorAddr, slot);
+    if (inspectorArgs.length > 0) {
+      // One log per spawn so operators can see exactly which port
+      // the new generation listens on after an HMR reload.
+      console.log(
+        `[1tube] workerd V8 inspector: ${
+          inspectorArgs[0].replace(/^--inspector-addr=/, "")
+        } ` +
+          `(gen=${args.gen}) — open chrome://inspect to attach`,
+      );
+    }
 
-      const newProcess = createWorkerdProcess({
-        binary: workerdBin,
-        capnpPath,
-        routes: capnp.routes,
-        ...(globalArgs.length > 0 ? { globalArgs } : {}),
-        extraArgs,
-        env: sharedRuntime
-          ? {
-            ...Deno.env.toObject(),
-            [SHARED_RUNTIME_URL_ENV]: sharedRuntime.url,
-            [SHARED_RUNTIME_TOKEN_ENV]: sharedRuntime.token,
-          }
-          : undefined,
-        logLineSink: opts.logLineSink,
-      });
-      try {
-        await newProcess.start();
-      } catch (err) {
-        // Boot failed. On initial start the caller will dispose the
-        // bundler. On reload we leave the bundler alive so subsequent
-        // saves can retry quickly.
-        throw err;
-      }
+    const maxHeapArgs = buildMaxHeapExtraArgs(opts.maxHeapMB);
+    const extraArgs = [...inspectorArgs, ...maxHeapArgs];
+    const verboseWorkerd =
+      (Deno.env.get("1TUBE_WORKERD_VERBOSE") ?? "") === "1";
+    if (verboseWorkerd) {
+      console.log(
+        `[1tube] workerd verbose logging enabled (1TUBE_WORKERD_VERBOSE=1)`,
+      );
+    }
+    const globalArgs = [
+      ...(verboseWorkerd ? ["-v"] : []),
+      ...(opts.experimental ? ["--experimental"] : []),
+    ];
 
-      return {
-        process: newProcess,
-        routesByName: newRoutesByName,
-        names: newNames,
-        manifests: newManifests,
-        rebundled: rebundledNames,
-        bundleResults,
-      };
+    const newProcess = createWorkerdProcess({
+      binary: workerdBin,
+      capnpPath,
+      routes: capnp.routes,
+      ...(globalArgs.length > 0 ? { globalArgs } : {}),
+      extraArgs,
+      env: sharedRuntime
+        ? {
+          ...Deno.env.toObject(),
+          [SHARED_RUNTIME_URL_ENV]: sharedRuntime.url,
+          [SHARED_RUNTIME_TOKEN_ENV]: sharedRuntime.token,
+        }
+        : undefined,
+      logLineSink: opts.logLineSink,
+    });
+    try {
+      await newProcess.start();
+    } catch (err) {
+      // Boot failed. On initial start the caller will dispose the
+      // bundler. On reload we leave the bundler alive so subsequent
+      // saves can retry quickly.
+      throw err;
+    }
+
+    return {
+      process: newProcess,
+      routesByName: newRoutesByName,
+      names: newNames,
+      manifests: newManifests,
+      rebundled: rebundledNames,
+      bundleResults,
+    };
   }
 
   // Crash-restart bookkeeping. We allow up to MAX_CRASHES inside
@@ -1538,8 +1622,12 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
 
       console.error(
         `[1tube] workerd crashed (gen=${generation}, code=${code}, ` +
-          `crashes=${crashTimestamps.length}/${MAX_CRASHES} in ${(CRASH_WINDOW_MS / 1000).toFixed(0)}s)` +
-          (expectedRetry ? " — auto-recycling..." : " — GIVING UP, manual restart required."),
+          `crashes=${crashTimestamps.length}/${MAX_CRASHES} in ${
+            (CRASH_WINDOW_MS / 1000).toFixed(0)
+          }s)` +
+          (expectedRetry
+            ? " — auto-recycling..."
+            : " — GIVING UP, manual restart required."),
       );
 
       try {
@@ -1575,10 +1663,14 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     changed?: ReadonlySet<string> | "all",
   ): Promise<WorkerdReloadResult> {
     if (!started) {
-      return Promise.reject(new Error("workerd backend not started; cannot reload"));
+      return Promise.reject(
+        new Error("workerd backend not started; cannot reload"),
+      );
     }
     if (stopping) {
-      return Promise.reject(new Error("workerd backend is stopping; reload denied"));
+      return Promise.reject(
+        new Error("workerd backend is stopping; reload denied"),
+      );
     }
     // `process == null` is allowed here: it's exactly the state we
     // land in after a crash (onExit fired and cleared `process`) or
@@ -1599,7 +1691,9 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     // Even on "rebundle this subset", the boot pipeline still runs
     // discovery to detect added/removed functions. The subset only
     // controls which existing functions we *re-bundle* for speed.
-    const rebundleOnly = wantFull ? undefined : new Set(changed as ReadonlySet<string>);
+    const rebundleOnly = wantFull
+      ? undefined
+      : new Set(changed as ReadonlySet<string>);
 
     reloadInFlight = (async (): Promise<WorkerdReloadResult> => {
       const nextGen = generation + 1;
@@ -1757,10 +1851,15 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
                 `Re-run \`1tube build\`.`,
             );
           }
-          const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+          const digest = await crypto.subtle.digest(
+            "SHA-256",
+            bytes as BufferSource,
+          );
           const view = new Uint8Array(digest);
           let got = "";
-          for (let i = 0; i < view.length; i++) got += view[i].toString(16).padStart(2, "0");
+          for (let i = 0; i < view.length; i++) {
+            got += view[i].toString(16).padStart(2, "0");
+          }
           if (got !== e.bundleSha256) {
             started = false;
             throw new Error(
@@ -1779,7 +1878,10 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
             const msg = err instanceof Error ? err.message : String(err);
             throw new Error(`prebuilt chunk ${chunkPath} unreadable (${msg})`);
           }
-          const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+          const digest = await crypto.subtle.digest(
+            "SHA-256",
+            bytes as BufferSource,
+          );
           const hex = Array.from(new Uint8Array(digest))
             .map((b) => b.toString(16).padStart(2, "0"))
             .join("");
@@ -1804,10 +1906,15 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
                 `Re-run \`1tube build\`.`,
             );
           }
-          const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+          const digest = await crypto.subtle.digest(
+            "SHA-256",
+            bytes as BufferSource,
+          );
           const view = new Uint8Array(digest);
           let got = "";
-          for (let i = 0; i < view.length; i++) got += view[i].toString(16).padStart(2, "0");
+          for (let i = 0; i < view.length; i++) {
+            got += view[i].toString(16).padStart(2, "0");
+          }
           if (got !== e.bundleSha256) {
             started = false;
             throw new Error(
@@ -1940,7 +2047,9 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
     async createEditableFunction(name) {
       requireRuntimeEditor();
       if (names.includes(name.trim())) {
-        throw new Error(`function "${name}" exists in firmware; open Code and save a patch instead`);
+        throw new Error(
+          `function "${name}" exists in firmware; open Code and save a patch instead`,
+        );
       }
       const source = await runtimeOverrides.create(name);
       await doReload(new Set([name]));
@@ -1996,6 +2105,8 @@ export function createWorkerdBackend(opts: WorkerdBackendOptions): WorkerdBacken
  * via a function rather than re-exporting the whole helper to keep the
  * public surface tight.
  */
-export async function resolveDefaultCacheDir(cwd: string = Deno.cwd()): Promise<string> {
+export async function resolveDefaultCacheDir(
+  cwd: string = Deno.cwd(),
+): Promise<string> {
   return await defaultCacheDir(cwd);
 }

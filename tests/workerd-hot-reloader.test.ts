@@ -42,17 +42,32 @@ Deno.test("classifyChangedPath: returns the function dir name for a real edit", 
   // Test against both forward + back slashes so the helper works on
   // Windows. Path.relative() on Windows will produce backslashes;
   // the regex split inside the helper handles both.
-  assertEquals(classifyChangedPath(root, join(root, "hello", "index.ts")), "hello");
-  assertEquals(classifyChangedPath(root, join(root, "echo", "1tube.json")), "echo");
+  assertEquals(
+    classifyChangedPath(root, join(root, "hello", "index.ts")),
+    "hello",
+  );
+  assertEquals(
+    classifyChangedPath(root, join(root, "echo", "1tube.json")),
+    "echo",
+  );
 });
 
 Deno.test("classifyChangedPath: underscored / shared dirs map to null (full reload)", () => {
   const root = join("/abs", "playground");
   // Anything starting with `_` is treated as cross-cutting code.
-  assertEquals(classifyChangedPath(root, join(root, "_shared", "handler.ts")), null);
-  assertEquals(classifyChangedPath(root, join(root, "_internal", "x.ts")), null);
+  assertEquals(
+    classifyChangedPath(root, join(root, "_shared", "handler.ts")),
+    null,
+  );
+  assertEquals(
+    classifyChangedPath(root, join(root, "_internal", "x.ts")),
+    null,
+  );
   // `*_shared` suffix also full-reload.
-  assertEquals(classifyChangedPath(root, join(root, "auth_shared", "x.ts")), null);
+  assertEquals(
+    classifyChangedPath(root, join(root, "auth_shared", "x.ts")),
+    null,
+  );
 });
 
 Deno.test("classifyChangedPath: outside-tree paths map to null", () => {
@@ -114,7 +129,9 @@ Deno.test("debouncer: coalesces multiple pushes into a single flush", async () =
     debounceMs: 200,
     setTimer: clock.set,
     clearTimer: clock.clear,
-    flushFn: async (c) => { calls.push(c); },
+    flushFn: async (c) => {
+      calls.push(c);
+    },
   });
 
   // Three rapid saves to the same function should merge into one
@@ -139,7 +156,9 @@ Deno.test("debouncer: distinct function dirs surface as a sorted list", async ()
     debounceMs: 200,
     setTimer: clock.set,
     clearTimer: clock.clear,
-    flushFn: async (c) => { calls.push(c); },
+    flushFn: async (c) => {
+      calls.push(c);
+    },
   });
 
   d.push([
@@ -150,7 +169,10 @@ Deno.test("debouncer: distinct function dirs surface as a sorted list", async ()
   clock.fireAll();
   await Promise.resolve();
   // Sorted so logs are deterministic.
-  assertEquals(calls, [{ sharedChange: false, functions: ["alpha", "boom", "echo"] }]);
+  assertEquals(calls, [{
+    sharedChange: false,
+    functions: ["alpha", "boom", "echo"],
+  }]);
 });
 
 Deno.test("debouncer: shared change promotes to full reload (sharedChange=true, functions=[])", async () => {
@@ -162,7 +184,9 @@ Deno.test("debouncer: shared change promotes to full reload (sharedChange=true, 
     debounceMs: 200,
     setTimer: clock.set,
     clearTimer: clock.clear,
-    flushFn: async (c) => { calls.push(c); },
+    flushFn: async (c) => {
+      calls.push(c);
+    },
   });
 
   // A change to _shared/handler.ts plus a per-function change must
@@ -185,7 +209,9 @@ Deno.test("debouncer: pushes during flush schedule a follow-up flush", async () 
   // arriving in this window should produce a SECOND flush after
   // the first resolves.
   let release: () => void = () => {};
-  const inFlight = new Promise<void>((r) => { release = r; });
+  const inFlight = new Promise<void>((r) => {
+    release = r;
+  });
 
   const d = createReloadDebouncer({
     functionsDir: root,
@@ -233,7 +259,9 @@ Deno.test("debouncer: cancel() drops the pending flush", async () => {
     debounceMs: 200,
     setTimer: clock.set,
     clearTimer: clock.clear,
-    flushFn: async (c) => { calls.push(c); },
+    flushFn: async (c) => {
+      calls.push(c);
+    },
   });
 
   d.push([join(root, "hello", "index.ts")]);
@@ -268,12 +296,19 @@ function stubBackend(opts?: {
     functionNames: [...manifests.keys()],
     workerdVersion: "stub",
     manifests,
-    async start() { /* */ },
-    async stop() { /* */ },
-    async dispatch() { return new Response(); },
-    reload(changed?: ReadonlySet<string> | "all"): Promise<WorkerdReloadResult> {
+    async start() {/* */},
+    async stop() {/* */},
+    async dispatch() {
+      return new Response();
+    },
+    reload(
+      changed?: ReadonlySet<string> | "all",
+    ): Promise<WorkerdReloadResult> {
       const all = changed === "all" || changed === undefined;
-      calls.push({ all, names: all ? [] : [...(changed as ReadonlySet<string>)].sort() });
+      calls.push({
+        all,
+        names: all ? [] : [...(changed as ReadonlySet<string>)].sort(),
+      });
       if (failsRemaining > 0) {
         failsRemaining--;
         return Promise.reject(new Error("synthetic bundle failure"));
@@ -283,11 +318,15 @@ function stubBackend(opts?: {
         durationMs: 1,
         added: [],
         removed: [],
-        rebundled: all ? [...manifests.keys()] : [...(changed as ReadonlySet<string>)],
+        rebundled: all
+          ? [...manifests.keys()]
+          : [...(changed as ReadonlySet<string>)],
         generation: gen,
       });
     },
-    get calls() { return calls; },
+    get calls() {
+      return calls;
+    },
   };
   return stub as unknown as WorkerdBackend & {
     readonly calls: ({ all: boolean; names: string[] })[];
@@ -303,7 +342,8 @@ function fakeStream(): FsEventStream & {
   close(): void;
 } {
   const queue: { paths: readonly string[] }[] = [];
-  const waiters: ((v: IteratorResult<{ paths: readonly string[] }>) => void)[] = [];
+  const waiters: ((v: IteratorResult<{ paths: readonly string[] }>) => void)[] =
+    [];
   let closed = false;
 
   return {
@@ -405,7 +445,9 @@ Deno.test("hot reloader: reload failure does not stop the watcher; next event st
     watch: () => stream,
     setTimer: clock.set,
     clearTimer: clock.clear,
-    log: (l) => { logs.push(l); },
+    log: (l) => {
+      logs.push(l);
+    },
   });
   await r.start();
 
@@ -454,7 +496,9 @@ Deno.test("hot reloader: onManifestsUpdated fires after a successful reload", as
     setTimer: clock.set,
     clearTimer: clock.clear,
     log: () => {},
-    onManifestsUpdated: (m) => { updates.push(m); },
+    onManifestsUpdated: (m) => {
+      updates.push(m);
+    },
   });
   await r.start();
 

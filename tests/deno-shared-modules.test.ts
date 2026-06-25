@@ -150,7 +150,9 @@ Deno.test(
         assertEquals(
           log.length,
           1,
-          `expected one evaluation marker, got ${log.length}: ${JSON.stringify(log)}`,
+          `expected one evaluation marker, got ${log.length}: ${
+            JSON.stringify(log)
+          }`,
         );
 
         // RPC actually reaches the gateway: dispatch every fn and
@@ -231,7 +233,11 @@ Deno.test(
         assertEquals((await Deno.readTextFile(evalLog)).length, 2);
 
         // RPC after reload returns the fresh exports.
-        const result = await sharedRuntime.call("profile-cache", "pingShared", []);
+        const result = await sharedRuntime.call(
+          "profile-cache",
+          "pingShared",
+          [],
+        );
         assertEquals(result, "pong");
       } finally {
         await host.stop();
@@ -265,7 +271,9 @@ Deno.test(
 
       await write(
         join(dir, "_shared", "profile-cache.ts"),
-        `await Deno.writeTextFile(${JSON.stringify(evalLog)}, Deno.readTextFileSync(${JSON.stringify(evalLog)}) + "x");
+        `await Deno.writeTextFile(${
+          JSON.stringify(evalLog)
+        }, Deno.readTextFileSync(${JSON.stringify(evalLog)}) + "x");
 export async function getCachedProfile(_id) { return { ok: true }; }
 `,
       );
@@ -310,7 +318,11 @@ reg.register(
       });
       try {
         const { loaded, errors } = await host.start();
-        assertEquals(errors, [], `unexpected boot errors: ${JSON.stringify(errors)}`);
+        assertEquals(
+          errors,
+          [],
+          `unexpected boot errors: ${JSON.stringify(errors)}`,
+        );
         assertEquals(loaded, ["fn"]);
 
         const handle = registry.workerHandle("fn");
@@ -367,7 +379,10 @@ export async function run() { return await getCachedProfile("u1"); }
       const afterFirst = rewriteCache.inspect();
       assertEquals(afterFirst.rewrites.length, 1);
       assertEquals(afterFirst.stubs.length, 1);
-      assertEquals([...afterFirst.parsedFiles].sort(), [indexPath, sharedPath].sort());
+      assertEquals(
+        [...afterFirst.parsedFiles].sort(),
+        [indexPath, sharedPath].sort(),
+      );
 
       const second = await rewriteCache.rewrite(req);
       assertEquals(second.emittedRewrites.length, 0);

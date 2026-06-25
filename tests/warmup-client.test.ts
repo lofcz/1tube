@@ -63,8 +63,8 @@ Deno.test("warmup-client: retries through warming and reports overlay transition
 });
 
 Deno.test("warmup-client: no overlay callback for instant success", async () => {
-  const fakeFetch = (() =>
-    Promise.resolve(new Response("ok"))) as unknown as typeof fetch;
+  const fakeFetch =
+    (() => Promise.resolve(new Response("ok"))) as unknown as typeof fetch;
   const transitions: boolean[] = [];
   const warmFetch = createWarmupFetch({
     fetch: fakeFetch,

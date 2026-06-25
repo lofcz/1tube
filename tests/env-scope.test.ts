@@ -7,7 +7,7 @@
  * runWithEnvScope around its own assertions.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { assert, assertEquals } from "@std/assert";
 import { installEnvScope, runWithEnvScope } from "../src/env-scope.ts";
 
 installEnvScope();
@@ -68,6 +68,9 @@ Deno.test("env-scope: env writes from inside a context throw PermissionDenied", 
   } catch (err) {
     threw = err instanceof Deno.errors.PermissionDenied;
   }
-  assert(threw, "Deno.env.set inside function context should throw PermissionDenied");
+  assert(
+    threw,
+    "Deno.env.set inside function context should throw PermissionDenied",
+  );
   assertEquals(Deno.env.get("__SCOPE_NEW"), undefined);
 });

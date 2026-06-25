@@ -10,15 +10,15 @@
  *
  * The prefix is process-global module state, set once at boot BEFORE any
  * route is mounted. It lives here (rather than threaded through every
- * call site) because the logging and rate-limit middleware — whose
- * public signatures we don't want to break — must strip the exact same
+ * call site) because the logging and rate-limit middleware ï¿½ whose
+ * public signatures we don't want to break ï¿½ must strip the exact same
  * prefix the router mounts on. There is one gateway per process, so a
  * single shared value is correct; tests that need a custom prefix call
  * {@link setRoutePrefix} and reset it afterwards (or re-import the
  * module fresh).
  */
 
-/** Supabase Edge Runtime convention — the historical, unchanged default. */
+/** Supabase Edge Runtime convention ï¿½ the historical, unchanged default. */
 export const DEFAULT_ROUTE_PREFIX = "/functions/v1";
 
 let _prefix = DEFAULT_ROUTE_PREFIX;
@@ -26,7 +26,7 @@ let _prefix = DEFAULT_ROUTE_PREFIX;
 /**
  * Canonicalize a raw prefix: guarantee exactly one leading slash, no
  * trailing slash, and no duplicate inner slashes. Empty / root-only
- * inputs fall back to the default — the router can't mount on bare `/`
+ * inputs fall back to the default ï¿½ the router can't mount on bare `/`
  * without swallowing `/health`, `/1tube/*`, and friends.
  */
 export function normalizeRoutePrefix(raw: string | undefined | null): string {

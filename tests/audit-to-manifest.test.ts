@@ -34,8 +34,7 @@ function rec(
   // becomes "    at fnN (file:///<path>:line:col)" — the same shape Deno
   // emits. We strip the leading "/" inside the file:/// prefix because that's
   // exactly what real Deno stacks look like ("file:///tmp/x" not "file:////tmp/x").
-  const stack =
-    "Error\n" +
+  const stack = "Error\n" +
     framesUnder
       .map((p, i) => `    at fn${i} (file://${p}:10:5)`)
       .join("\n");
@@ -54,7 +53,10 @@ Deno.test("audit: extractPathsFromStack pulls out file paths from a typical Deno
 });
 
 Deno.test("audit: functionForPath identifies the owning function under functionsDir", () => {
-  assertEquals(functionForPath(fnPath("ai-chat", "helpers", "x.ts"), FNS_DIR), "ai-chat");
+  assertEquals(
+    functionForPath(fnPath("ai-chat", "helpers", "x.ts"), FNS_DIR),
+    "ai-chat",
+  );
   assertEquals(functionForPath(fnPath("_shared", "db.ts"), FNS_DIR), null);
   assertEquals(functionForPath(fnPath("_internal", "x.ts"), FNS_DIR), null);
   assertEquals(functionForPath("/somewhere/else/file.ts", FNS_DIR), null);
@@ -200,7 +202,9 @@ Deno.test("audit: end-to-end JSONL → manifest map (smoke test through the publ
       stack: `at handler (file://${aiPath}:2:2)`,
     }),
   ];
-  const records = lines.map(parseAuditLine).filter((r): r is AuditRecord => r !== null);
+  const records = lines.map(parseAuditLine).filter((r): r is AuditRecord =>
+    r !== null
+  );
   assertEquals(records.length, 2);
 
   const map = buildPermissionMap(records, { functionsDir: FNS_DIR });

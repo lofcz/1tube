@@ -22,11 +22,16 @@ export interface StreamResult {
 }
 
 const GATEWAY_URL =
-  (import.meta.env.VITE_GATEWAY_URL as string | undefined)?.replace(/\/+$/, "") ||
+  (import.meta.env.VITE_GATEWAY_URL as string | undefined)?.replace(
+    /\/+$/,
+    "",
+  ) ||
   "http://localhost:3199";
 
 export function streamChat(args: StreamArgs): StreamResult {
-  if (!args.apiKey) throw new Error(`no API key configured for ${args.provider}`);
+  if (!args.apiKey) {
+    throw new Error(`no API key configured for ${args.provider}`);
+  }
 
   const controller = new AbortController();
   const signal = mergeSignals(args.signal, controller.signal);

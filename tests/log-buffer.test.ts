@@ -254,7 +254,11 @@ Deno.test("log-buffer: multiple writes between threshold/interval batch into one
   assertEquals(_logBufferStatsForTests().stdoutPending, 30);
 
   flushLogs();
-  assertEquals(out.writeCalls(), 1, "30 logs → 1 syscall (vs 30 with raw console.log)");
+  assertEquals(
+    out.writeCalls(),
+    1,
+    "30 logs → 1 syscall (vs 30 with raw console.log)",
+  );
   assertEquals(out.lines().length, 30);
 
   _resetLogBufferForTests();

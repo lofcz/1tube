@@ -7,7 +7,9 @@
   "description": "SHA256, Authenticode signature, PE characteristics of workerd.exe. Compare SHA256 to your local file.",
   "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
   "args": [
-    "-NoProfile", "-NonInteractive", "-Command",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
     "$ErrorActionPreference='Continue'; $w='${WorkerdPath}'; Write-Host '== sha256 =='; Get-FileHash -Algorithm SHA256 $w | Format-List | Out-String; Write-Host '== authenticode =='; Get-AuthenticodeSignature $w | Format-List Status, StatusMessage, SignerCertificate, TimeStamperCertificate | Out-String; Write-Host '== file =='; Get-Item $w | Format-List FullName, Length, CreationTime, LastWriteTime, Attributes | Out-String; Write-Host '== blocked? =='; if (Get-Item $w -Stream Zone.Identifier -ErrorAction SilentlyContinue) { 'WARNING: file has Zone.Identifier (downloaded from internet, may be blocked)'; Get-Content $w -Stream Zone.Identifier } else { 'no Zone.Identifier (file is unblocked)' }; Write-Host '== imports (first 40) =='; $bytes=[IO.File]::ReadAllBytes($w); 'PE size: ' + $bytes.Length"
   ],
   "timeoutSec": 20

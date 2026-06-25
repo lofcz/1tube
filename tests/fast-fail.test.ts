@@ -150,12 +150,16 @@ Deno.test("fast-fail: name with trailing path is parsed correctly (only first se
   });
 
   const { app, counts } = buildApp(reg);
-  const res = await app.fetch(new Request("http://x/functions/v1/myfn/some/sub/path"));
+  const res = await app.fetch(
+    new Request("http://x/functions/v1/myfn/some/sub/path"),
+  );
   // Known fn → middleware allows through.
   assertEquals(res.status, 200);
   assertEquals(counts().dispatch, 1);
 
-  const res2 = await app.fetch(new Request("http://x/functions/v1/notmyfn/sub"));
+  const res2 = await app.fetch(
+    new Request("http://x/functions/v1/notmyfn/sub"),
+  );
   assertEquals(res2.status, 404);
   const body = await res2.json();
   assert((body.error as string).includes("notmyfn"));

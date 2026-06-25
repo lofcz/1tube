@@ -8,7 +8,9 @@
   "description": "Per-user WER config; works without admin. Dumps land in ${DiagDir}/wer-dumps on the next workerd crash.",
   "executable": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
   "args": [
-    "-NoProfile", "-NonInteractive", "-Command",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
     "$ErrorActionPreference='Stop'; $dump='${DiagDir}\\wer-dumps'; New-Item -ItemType Directory -Force -Path $dump | Out-Null; $key='HKCU:\\Software\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\workerd.exe'; New-Item -Path $key -Force | Out-Null; Set-ItemProperty -Path $key -Name DumpFolder -Value $dump -Type ExpandString; Set-ItemProperty -Path $key -Name DumpType -Value 2 -Type DWord; Set-ItemProperty -Path $key -Name DumpCount -Value 10 -Type DWord; Get-ItemProperty -Path $key | Format-List | Out-String; Write-Host \"WER dumps for workerd.exe will land in $dump on next crash. Run a workerd experiment afterwards, then re-run crash-dumps.\""
   ],
   "timeoutSec": 8

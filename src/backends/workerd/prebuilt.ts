@@ -106,35 +106,39 @@ export function parsePrebuiltManifest(raw: unknown): PrebuiltManifest {
   if (!Array.isArray(obj.functions)) {
     throw new Error(`prebuilt manifest missing "functions" array`);
   }
-  const functions: PrebuiltFunctionEntry[] = obj.functions.map((rawEntry, idx) => {
-    if (!rawEntry || typeof rawEntry !== "object") {
-      throw new Error(`functions[${idx}] is not an object`);
-    }
-    const e = rawEntry as Record<string, unknown>;
-    const name = typeof e.name === "string" ? e.name : "";
-    const bundleFile = typeof e.bundleFile === "string" ? e.bundleFile : "";
-    const bundleBytes = typeof e.bundleBytes === "number" ? e.bundleBytes : 0;
-    const bundleSha256 = typeof e.bundleSha256 === "string" ? e.bundleSha256 : "";
-    if (!name || !bundleFile || !bundleSha256) {
-      throw new Error(
-        `functions[${idx}] missing required fields (name, bundleFile, bundleSha256)`,
-      );
-    }
-    const moduleFiles = Array.isArray(e.moduleFiles)
-      ? e.moduleFiles.filter((n): n is string => typeof n === "string")
-      : [];
-    return {
-      name,
-      bundleFile,
-      bundleBytes,
-      bundleSha256,
-      moduleFiles: moduleFiles.length > 0 ? moduleFiles : [bundleFile],
-      manifest: parseManifest(e.manifest, /* fromFile */ true),
-      sourceFiles: Array.isArray(e.sourceFiles)
-        ? e.sourceFiles.filter((n): n is string => typeof n === "string")
-        : undefined,
-    };
-  });
+  const functions: PrebuiltFunctionEntry[] = obj.functions.map(
+    (rawEntry, idx) => {
+      if (!rawEntry || typeof rawEntry !== "object") {
+        throw new Error(`functions[${idx}] is not an object`);
+      }
+      const e = rawEntry as Record<string, unknown>;
+      const name = typeof e.name === "string" ? e.name : "";
+      const bundleFile = typeof e.bundleFile === "string" ? e.bundleFile : "";
+      const bundleBytes = typeof e.bundleBytes === "number" ? e.bundleBytes : 0;
+      const bundleSha256 = typeof e.bundleSha256 === "string"
+        ? e.bundleSha256
+        : "";
+      if (!name || !bundleFile || !bundleSha256) {
+        throw new Error(
+          `functions[${idx}] missing required fields (name, bundleFile, bundleSha256)`,
+        );
+      }
+      const moduleFiles = Array.isArray(e.moduleFiles)
+        ? e.moduleFiles.filter((n): n is string => typeof n === "string")
+        : [];
+      return {
+        name,
+        bundleFile,
+        bundleBytes,
+        bundleSha256,
+        moduleFiles: moduleFiles.length > 0 ? moduleFiles : [bundleFile],
+        manifest: parseManifest(e.manifest, /* fromFile */ true),
+        sourceFiles: Array.isArray(e.sourceFiles)
+          ? e.sourceFiles.filter((n): n is string => typeof n === "string")
+          : undefined,
+      };
+    },
+  );
   const chunks: PrebuiltChunkEntry[] = Array.isArray(obj.chunks)
     ? obj.chunks.map((rawEntry, idx) => {
       if (!rawEntry || typeof rawEntry !== "object") {
@@ -145,32 +149,39 @@ export function parsePrebuiltManifest(raw: unknown): PrebuiltManifest {
       const bytes = typeof e.bytes === "number" ? e.bytes : 0;
       const sha256 = typeof e.sha256 === "string" ? e.sha256 : "";
       if (!file || !sha256) {
-        throw new Error(`chunks[${idx}] missing required fields (file, sha256)`);
+        throw new Error(
+          `chunks[${idx}] missing required fields (file, sha256)`,
+        );
       }
       return { file, bytes, sha256 };
     })
     : [];
-  const sharedModules: PrebuiltSharedModuleEntry[] = Array.isArray(obj.sharedModules)
-    ? obj.sharedModules.map((rawEntry, idx) => {
-      if (!rawEntry || typeof rawEntry !== "object") {
-        throw new Error(`sharedModules[${idx}] is not an object`);
-      }
-      const e = rawEntry as Record<string, unknown>;
-      const id = typeof e.id === "string" ? e.id : "";
-      const bundleFile = typeof e.bundleFile === "string" ? e.bundleFile : "";
-      const bundleBytes = typeof e.bundleBytes === "number" ? e.bundleBytes : 0;
-      const bundleSha256 = typeof e.bundleSha256 === "string" ? e.bundleSha256 : "";
-      const exportNames = Array.isArray(e.exportNames)
-        ? e.exportNames.filter((n): n is string => typeof n === "string")
-        : [];
-      if (!id || !bundleFile || !bundleSha256) {
-        throw new Error(
-          `sharedModules[${idx}] missing required fields (id, bundleFile, bundleSha256)`,
-        );
-      }
-      return { id, bundleFile, bundleBytes, bundleSha256, exportNames };
-    })
-    : [];
+  const sharedModules: PrebuiltSharedModuleEntry[] =
+    Array.isArray(obj.sharedModules)
+      ? obj.sharedModules.map((rawEntry, idx) => {
+        if (!rawEntry || typeof rawEntry !== "object") {
+          throw new Error(`sharedModules[${idx}] is not an object`);
+        }
+        const e = rawEntry as Record<string, unknown>;
+        const id = typeof e.id === "string" ? e.id : "";
+        const bundleFile = typeof e.bundleFile === "string" ? e.bundleFile : "";
+        const bundleBytes = typeof e.bundleBytes === "number"
+          ? e.bundleBytes
+          : 0;
+        const bundleSha256 = typeof e.bundleSha256 === "string"
+          ? e.bundleSha256
+          : "";
+        const exportNames = Array.isArray(e.exportNames)
+          ? e.exportNames.filter((n): n is string => typeof n === "string")
+          : [];
+        if (!id || !bundleFile || !bundleSha256) {
+          throw new Error(
+            `sharedModules[${idx}] missing required fields (id, bundleFile, bundleSha256)`,
+          );
+        }
+        return { id, bundleFile, bundleBytes, bundleSha256, exportNames };
+      })
+      : [];
   return {
     schema,
     builtBy: typeof obj.builtBy === "string" ? obj.builtBy : "unknown",
@@ -179,7 +190,11 @@ export function parsePrebuiltManifest(raw: unknown): PrebuiltManifest {
       ? { compatibilityDate: obj.compatibilityDate }
       : {}),
     ...(Array.isArray(obj.compatibilityFlags)
-      ? { compatibilityFlags: obj.compatibilityFlags.filter((f): f is string => typeof f === "string") }
+      ? {
+        compatibilityFlags: obj.compatibilityFlags.filter((f): f is string =>
+          typeof f === "string"
+        ),
+      }
       : {}),
     envAllowlist: Array.isArray(obj.envAllowlist)
       ? obj.envAllowlist.filter((n): n is string => typeof n === "string")

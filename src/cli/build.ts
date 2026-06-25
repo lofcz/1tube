@@ -32,7 +32,13 @@
  */
 
 import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
-import { dirname, isAbsolute, join, relative, resolve as resolvePath } from "node:path";
+import {
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve as resolvePath,
+} from "node:path";
 import {
   bundleAllChunked,
   bundleSharedModule,
@@ -150,7 +156,11 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return out;
 }
 
-async function copySourceSnapshot(functionsDir: string, name: string, outDir: string): Promise<string[]> {
+async function copySourceSnapshot(
+  functionsDir: string,
+  name: string,
+  outDir: string,
+): Promise<string[]> {
   const sourceRoot = join(functionsDir, name);
   const outRoot = join(outDir, "sources", name);
   const files: string[] = [];
@@ -314,7 +324,11 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
       const bytes = await Deno.readFile(r.bundlePath);
       const sha = await sha256Hex(bytes);
       const manifest = await loadManifest(functionsDir, r.name);
-      const sourceFiles = await copySourceSnapshot(functionsDir, r.name, outDir);
+      const sourceFiles = await copySourceSnapshot(
+        functionsDir,
+        r.name,
+        outDir,
+      );
       opts.onProgress?.({
         phase: "hash-function",
         current: idx + 1,

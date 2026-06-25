@@ -48,7 +48,10 @@ Deno.test("resolveEnvAllowlist: explicit list takes precedence over 1TUBE_WORKER
     POSTHOG_HOST: "https://x",
     "1TUBE_WORKERD_ENV": "POSTHOG_HOST",
   });
-  const { resolved, missing, mode } = resolveEnvAllowlist(["OPENAI_API_KEY"], env);
+  const { resolved, missing, mode } = resolveEnvAllowlist(
+    ["OPENAI_API_KEY"],
+    env,
+  );
   assertEquals(resolved, ["OPENAI_API_KEY"]);
   assertEquals(missing, []);
   assertEquals(mode, "restricted");
@@ -116,7 +119,10 @@ Deno.test("resolveEnvAllowlist: literal ['*'] is the explicit form of pass-all",
   // `1TUBE_WORKERD_ENV` itself starts with a digit and gets filtered
   // out of pass-all output (workerd's `fromEnvironment` requires the
   // POSIX identifier convention). Only `A` survives.
-  const b = resolveEnvAllowlist(undefined, fakeEnv({ A: "1", "1TUBE_WORKERD_ENV": "*" }));
+  const b = resolveEnvAllowlist(
+    undefined,
+    fakeEnv({ A: "1", "1TUBE_WORKERD_ENV": "*" }),
+  );
   assertEquals(b.resolved, ["A"]);
   assertEquals(b.mode, "all");
 });
@@ -136,7 +142,10 @@ Deno.test("resolveEnvAllowlist: reports missing names but never fabricates value
 
 Deno.test("resolveEnvAllowlist: de-duplicates names while preserving first-seen order", () => {
   const env = fakeEnv({ A: "1", B: "2", C: "3" });
-  const { resolved, missing } = resolveEnvAllowlist(["B", "A", "B", "C", "A"], env);
+  const { resolved, missing } = resolveEnvAllowlist(
+    ["B", "A", "B", "C", "A"],
+    env,
+  );
   assertEquals(resolved, ["B", "A", "C"]);
   assertEquals(missing, []);
 });

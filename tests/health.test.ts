@@ -6,7 +6,7 @@
  * removed `?key=` query form is treated like any other unauthenticated call.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { assert, assertEquals } from "@std/assert";
 import { Hono } from "hono";
 import { FunctionRegistry } from "../src/registry.ts";
 import {

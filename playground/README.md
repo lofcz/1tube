@@ -15,11 +15,11 @@ playground/
 ```
 
 The [`chat/`](./chat/index.ts) function holds the AI SDK 6 dependency and
-streams provider tokens back to the browser. The user's API key arrives in
-the `x-api-key` header — no server-side keys are stored.
+streams provider tokens back to the browser. The user's API key arrives in the
+`x-api-key` header — no server-side keys are stored.
 
-The [`web/`](./web/README.md) folder is a Vite app whose `/chat` route POSTs
-to `chat/` through the gateway. Run them together:
+The [`web/`](./web/README.md) folder is a Vite app whose `/chat` route POSTs to
+`chat/` through the gateway. Run them together:
 
 ```bash
 deno task play                     # terminal 1: gateway on :3199
@@ -34,21 +34,28 @@ From the repo root:
 deno task play
 ```
 
-The `play` task implies `--dev --hmr`. Without `--dev`, the gateway will refuse to start since neither `JWT_SECRET` nor `SUPABASE_SERVICE_ROLE_KEY` is set in the environment (Phase 0 hardening).
+The `play` task implies `--dev --hmr`. Without `--dev`, the gateway will refuse
+to start since neither `JWT_SECRET` nor `SUPABASE_SERVICE_ROLE_KEY` is set in
+the environment (Phase 0 hardening).
 
 ## Per-function manifests
 
 `hello/1tube.json` and `slow/1tube.json` show the optional manifest schema:
 
-- scoped `permissions.env` (enforced when `1TUBE_ENFORCE_MANIFEST=1`); `net`/`read`/`write` are recorded as advisory metadata
+- scoped `permissions.env` (enforced when `1TUBE_ENFORCE_MANIFEST=1`);
+  `net`/`read`/`write` are recorded as advisory metadata
 - `timeoutMs` overriding the global default (enforced)
 - `rpm` per-function rate limit (enforced)
 - `warm: true` opts the function out of lazy loading (loaded at boot)
-- `recycle.{maxRequests,errorRate,errorWindow,cooldownMs}` drives the in-process circuit breaker
+- `recycle.{maxRequests,errorRate,errorWindow,cooldownMs}` drives the in-process
+  circuit breaker
 
-See the top-level [`README.md`](../README.md#per-function-manifest-functionsdirname1tubejson) for the full field reference.
+See the top-level
+[`README.md`](../README.md#per-function-manifest-functionsdirname1tubejson) for
+the full field reference.
 
-The TS runtime ignores these fields, so adding manifests today is forward-compatible.
+The TS runtime ignores these fields, so adding manifests today is
+forward-compatible.
 
 That's `deno task dev` pointed at `./playground` on port `3199` (so it doesn't
 clash with a real project running on the default `3100`). HMR is on — edits to

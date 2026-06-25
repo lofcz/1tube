@@ -2,13 +2,13 @@
  * Tests for src/manifest.ts.
  */
 
-import { assertEquals, assert } from "@std/assert";
+import { assert, assertEquals } from "@std/assert";
 import { join } from "@std/path";
 import {
   defaultManifest,
   loadManifest,
-  parseManifest,
   MANIFEST_FILENAME,
+  parseManifest,
 } from "../src/manifest.ts";
 
 Deno.test("manifest: defaults are conservative (deny-everything)", () => {
@@ -100,7 +100,11 @@ Deno.test("manifest: loadManifest reads + parses a real file", async () => {
     await Deno.mkdir(join(dir, "fn"));
     await Deno.writeTextFile(
       join(dir, "fn", MANIFEST_FILENAME),
-      JSON.stringify({ timeoutMs: 1234, rpm: 7, permissions: { net: ["x.com"] } }),
+      JSON.stringify({
+        timeoutMs: 1234,
+        rpm: 7,
+        permissions: { net: ["x.com"] },
+      }),
     );
     const m = await loadManifest(dir, "fn");
     assertEquals(m.fromFile, true);

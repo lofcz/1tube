@@ -145,7 +145,9 @@ export function parseVersionOutput(stdout: string): VersionInfo {
   const trimmed = stdout.trim();
   const m = /^workerd\s+(\S+)/i.exec(trimmed);
   if (!m) {
-    throw new Error(`unable to parse workerd version from output: ${JSON.stringify(trimmed)}`);
+    throw new Error(
+      `unable to parse workerd version from output: ${JSON.stringify(trimmed)}`,
+    );
   }
   return { version: m[1], raw: trimmed };
 }
@@ -213,7 +215,9 @@ export async function probeVersion(binary: string): Promise<VersionInfo> {
   });
   const child = cmd.spawn();
   const timer = setTimeout(() => {
-    try { child.kill("SIGKILL"); } catch { /* already exited */ }
+    try {
+      child.kill("SIGKILL");
+    } catch { /* already exited */ }
   }, 5_000);
   try {
     const { code, stdout, stderr } = await child.output();
@@ -258,7 +262,8 @@ async function probeOnce(hostname: string, port: number): Promise<boolean> {
  */
 export async function waitForPorts(
   endpoints: readonly { host: string; port: number }[],
-  opts: { timeoutMs?: number; intervalMs?: number; abortSignal?: AbortSignal } = {},
+  opts: { timeoutMs?: number; intervalMs?: number; abortSignal?: AbortSignal } =
+    {},
 ): Promise<void> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
   const intervalMs = opts.intervalMs ?? DEFAULT_PROBE_INTERVAL_MS;
@@ -355,7 +360,10 @@ async function pumpLines(
  * Returns true if the kill request was accepted by the OS, false if
  * the process was already gone.
  */
-function bestEffortKill(child: Deno.ChildProcess, signal: Deno.Signal): boolean {
+function bestEffortKill(
+  child: Deno.ChildProcess,
+  signal: Deno.Signal,
+): boolean {
   try {
     child.kill(signal);
     return true;
@@ -374,7 +382,9 @@ function summarizeRoutes(routes: readonly CapnpRoute[]): string {
   const min = Math.min(...ports);
   const max = Math.max(...ports);
   const hosts = [...new Set(routes.map((r) => r.address))].join(",");
-  return `routes=${routes.length} hosts=${hosts} ports=${min}${min === max ? "" : `-${max}`}`;
+  return `routes=${routes.length} hosts=${hosts} ports=${min}${
+    min === max ? "" : `-${max}`
+  }`;
 }
 
 function formatStartupFailure(opts: {
@@ -405,12 +415,17 @@ function formatStartupFailure(opts: {
 }
 
 /** Build the manager. Stateful — caller owns lifecycle. */
-export function createWorkerdProcess(opts: WorkerdProcessOptions): WorkerdProcess {
+export function createWorkerdProcess(
+  opts: WorkerdProcessOptions,
+): WorkerdProcess {
   const sink = opts.logLineSink ?? defaultLogLineSink;
   const readyTimeoutMs = opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
   const probeIntervalMs = opts.probeIntervalMs ?? DEFAULT_PROBE_INTERVAL_MS;
-  const shutdownTimeoutMs = opts.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
-  const exitListeners = new Set<(code: number | null, expected: boolean) => void>();
+  const shutdownTimeoutMs = opts.shutdownTimeoutMs ??
+    DEFAULT_SHUTDOWN_TIMEOUT_MS;
+  const exitListeners = new Set<
+    (code: number | null, expected: boolean) => void
+  >();
 
   let child: Deno.ChildProcess | null = null;
   let started = false;
@@ -422,7 +437,9 @@ export function createWorkerdProcess(opts: WorkerdProcessOptions): WorkerdProces
     if (exited) return;
     exited = true;
     for (const cb of exitListeners) {
-      try { cb(code, expected); } catch { /* listener errors must never crash the manager */ }
+      try {
+        cb(code, expected);
+      } catch { /* listener errors must never crash the manager */ }
     }
   };
 

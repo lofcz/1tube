@@ -83,21 +83,28 @@ function readBoolEnv(name: string): boolean | null {
 /** Headers/methods/etc. are independent of the origin allowlist branch. */
 function loadResponseShape(): Pick<
   CorsConfig,
-  "allowHeaders" | "allowMethods" | "exposeHeaders" | "maxAge" | "allowCredentials"
+  | "allowHeaders"
+  | "allowMethods"
+  | "exposeHeaders"
+  | "maxAge"
+  | "allowCredentials"
 > {
   const allowHeaders =
-    (Deno.env.get("1TUBE_CORS_ALLOW_HEADERS") || DEFAULT_ALLOWED_HEADERS).trim();
+    (Deno.env.get("1TUBE_CORS_ALLOW_HEADERS") || DEFAULT_ALLOWED_HEADERS)
+      .trim();
   const allowMethods =
-    (Deno.env.get("1TUBE_CORS_ALLOW_METHODS") || DEFAULT_ALLOWED_METHODS).trim();
+    (Deno.env.get("1TUBE_CORS_ALLOW_METHODS") || DEFAULT_ALLOWED_METHODS)
+      .trim();
   const exposeHeaders = mergeHeaderList(
     INTERNAL_EXPOSED_HEADERS,
     (Deno.env.get("1TUBE_CORS_EXPOSE_HEADERS") || "").trim(),
   );
   const maxAgeRaw = (Deno.env.get("1TUBE_CORS_MAX_AGE") || "").trim();
   const maxAgeNum = parseInt(maxAgeRaw, 10);
-  const maxAge = maxAgeRaw !== "" && Number.isFinite(maxAgeNum) && maxAgeNum >= 0
-    ? String(maxAgeNum)
-    : null;
+  const maxAge =
+    maxAgeRaw !== "" && Number.isFinite(maxAgeNum) && maxAgeNum >= 0
+      ? String(maxAgeNum)
+      : null;
   return {
     allowHeaders,
     allowMethods,
@@ -185,10 +192,14 @@ function pickAllowedOrigin(reqOrigin: string | null): string | null {
   const hostname = originDomain(reqOrigin);
   if (!hostname) return null;
   if (cfg.allowList.includes(hostname)) return reqOrigin;
-  return cfg.wildcardList.some((suffix) => wildcardMatches(suffix, hostname)) ? reqOrigin : null;
+  return cfg.wildcardList.some((suffix) => wildcardMatches(suffix, hostname))
+    ? reqOrigin
+    : null;
 }
 
-function buildCorsHeaders(reqOrigin: string | null): Record<string, string> | null {
+function buildCorsHeaders(
+  reqOrigin: string | null,
+): Record<string, string> | null {
   const allowed = pickAllowedOrigin(reqOrigin);
   if (!allowed) return null;
   const cfg = loadConfig();

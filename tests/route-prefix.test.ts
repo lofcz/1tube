@@ -1,5 +1,5 @@
 /**
- * Tests for src/gateway/route-prefix.ts — the configurable function route
+ * Tests for src/gateway/route-prefix.ts ï¿½ the configurable function route
  * prefix.
  *
  * The prefix is process-global module state, so every test restores the
@@ -81,7 +81,9 @@ Deno.test(
       return c.json({ name, seen });
     });
 
-    const hit = await app.fetch(new Request("http://localhost/api/hello/world"));
+    const hit = await app.fetch(
+      new Request("http://localhost/api/hello/world"),
+    );
     assertEquals(hit.status, 200);
     assertEquals(await hit.json(), { name: "hello", seen: "/hello/world" });
 

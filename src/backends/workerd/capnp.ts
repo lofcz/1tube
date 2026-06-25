@@ -46,7 +46,10 @@ const ENV_VAR_NAME_RX = /^[A-Za-z_][A-Za-z0-9_]*$/;
  * binary is older than this date.
  */
 const DEFAULT_COMPAT_DATE = "2026-04-25";
-const DEFAULT_COMPAT_FLAGS = ["nodejs_compat", "nodejs_compat_populate_process_env"] as const;
+const DEFAULT_COMPAT_FLAGS = [
+  "nodejs_compat",
+  "nodejs_compat_populate_process_env",
+] as const;
 
 export interface CapnpFunctionInput {
   /** Function name. Must match `[A-Za-z][A-Za-z0-9_-]*`. */
@@ -162,15 +165,23 @@ function validateServiceName(name: string): string {
 function validateBundleEmbedPath(path: string): string {
   if (!path || path.includes("\\") || path.includes('"')) {
     throw new Error(
-      `bundle embed path must be a relative POSIX path, got ${JSON.stringify(path)}`,
+      `bundle embed path must be a relative POSIX path, got ${
+        JSON.stringify(path)
+      }`,
     );
   }
   if (path.startsWith("/") || path.startsWith("./") || path.endsWith("/")) {
-    throw new Error(`bundle embed path must be relative, got ${JSON.stringify(path)}`);
+    throw new Error(
+      `bundle embed path must be relative, got ${JSON.stringify(path)}`,
+    );
   }
   const segments = path.split("/");
   if (segments.some((s) => s === "" || s === "." || s === "..")) {
-    throw new Error(`bundle embed path must not contain empty, '.' or '..' segments: ${JSON.stringify(path)}`);
+    throw new Error(
+      `bundle embed path must not contain empty, '.' or '..' segments: ${
+        JSON.stringify(path)
+      }`,
+    );
   }
   return path;
 }
@@ -262,8 +273,12 @@ export function generateCapnp(
 
   const bindAddress = opts.bindAddress ?? "127.0.0.1";
   const basePort = opts.basePort ?? 8800;
-  const globalDate = validateCompatDate(opts.compatibilityDate ?? DEFAULT_COMPAT_DATE);
-  const globalFlags = (opts.compatibilityFlags ?? DEFAULT_COMPAT_FLAGS).map(validateCompatFlag);
+  const globalDate = validateCompatDate(
+    opts.compatibilityDate ?? DEFAULT_COMPAT_DATE,
+  );
+  const globalFlags = (opts.compatibilityFlags ?? DEFAULT_COMPAT_FLAGS).map(
+    validateCompatFlag,
+  );
 
   if (!Number.isInteger(basePort) || basePort < 1024 || basePort > 65535) {
     throw new Error(
@@ -315,14 +330,14 @@ export function generateCapnp(
     const moduleFiles = input.moduleFiles && input.moduleFiles.length > 0
       ? dedupeStable(input.moduleFiles.map(validateBundleEmbedPath))
       : [];
-    const modules = moduleFiles.length > 0
-      ? moduleFiles
-      : [bundlePath];
+    const modules = moduleFiles.length > 0 ? moduleFiles : [bundlePath];
     const moduleLines = modules
       .map((path, moduleIdx) => {
         const name = moduleFiles.length > 0 ? path : "worker";
         const comma = moduleIdx === modules.length - 1 ? "" : ",";
-        return `        (name = ${capnpString(name)}, esModule = embed "${path}")${comma}`;
+        return `        (name = ${
+          capnpString(name)
+        }, esModule = embed "${path}")${comma}`;
       })
       .join("\n");
     const compatDate = input.compatibilityDate
@@ -345,7 +360,11 @@ export function generateCapnp(
     const bindingsLine = envNames.length > 0
       ? `,\n      bindings = [\n${
         envNames
-          .map((n) => `        (name = ${capnpString(n)}, fromEnvironment = ${capnpString(n)})`)
+          .map((n) =>
+            `        (name = ${capnpString(n)}, fromEnvironment = ${
+              capnpString(n)
+            })`
+          )
           .join(",\n")
       }\n      ]`
       : "";

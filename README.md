@@ -41,7 +41,12 @@ in-process on filesystem changes (including newly created function folders).
 ## npm CLI
 
 The published npm package exposes a `1tube` binary. It is a tiny Node shim that
-launches this repo's Deno CLI, so machines using it need Deno on `PATH`.
+launches this repo's Deno CLI, so machines using it need Deno on `PATH` (set
+`DENO_BIN` to point at a specific `deno` if it isn't). **Prefer this launcher
+over a hand-rolled `deno run … src/server.ts` line** — it applies 1tube's
+recommended defaults (see [minimum dependency age](#minimum-dependency-age)
+below) before Deno starts, which a flag added _inside_ the gateway can no longer
+do.
 
 ```bash
 # Show CLI help
@@ -57,6 +62,44 @@ npx 1tube package --functions supabase/functions --in dist --out fw.1tube --sign
 This replaces local-source invocations such as
 `deno run -A ../1tube/src/cli.ts ...` in downstream CI pipelines.
 
+### Passing deno flags through the launcher
+
+Arguments before a standalone `--` are 1tube CLI args; everything **after** `--`
+is forwarded verbatim to `deno run` (inserted before the entrypoint). This lets
+the launcher fully replace a project's bespoke `deno run … src/server.ts`
+command — including project-level deno flags like `--config`, `--env-file`,
+`--node-modules-dir` and `--no-lock`:
+
+```bash
+npx 1tube serve --functions ./supabase/functions --dev --hmr \
+  -- --no-lock --env-file=.env --config ./supabase/functions/deno.json --node-modules-dir=false
+```
+
+- If your passthrough includes its own `--config`, the launcher does **not** add
+  1tube's bundled `deno.json` — your import map wins (the gateway's own sources
+  use fully-qualified `npm:`/`jsr:` specifiers, so they resolve regardless).
+- Prefer keeping the command line clean? Set the same flags in
+  `1TUBE_DENO_ARGS` (space-separated) instead of after `--`. CLI passthrough
+  takes precedence on any duplicate flag.
+
+### Minimum dependency age
+
+Deno 2.9 turns on a **24-hour minimum dependency age** by default: a function
+that pins a just-published npm version fails to resolve locally with
+_"… is newer than the specified minimum dependency date"_. Because Deno
+snapshots npm config at process startup, this can only be changed by the
+launcher, not from inside the running gateway.
+
+The `1tube` launcher (and the .NET host) therefore export
+`NPM_CONFIG_MIN_RELEASE_AGE=0` for the Deno child **unless you've already set
+it**. That env var is the lowest explicit tier in Deno's precedence chain
+(`--minimum-dependency-age` > `deno.json` `minimumDependencyAge` > `.npmrc`
+`min-release-age` > this env var > the 24h built-in default), so it cancels
+_only_ the new built-in default — any age you configure through `.npmrc`,
+`deno.json`, or the CLI flag still wins. To re-enable a guard, set
+`NPM_CONFIG_MIN_RELEASE_AGE` (e.g. `24h`) yourself or use any higher-precedence
+mechanism.
+
 ### Deno npm lifecycle scripts
 
 Deno does not run npm `postinstall` / build scripts unless you allow them.
@@ -67,12 +110,12 @@ dependency install — **1tube’s runtime graph is just Hono + JSR std**.
 
 ## Endpoints
 
-| Path                       | Description                                                                                                         |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `GET /`                    | Liveness probe (`{"status":"ok"}`) — intentionally minimal so unauthenticated callers don't see the function map.   |
-| `POST /functions/v1/:name` | Invoke an edge function                                                                                             |
-| `GET /health`              | Auth-gated health (`Authorization: Bearer $INTERNAL_KEY`); without auth returns the same minimal `{"status":"ok"}`. |
-| `GET /metrics`             | Auth-gated Prometheus exposition (same scheme).                                                                     |
+| Path                       | Description                                                                                                                                         |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /`                    | Liveness probe (`{"status":"ok"}`) — intentionally minimal so unauthenticated callers don't see the function map.                                   |
+| `POST /functions/v1/:name` | Invoke an edge function                                                                                                                             |
+| `GET /health`              | Auth-gated health (`Authorization: Bearer $INTERNAL_KEY`); without auth returns the same minimal `{"status":"ok"}`.                                 |
+| `GET /metrics`             | Auth-gated Prometheus exposition (same scheme).                                                                                                     |
 | `GET /1tube/warmup`        | Boot progress (deferred boot): `{ready, total, loaded, loading, queued, failed}`. CORS-enabled so frontends can poll it to drive a warm-up overlay. |
 
 ## Configuration
@@ -94,6 +137,12 @@ All knobs default to safe-but-backwards-compatible values. The TS gateway
 | `1TUBE_BODY_LIMIT_MB`                                       | `30`                   | Hono `bodyLimit`; matches Supabase. Returns 413 before the handler runs.                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `1TUBE_BODY_READ_MS`                                        | `30000`                | Slow-loris guard. Max idle gap (ms) between body chunks before the request is aborted with **408**. NOT a total body-read deadline — large but fast uploads pass through. Set `0` to disable.                                                                                                                                                                                                                                                                                                                                    |
 | `1TUBE_CORS_ORIGIN`                                         | `*` (dev only)         | Comma-separated allowlist or `*`. In prod, leaving unset disables CORS.                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `1TUBE_CORS_ALLOW_HEADERS`                                  | Supabase defaults      | Comma-separated `Access-Control-Allow-Headers`. Replaces the built-in default list (`authorization, x-client-info, apikey, content-type`, …) when set.                                                                                                                                                                                                                                                                                                                                                                            |
+| `1TUBE_CORS_ALLOW_METHODS`                                  | Supabase defaults      | Comma-separated `Access-Control-Allow-Methods` (default `GET, POST, PUT, PATCH, DELETE, OPTIONS`).                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `1TUBE_CORS_EXPOSE_HEADERS`                                 | 1tube internals        | Comma-separated `Access-Control-Expose-Headers`. **Merged with** (not replacing) the headers 1tube must always expose (e.g. `X-1tube-Warming`).                                                                                                                                                                                                                                                                                                                                                                                   |
+| `1TUBE_CORS_MAX_AGE`                                        | unset                  | Seconds for `Access-Control-Max-Age` (preflight cache). Omitted when unset.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `1TUBE_CORS_ALLOW_CREDENTIALS`                              | off                    | `1`/`true` emits `Access-Control-Allow-Credentials: true`. Per the Fetch spec this is incompatible with `Origin: *`, so when credentials are on, a literal `*` allowlist is rejected — set an explicit origin.                                                                                                                                                                                                                                                                                                                     |
+| `--route-prefix` / `1TUBE_ROUTE_PREFIX`                     | `/functions/v1`        | URL prefix functions are mounted under. Change it to e.g. `/api` to serve at `/api/<name>`. Normalized to a leading-slash, no-trailing-slash form; logging and rate-limiting follow it automatically.                                                                                                                                                                                                                                                                                                                              |
 | `1TUBE_TRUSTED_PROXIES`                                     | empty                  | Comma-separated list of remote IPs whose `X-Forwarded-For` is honored. Anything else uses the raw socket address — XFF spoofing no longer mints fresh rate-limit buckets.                                                                                                                                                                                                                                                                                                                                                        |
 | `1TUBE_SHUTDOWN_GRACE_MS`                                   | `10000`                | SIGINT/SIGTERM drain budget.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `INTERNAL_KEY`                                              | unset                  | Required to read detailed `/health` and `/metrics`. Header-only: `Authorization: Bearer $INTERNAL_KEY`.                                                                                                                                                                                                                                                                                                                                                                                                                          |
@@ -105,6 +154,7 @@ All knobs default to safe-but-backwards-compatible values. The TS gateway
 | `1TUBE_SHUTDOWN_GRACE_MS`                                   | `10000`                | Total wall-clock budget (ms) for shutdown, split between (1) draining gateway in-flight requests and (2) tearing down the workerd subprocess. See [Graceful shutdown](#graceful-shutdown) below.                                                                                                                                                                                                                                                                                                                                 |
 | `1TUBE_DEFAULT_RPM`                                         | `120`                  | Override the gateway-wide default rate limit (requests per minute, per IP, per function). Per-function `1tube.json#rpm` still wins.                                                                                                                                                                                                                                                                                                                                                                                              |
 | `1TUBE_DISABLE_RATE_LIMIT`                                  | unset                  | Set to `1` to bypass rate limiting entirely. **Load-test / dev only** — production deployments must keep the limiter on. The gateway prints a clear warning at boot when this is enabled.                                                                                                                                                                                                                                                                                                                                        |
+| `NPM_CONFIG_MIN_RELEASE_AGE`                               | `0` (set by launcher)  | Deno 2.9's minimum dependency age. The `1tube` launcher and .NET host export `0` for the Deno child unless you set it, cancelling only Deno's new 24h default. See [Minimum dependency age](#minimum-dependency-age). Must be set _before_ Deno starts — a gateway flag can't change it.                                                                                                                                                                                                                                            |
 
 ````
 ## Deferred boot & warm-up overlay

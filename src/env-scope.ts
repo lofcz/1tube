@@ -57,7 +57,9 @@ export function installEnvScope(): void {
       const ctx = envScopeStorage.getStore();
       if (ctx && !allowAll) {
         throw new Deno.errors.PermissionDenied(
-          `Function "${ctx.functionName}" attempted Deno.env.set(${JSON.stringify(key)}); ` +
+          `Function "${ctx.functionName}" attempted Deno.env.set(${
+            JSON.stringify(key)
+          }); ` +
             `env writes are not permitted from function code.`,
         );
       }
@@ -67,7 +69,9 @@ export function installEnvScope(): void {
       const ctx = envScopeStorage.getStore();
       if (ctx && !allowAll) {
         throw new Deno.errors.PermissionDenied(
-          `Function "${ctx.functionName}" attempted Deno.env.delete(${JSON.stringify(key)}); ` +
+          `Function "${ctx.functionName}" attempted Deno.env.delete(${
+            JSON.stringify(key)
+          }); ` +
             `env writes are not permitted from function code.`,
         );
       }
