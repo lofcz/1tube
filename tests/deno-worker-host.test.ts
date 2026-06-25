@@ -152,6 +152,77 @@ reg.register(() => new Response(value), { public: true });
   }
 });
 
+Deno.test("worker-host: a request in flight during a reload still completes (graceful drain)", async () => {
+  const tmp = await Deno.makeTempDir({ prefix: "1tube-worker-host-drain-" });
+  // A handler that holds the request open long enough for an HMR reload
+  // to land while it's still running. Under the old "terminate the old
+  // worker immediately" behaviour this request was rejected with
+  // `Worker for "fn" terminated`; with graceful draining it must finish.
+  const slowSource = (body: string) => `
+const reg = (globalThis as any).__edgeFunctionRegistry;
+reg.register(async () => {
+  await new Promise((r) => setTimeout(r, 400));
+  return new Response(${JSON.stringify(body)});
+}, { public: true });
+`;
+  try {
+    const fnDir = join(tmp, "fn");
+    await writeFile(join(fnDir, "index.ts"), slowSource("slow-v1"));
+
+    const registry = new FunctionRegistry();
+    const supervisor = new FunctionSupervisor();
+    const host = createDenoWorkerHost({
+      functionsDir: tmp,
+      registry,
+      supervisor,
+    });
+    await host.start();
+
+    try {
+      const before = registry.workerHandle("fn")!;
+      const ac = new AbortController();
+      // Kick off the slow request but DON'T await it yet — it must be
+      // mid-flight (in the worker's pending set) when the reload swaps
+      // the worker out from under it.
+      const inflight = before.dispatch(
+        new Request("http://localhost/"),
+        null,
+        ac.signal,
+      );
+      // Let the dispatch reach the worker before we reload.
+      await new Promise((r) => setTimeout(r, 60));
+
+      await writeFile(join(fnDir, "index.ts"), slowSource("fast-v2"));
+      const summary = await host.reload(new Set(["fn"]), "test");
+      assertEquals(summary.errors, []);
+      assertEquals(summary.reloaded, ["fn"]);
+
+      // The fresh worker is a distinct handle serving the new code.
+      const after = registry.workerHandle("fn")!;
+      assert(after !== before, "expected a fresh handle after reload");
+
+      // The in-flight request must complete against the draining old
+      // worker with its original response — not a dropped rejection.
+      const resp = await inflight;
+      assertEquals(resp.status, 200);
+      assertEquals(await resp.text(), "slow-v1");
+
+      // New traffic lands on the fresh worker.
+      const ac2 = new AbortController();
+      const r2 = await after.dispatch(
+        new Request("http://localhost/"),
+        null,
+        ac2.signal,
+      );
+      assertEquals(await r2.text(), "fast-v2");
+    } finally {
+      await host.stop();
+    }
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
 Deno.test("worker-host: reload removes a function whose index.ts was deleted", async () => {
   const tmp = await Deno.makeTempDir({ prefix: "1tube-worker-host-rm-" });
   try {

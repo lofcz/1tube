@@ -11,6 +11,7 @@
 import type { Context, Next } from "npm:hono@4";
 import { getConnInfo } from "npm:hono@4/deno";
 import type { FunctionRegistry } from "../registry.ts";
+import { routeRemainder } from "./route-prefix.ts";
 
 interface Bucket {
   tokens: number;
@@ -131,14 +132,11 @@ export function createRateLimiter(config: Partial<RateLimitConfig> = {}) {
   _activeMaxBuckets = cfg.maxBuckets;
 
   return async (c: Context, next: Next) => {
-    // Middleware is mounted on `/functions/v1/*`, so c.req.param() won't see
-    // the trailing segments. Parse the function name out of the path
-    // ourselves — first segment after the prefix, before any nested route.
-    const path = c.req.path;
-    const after = path.startsWith("/functions/v1/")
-      ? path.slice("/functions/v1/".length)
-      : "";
-    const fnName = after.split("/", 1)[0] || "";
+    // Middleware is mounted on the function route wildcard, so
+    // c.req.param() won't see the trailing segments. Parse the function
+    // name out of the path ourselves — first segment after the
+    // (configurable) prefix, before any nested route.
+    const fnName = routeRemainder(c.req.path).split("/", 1)[0] || "";
 
     const manifestRpm = fnName ? cfg.registry?.manifestFor(fnName)?.rpm : undefined;
     const rpm = manifestRpm ?? ((fnName && cfg.overrides[fnName]) || cfg.defaultRpm);

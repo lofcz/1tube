@@ -63,8 +63,20 @@ export interface DenoWorkerHostOptions {
   supervisor: FunctionSupervisor;
   /** Debounce window in ms for batched fs change events. Defaults to 200ms. */
   debounceMs?: number;
-  /** Max concurrent worker spawns at boot/reload. Defaults to 8. */
+  /**
+   * Max concurrent worker spawns at boot/reload. Defaults to the host's
+   * CPU count clamped to [8, 16] so multi-core dev machines boot a large
+   * function set faster, while smaller boxes keep the historical 8.
+   */
   concurrency?: number;
+  /**
+   * Grace window (ms) granted to a superseded worker on HMR reload so its
+   * in-flight requests can finish before it is terminated. The fresh
+   * worker already serves new traffic, so the reload never waits on this
+   * — it runs in the background. Defaults to 10000; 0 reverts to the
+   * legacy "terminate immediately" behaviour (drops in-flight responses).
+   */
+  reloadDrainMs?: number;
   /**
    * Parsed `imports` from the host project's deno.json. Forwarded to the
    * dep-graph so import-map aliases resolve to the right file URLs. Optional.
@@ -166,6 +178,44 @@ function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
     const pending = new Map<number, PendingRequest>();
     let nextId = 1;
     let booted = false;
+    let terminated = false;
+
+    // Graceful-drain plumbing. `drainWaiters` are notified whenever a
+    // pending request settles (so a `terminate({ drainMs })` can finish
+    // the moment the worker goes idle) AND on hard termination (so an
+    // in-flight drain resolves instead of leaking timers). `drainTimers`
+    // tracks the drain's own timers so hard termination can cancel them.
+    const drainWaiters = new Set<() => void>();
+    const drainTimers = new Set<number>();
+
+    /** Fire drain waiters once the worker has no in-flight requests left. */
+    const notifyDrained = () => {
+      if (pending.size !== 0 || drainWaiters.size === 0) return;
+      for (const w of [...drainWaiters]) w();
+    };
+
+    /**
+     * Immediate teardown: kill the worker, reject everything still
+     * pending, and release any drain waiters. Idempotent — safe to call
+     * from the crash handler, a drain timeout, or host.stop() racing an
+     * in-flight drain.
+     */
+    const hardTerminate = () => {
+      if (terminated) return;
+      terminated = true;
+      try {
+        worker.terminate();
+      } catch { /* already dead */ }
+      for (const p of pending.values()) {
+        p.reject(new Error(`Worker for "${opts.name}" terminated`));
+      }
+      pending.clear();
+      for (const t of drainTimers) clearTimeout(t);
+      drainTimers.clear();
+      const waiters = [...drainWaiters];
+      drainWaiters.clear();
+      for (const w of waiters) w();
+    };
 
     const finishBoot = (handle: InternalHandle) => {
       booted = true;
@@ -190,9 +240,13 @@ function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
           new Error(`Worker for "${opts.name}" failed to start: ${message}`),
         );
       } else {
-        // Drain any in-flight callers — the worker is dead.
+        // Crashed after boot — reject in-flight callers with the real
+        // error, then mark the worker terminated so later dispatches
+        // fast-fail and any graceful drain in progress resolves instead
+        // of hanging on a dead worker.
         for (const p of pending.values()) p.reject(new Error(message));
         pending.clear();
+        hardTerminate();
       }
       e.preventDefault?.();
     };
@@ -216,6 +270,13 @@ function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
             if (signal.aborted) {
               throw new DOMException("Aborted", "AbortError");
             }
+            if (terminated) {
+              // Worker already torn down (HMR drain grace expired, a
+              // crash, or shutdown). Fail fast with a clear signal rather
+              // than posting into a dead worker and stalling until the
+              // request timeout fires.
+              throw new Error(`Worker for "${opts.name}" terminated`);
+            }
             const id = nextId++;
             const headers: Array<[string, string]> = [];
             req.headers.forEach((v, k) => headers.push([k, v]));
@@ -231,6 +292,7 @@ function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
               if (p) {
                 pending.delete(id);
                 p.reject(new DOMException("Aborted", "AbortError"));
+                notifyDrained();
               }
             };
             signal.addEventListener("abort", onAbort, { once: true });
@@ -251,6 +313,7 @@ function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
             } catch (err) {
               pending.delete(id);
               signal.removeEventListener("abort", onAbort);
+              notifyDrained();
               throw err;
             }
             try {
@@ -259,15 +322,56 @@ function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
               signal.removeEventListener("abort", onAbort);
             }
           },
-          terminate() {
-            try {
-              worker.terminate();
-            } catch { /* already dead */ }
-            for (const p of pending.values()) {
-              p.reject(new Error(`Worker for "${opts.name}" terminated`));
+          terminate(termOpts) {
+            const drainMs = termOpts?.drainMs ?? 0;
+            if (terminated) return Promise.resolve();
+            // No grace requested → tear down immediately.
+            if (drainMs <= 0) {
+              hardTerminate();
+              return Promise.resolve();
             }
-            pending.clear();
-            return Promise.resolve();
+            // Graceful handoff: keep serving the requests already in
+            // flight, then kill the worker once it goes idle (plus a
+            // short linger so a just-posted response body finishes
+            // flushing to the host) or the grace window expires —
+            // whichever comes first.
+            const lingerMs = Math.min(500, drainMs);
+            return new Promise<void>((resolveDrain) => {
+              let settled = false;
+              let lingerTimer: number | undefined;
+              const finish = () => {
+                if (settled) return;
+                settled = true;
+                drainWaiters.delete(waiter);
+                clearTimeout(hardCap);
+                drainTimers.delete(hardCap);
+                if (lingerTimer !== undefined) {
+                  clearTimeout(lingerTimer);
+                  drainTimers.delete(lingerTimer);
+                }
+                hardTerminate();
+                resolveDrain();
+              };
+              const armLinger = () => {
+                if (lingerTimer !== undefined || settled) return;
+                lingerTimer = setTimeout(finish, lingerMs) as unknown as number;
+                drainTimers.add(lingerTimer);
+              };
+              // Invoked both on each pending-request settle and on hard
+              // termination (where `terminated` is already true).
+              const waiter = () => {
+                if (terminated) {
+                  finish();
+                  return;
+                }
+                if (pending.size === 0) armLinger();
+              };
+              drainWaiters.add(waiter);
+              const hardCap = setTimeout(finish, drainMs) as unknown as number;
+              drainTimers.add(hardCap);
+              // Nothing in flight at swap time → go straight to linger.
+              if (pending.size === 0) armLinger();
+            });
           },
         };
         finishBoot(handle);
@@ -292,6 +396,10 @@ function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
         const wantsBody = status >= 200 && status !== 204 && status !== 205 &&
           status !== 304;
         p.resolve(new Response(wantsBody ? body : null, { status, headers }));
+        // After resolve, never before: a drain may hard-terminate the
+        // worker here, and the response body is a stream we just handed
+        // to the caller — let it land first.
+        notifyDrained();
         return;
       }
 
@@ -303,6 +411,7 @@ function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
         const err = new Error(String(m.message ?? "handler error"));
         if (m.stack) (err as Error).stack = String(m.stack);
         p.reject(err);
+        notifyDrained();
         return;
       }
 
@@ -412,6 +521,14 @@ export interface SpawnProgress {
 }
 
 export interface StartOptions {
+  /**
+   * Fired as functions are discovered on disk, BEFORE any worker spawns,
+   * with the running count. Drives the live "scanning" line so a project
+   * with a slow/large function tree doesn't look hung during the
+   * stat + manifest sweep. `phase` distinguishes the directory scan from
+   * the (shared-rewrite only) batch dep-graph build that follows it.
+   */
+  onScanProgress?: (p: { found: number; phase: "scan" | "graph" }) => void;
   /** Fired before each worker spawn begins. */
   onSpawnStart?: (p: { index: number; total: number; name: string }) => void;
   /** Fired after each worker either becomes ready or errors out. */
@@ -502,29 +619,68 @@ interface DiscoveredCandidate {
   manifest: FunctionManifest;
 }
 
+/**
+ * Lightweight fs metadata is cheap individually but ruinous in series:
+ * a stat + manifest read per function, one after another, is the single
+ * biggest "boot looks stuck" contributor on large projects (Windows
+ * especially). 64 lanes saturate the filesystem without exhausting
+ * handles.
+ */
+const DISCOVERY_CONCURRENCY = 64;
+
+/** Run `fn` over `items` with at most `limit` in flight at once. */
+async function forEachBounded<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let cursor = 0;
+  const lanes = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= items.length) return;
+        await fn(items[i]);
+      }
+    },
+  );
+  await Promise.all(lanes);
+}
+
 async function discoverCandidates(
-  functionsDir: string,
+  resolved: string,
+  onFound?: (count: number) => void,
 ): Promise<DiscoveredCandidate[]> {
-  const resolved = await Deno.realPath(functionsDir);
-  const out: DiscoveredCandidate[] = [];
+  // Phase 1: cheap directory listing (single syscall stream).
+  const names: string[] = [];
   for await (const entry of Deno.readDir(resolved)) {
     if (!entry.isDirectory) continue;
     if (entry.name.startsWith("_") || entry.name.endsWith("_shared")) continue;
-    const indexPath = join(resolved, entry.name, "index.ts");
+    names.push(entry.name);
+  }
+  // Phase 2: stat + manifest in parallel. Was sequential, which made a
+  // big function set crawl one fs round-trip at a time.
+  const out: DiscoveredCandidate[] = [];
+  let found = 0;
+  await forEachBounded(names, DISCOVERY_CONCURRENCY, async (name) => {
+    const indexPath = join(resolved, name, "index.ts");
     try {
-      await Deno.stat(indexPath);
+      const st = await Deno.stat(indexPath);
+      if (!st.isFile) return;
     } catch {
-      continue;
+      return;
     }
-    const manifest = await loadManifest(resolved, entry.name).catch(() =>
+    const manifest = await loadManifest(resolved, name).catch(() =>
       defaultManifest()
     );
     out.push({
-      name: entry.name,
+      name,
       entryUrl: pathToFileURL(indexPath).href,
       manifest,
     });
-  }
+    onFound?.(++found);
+  });
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
 }
@@ -536,10 +692,9 @@ async function discoverCandidates(
  * 100 stat + manifest reads (which are painfully slow on Windows).
  */
 async function discoverNamed(
-  functionsDir: string,
+  resolved: string,
   names: ReadonlySet<string>,
 ): Promise<DiscoveredCandidate[]> {
-  const resolved = await Deno.realPath(functionsDir);
   const out: DiscoveredCandidate[] = [];
   await Promise.all([...names].map(async (name) => {
     if (name.startsWith("_") || name.endsWith("_shared")) return;
@@ -576,10 +731,58 @@ export function createDenoWorkerHost(
       }
       : undefined,
   );
-  const concurrency = Math.max(1, opts.concurrency ?? 8);
+  // Scale boot/reload spawn concurrency to the machine: a 32-function
+  // project boots far faster with 12-16 lanes on a modern dev box, while
+  // small machines keep the historical 8. Deno 2.9's much lower per-
+  // worker RSS makes the higher ceiling safe.
+  const defaultConcurrency = (() => {
+    const hc = Math.floor(globalThis.navigator?.hardwareConcurrency ?? 0);
+    return hc > 0 ? Math.max(8, Math.min(hc, 16)) : 8;
+  })();
+  const concurrency = Math.max(1, opts.concurrency ?? defaultConcurrency);
+  const reloadDrainMs = Math.max(0, opts.reloadDrainMs ?? 10_000);
 
   const sharedRuntime = opts.sharedRuntime;
   const rewriteCache = opts.rewriteCache;
+
+  // Canonical functions root, resolved once. Both discovery paths used
+  // to `Deno.realPath()` on every boot AND every HMR reload — needless
+  // syscalls (slow on Windows) since the directory never moves. Cache
+  // it, but don't memoize a transient failure so a missing dir can heal.
+  let functionsRootPromise: Promise<string> | null = null;
+  function functionsRoot(): Promise<string> {
+    if (!functionsRootPromise) {
+      functionsRootPromise = Deno.realPath(opts.functionsDir).catch((err) => {
+        functionsRootPromise = null;
+        throw err;
+      });
+    }
+    return functionsRootPromise;
+  }
+
+  // Workers superseded by an HMR reload but still draining their
+  // in-flight requests. Held so `stop()` can reap them promptly instead
+  // of waiting out each one's grace window.
+  const drainingHandles = new Set<InternalHandle>();
+
+  /**
+   * Retire a worker that has been replaced or removed. Hands it the
+   * configured drain grace so in-flight requests finish, and tracks it
+   * for shutdown. Fire-and-forget: the caller (reload/respawn) must not
+   * block on the drain.
+   */
+  function retireHandle(h: InternalHandle): void {
+    if (reloadDrainMs <= 0) {
+      void h.terminate().catch(() => {});
+      return;
+    }
+    drainingHandles.add(h);
+    void h.terminate({ drainMs: reloadDrainMs })
+      .catch(() => {})
+      .finally(() => {
+        drainingHandles.delete(h);
+      });
+  }
 
   // -------------------------------------------------------------------
   // Boot state machine (shared by eager + deferred boot and reload)
@@ -845,7 +1048,12 @@ export function createDenoWorkerHost(
         });
       }
       if (old) {
-        await old.terminate().catch(() => {});
+        // Graceful handoff: new requests already route to the fresh
+        // worker (registry + handles swapped above), so let the previous
+        // one finish whatever it had in flight before terminating. This
+        // is the fix for HMR dropping in-flight responses under load —
+        // and it runs in the background so the reload returns instantly.
+        retireHandle(old);
       }
       // If the dep-graph was kicked off in parallel (no shared
       // runtime case), make sure it lands before we return —
@@ -890,7 +1098,10 @@ export function createDenoWorkerHost(
   }
 
   async function start(startOpts: StartOptions = {}) {
-    const candidates = await discoverCandidates(opts.functionsDir);
+    const candidates = await discoverCandidates(
+      await functionsRoot(),
+      (found) => startOpts.onScanProgress?.({ found, phase: "scan" }),
+    );
     const loaded: string[] = [];
     const errors: Array<{ name: string; error: string }> = [];
     const total = candidates.length;
@@ -900,6 +1111,7 @@ export function createDenoWorkerHost(
     );
 
     if (useSharedRewrite && candidates.length > 0) {
+      startOpts.onScanProgress?.({ found: total, phase: "graph" });
       const graphStart = performance.now();
       await depGraph.refreshMany(
         candidates.map((c) => ({ name: c.name, entryFileUrl: c.entryUrl })),
@@ -1021,7 +1233,10 @@ export function createDenoWorkerHost(
   async function startDeferred(
     startOpts: StartOptions = {},
   ): Promise<DeferredStart> {
-    const candidates = await discoverCandidates(opts.functionsDir);
+    const candidates = await discoverCandidates(
+      await functionsRoot(),
+      (found) => startOpts.onScanProgress?.({ found, phase: "scan" }),
+    );
     // MRU-first warm-up: the background queue boots the functions the
     // developer was hitting most recently (seeded from the invocation
     // log store across restarts) before the ones nobody calls. Ties —
@@ -1107,11 +1322,12 @@ export function createDenoWorkerHost(
     reason = "fs change",
   ): Promise<ReloadSummary> {
     const start = performance.now();
+    const root = await functionsRoot();
     // Targeted re-discovery: only stat/load the affected names. The
     // full-scan path is reserved for "all" (initial boot semantics).
     const candidates = names === "all"
-      ? await discoverCandidates(opts.functionsDir)
-      : await discoverNamed(opts.functionsDir, names);
+      ? await discoverCandidates(root)
+      : await discoverNamed(root, names);
     const candByName = new Map(candidates.map((c) => [c.name, c]));
 
     const targetNames = names === "all"
@@ -1133,7 +1349,9 @@ export function createDenoWorkerHost(
 
     for (const n of removed) {
       const h = handles.get(n);
-      if (h) await h.terminate().catch(() => {});
+      // Drop the routing handle first so no new request reaches it, then
+      // let it drain its in-flight requests in the background.
+      if (h) retireHandle(h);
       handles.delete(n);
       opts.registry.clearWorkerHandle(n);
       // Deferred boot may have registered a candidate for this name;
@@ -1209,8 +1427,12 @@ export function createDenoWorkerHost(
   }
 
   async function stop() {
-    const all = [...handles.values()];
+    // Include workers still draining from a recent reload. Hard-terminate
+    // everything (no drain grace) so shutdown stays prompt; each handle's
+    // in-flight graceful drain resolves the instant its worker is killed.
+    const all = [...handles.values(), ...drainingHandles];
     handles.clear();
+    drainingHandles.clear();
     await Promise.all(all.map((h) => h.terminate().catch(() => {})));
   }
 

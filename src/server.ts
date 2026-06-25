@@ -35,6 +35,14 @@ import { createLogQuery } from "./logs/query.ts";
 import { registerLogRoutes } from "./logs/api.ts";
 import { parseMarkedConsoleLine } from "./logs/console-marker.ts";
 import { createRateLimiter } from "./gateway/rate-limit.ts";
+import {
+  getRoutePrefix,
+  normalizeRoutePrefix,
+  routeDispatchPattern,
+  routeWildcard,
+  setRoutePrefix,
+  stripRoutePrefixFromPathname,
+} from "./gateway/route-prefix.ts";
 import { createHealthHandler, createMetricsHandler } from "./health.ts";
 import { FunctionSupervisor } from "./supervisor.ts";
 import { installEnvScope } from "./env-scope.ts";
@@ -66,7 +74,7 @@ import {
   createRewriteCache,
   type RewriteCache,
 } from "./backends/deno/source-rewriter.ts";
-import { createBootProgress } from "./boot-progress.ts";
+import { createBootProgress, createScanProgress } from "./boot-progress.ts";
 import {
   createWorkerdWatchdog,
   recommendedBudgetBytes,
@@ -114,6 +122,13 @@ interface CliOpts {
   port: number;
   host: string;
   functionsPath: string;
+  /**
+   * URL prefix every function is served under. Defaults to Supabase's
+   * `/functions/v1`. Override with `--route-prefix <p>` /
+   * `1TUBE_ROUTE_PREFIX` to mount functions at e.g. `/api` or `/edge/v2`.
+   * Normalized to a single leading slash, no trailing slash.
+   */
+  routePrefix: string;
   defaultTimeoutMs: number;
   bodyLimitBytes: number;
   /**
@@ -179,6 +194,13 @@ interface CliOpts {
   workerdShared?: readonly string[];
   /** Max concurrent Deno Worker spawns during eager boot/reload. */
   denoWorkerConcurrency?: number;
+  /**
+   * Grace window (ms) an HMR-superseded Deno worker keeps serving its
+   * in-flight requests before it is terminated. Prevents a reload under
+   * load from dropping responses. `1TUBE_HMR_DRAIN_MS`, default 10000;
+   * 0 reverts to terminate-immediately. Deno backend only.
+   */
+  denoReloadDrainMs?: number;
   /**
    * First loopback port workerd may use for per-function sockets.
    * The backend reserves a second generation range at +500 during
@@ -306,6 +328,12 @@ function parseArgs(): CliOpts {
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n > 0 ? n : undefined;
   })();
+  let denoReloadDrainMs: number | undefined = (() => {
+    const v = Deno.env.get("1TUBE_HMR_DRAIN_MS");
+    if (!v) return undefined;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+  })();
   let workerdBasePort: number | undefined = (() => {
     const v = Deno.env.get("1TUBE_WORKERD_BASE_PORT");
     if (!v) return undefined;
@@ -373,6 +401,9 @@ function parseArgs(): CliOpts {
   let port = parseInt(Deno.env.get("PORT") || "3100", 10);
   let host = (Deno.env.get("1TUBE_HOST") || "127.0.0.1").trim();
   let functionsPath = Deno.env.get("FUNCTIONS_PATH") || "./supabase/functions";
+  // Normalized at the end via setRoutePrefix(); kept raw here so an
+  // explicit CLI flag can still override the env var.
+  let routePrefix = Deno.env.get("1TUBE_ROUTE_PREFIX") || "/functions/v1";
   let defaultTimeoutMs = parseInt(
     Deno.env.get("FUNCTION_TIMEOUT_MS") || "150000",
     10,
@@ -395,6 +426,10 @@ function parseArgs(): CliOpts {
       host = args[++i];
     } else if (a === "--functions" && args[i + 1]) {
       functionsPath = args[++i];
+    } else if (a === "--route-prefix" && args[i + 1]) {
+      routePrefix = args[++i];
+    } else if (a.startsWith("--route-prefix=")) {
+      routePrefix = a.slice("--route-prefix=".length);
     } else if (a === "--timeout" && args[i + 1]) {
       defaultTimeoutMs = parseInt(args[++i], 10);
     } else if (a === "--dev") {
@@ -459,6 +494,12 @@ function parseArgs(): CliOpts {
     } else if (a.startsWith("--deno-worker-concurrency=")) {
       const n = parseInt(a.slice("--deno-worker-concurrency=".length), 10);
       if (Number.isFinite(n) && n > 0) denoWorkerConcurrency = n;
+    } else if (a === "--hmr-drain-ms" && args[i + 1]) {
+      const n = parseInt(args[++i], 10);
+      if (Number.isFinite(n) && n >= 0) denoReloadDrainMs = n;
+    } else if (a.startsWith("--hmr-drain-ms=")) {
+      const n = parseInt(a.slice("--hmr-drain-ms=".length), 10);
+      if (Number.isFinite(n) && n >= 0) denoReloadDrainMs = n;
     } else if (a === "--workerd-base-port" && args[i + 1]) {
       const n = parseInt(args[++i], 10);
       if (Number.isFinite(n) && n > 0) workerdBasePort = n;
@@ -574,6 +615,7 @@ function parseArgs(): CliOpts {
     port,
     host,
     functionsPath,
+    routePrefix: normalizeRoutePrefix(routePrefix),
     defaultTimeoutMs,
     bodyLimitBytes: Math.max(0, Math.floor(bodyLimitMb * 1024 * 1024)),
     bodyReadIdleMs: Math.max(0, bodyReadIdleMs),
@@ -589,6 +631,7 @@ function parseArgs(): CliOpts {
     workerdEnv,
     workerdShared,
     denoWorkerConcurrency,
+    denoReloadDrainMs,
     workerdBasePort,
     workerdInspector,
     workerdMaxHeapMB,
@@ -1360,6 +1403,9 @@ if (opts.backend === "workerd") {
     ...(opts.denoWorkerConcurrency
       ? { concurrency: opts.denoWorkerConcurrency }
       : {}),
+    ...(opts.denoReloadDrainMs !== undefined
+      ? { reloadDrainMs: opts.denoReloadDrainMs }
+      : {}),
     ...(denoImportMapOptions ?? {}),
     ...(denoSharedRuntime ? { sharedRuntime: denoSharedRuntime } : {}),
     ...(denoRewriteCache ? { rewriteCache: denoRewriteCache } : {}),
@@ -1375,6 +1421,11 @@ if (opts.backend === "workerd") {
   // already enough signal.
   const bootStart = performance.now();
   const progress = createBootProgress(Deno.stdout, { pulseMs: 2000 });
+  // Live in-place "scanning" line for the pre-spawn phase (directory
+  // discovery + batch dep-graph). Safe to redraw in place here because no
+  // function module has been imported yet, so nothing else is writing to
+  // the TTY. Cleared the instant the first worker spawn line prints.
+  const scanProgress = createScanProgress(Deno.stdout);
   const bootProfile = Deno.env.get("1TUBE_BOOT_PROFILE") === "1" ||
     Deno.env.get("1TUBE_BOOT_PROFILE")?.toLowerCase() === "true";
   let started = false;
@@ -1387,6 +1438,10 @@ if (opts.backend === "workerd") {
   // duration; the only thing that changes is the column we display.
   let printOrder = 0;
   const startCallbacks = {
+    onScanProgress: (p: { found: number; phase: "scan" | "graph" }) => {
+      scanProgress.setPhase(p.phase);
+      scanProgress.setFound(p.found);
+    },
     onBatchGraph: (p: { total: number; durationMs: number }) => {
       if (bootProfile) {
         console.log(
@@ -1397,6 +1452,9 @@ if (opts.backend === "workerd") {
       }
     },
     onSpawnStart: (p: { index: number; total: number; name: string }) => {
+      // Clear the scanning line before the first append-only spawn line
+      // lands, so the two never collide on the same TTY row.
+      scanProgress.stop();
       if (!started) {
         progress.start(p.total);
         started = true;
@@ -1440,6 +1498,7 @@ if (opts.backend === "workerd") {
     }
   };
 
+  scanProgress.start();
   if (opts.deferBoot) {
     // Deferred boot: the gateway starts serving right away; Workers spawn
     // in the background. A request for a not-yet-ready function bumps it
@@ -1447,6 +1506,9 @@ if (opts.backend === "workerd") {
     const { discovered, done } = await denoWorkerHost.startDeferred(
       startCallbacks,
     );
+    // Scan is done by the time startDeferred resolves (spawns continue in
+    // the background); clear the line before the deferred-boot message.
+    scanProgress.stop();
     console.log(
       `[1tube] Deferred boot: ${discovered.length} function(s) warming in ` +
         `the background — gateway is accepting requests now ` +
@@ -1458,6 +1520,7 @@ if (opts.backend === "workerd") {
     });
   } else {
     const { loaded, errors } = await denoWorkerHost.start(startCallbacks);
+    scanProgress.stop();
     progress.stop();
     logBootSummary(loaded, errors, "Loaded");
   }
@@ -1506,6 +1569,16 @@ const rateLimiter = createRateLimiter({
   ...(rpmOverride !== null ? { defaultRpm: rpmOverride } : {}),
 });
 
+// Lock in the (configurable) function route prefix BEFORE mounting any
+// route — the logging + rate-limit middleware read the same global to
+// strip it back off. `fnRouteWildcard` is the Hono mount pattern shared
+// by every middleware below (`<prefix>/*`).
+setRoutePrefix(opts.routePrefix);
+const fnRouteWildcard = routeWildcard();
+if (opts.routePrefix !== "/functions/v1") {
+  console.log(`[1tube] Function route prefix: ${opts.routePrefix}`);
+}
+
 // Middleware order matters:
 //   1. CORS (handle preflight before anything else can short-circuit)
 //   2. Fast-fail unknown function names (no auth/rate-limit cost for scans)
@@ -1514,7 +1587,7 @@ const rateLimiter = createRateLimiter({
 //   5. JWT auth probe (sets c.userId when token is valid; does NOT enforce
 //      auth here — the dispatcher decides per function based on `isPublic`)
 //   6. Rate limiter (now sees a real userId for per-user keying)
-app.use("/functions/v1/*", corsMiddleware);
+app.use(fnRouteWildcard, corsMiddleware);
 // Backend-aware function-existence probe. On the workerd backend the
 // bundled-set captured at boot is the source; on the deno backend the
 // registry's worker-handle map is. Both expose the same Map-lookup-cost
@@ -1522,12 +1595,12 @@ app.use("/functions/v1/*", corsMiddleware);
 const functionExists = (name: string): boolean =>
   opts.backend === "workerd" ? workerdNames.has(name) : registry.has(name);
 
-app.use("/functions/v1/*", async (c, next) => {
+app.use(fnRouteWildcard, async (c, next) => {
   // Fast-fail unknown function names before paying for logging, auth, body
   // limit, and rate-limit. Without this, a scanner hammering random names
   // exhausts rate-limit buckets keyed by IP and pollutes the log stream.
   const path = c.req.path;
-  const prefix = "/functions/v1/";
+  const prefix = getRoutePrefix() + "/";
   if (path.length > prefix.length) {
     const after = path.slice(prefix.length);
     const slash = after.indexOf("/");
@@ -1538,9 +1611,9 @@ app.use("/functions/v1/*", async (c, next) => {
   }
   await next();
 });
-app.use("/functions/v1/*", loggingMiddleware);
+app.use(fnRouteWildcard, loggingMiddleware);
 app.use(
-  "/functions/v1/*",
+  fnRouteWildcard,
   bodyLimit({
     maxSize: opts.bodyLimitBytes,
     onError: (c) =>
@@ -1553,7 +1626,7 @@ app.use(
       ),
   }),
 );
-app.use("/functions/v1/*", async (c, next) => {
+app.use(fnRouteWildcard, async (c, next) => {
   // Probe-only auth: validate the bearer token if present, but don't reject
   // unauthenticated requests here. Public functions need to pass through and
   // rate-limit by IP; protected functions are gated below in the dispatcher.
@@ -1568,13 +1641,15 @@ app.use("/functions/v1/*", async (c, next) => {
   }
   await next();
 });
-app.use("/functions/v1/*", rateLimiter);
+app.use(fnRouteWildcard, rateLimiter);
 
-// Function dispatch
-app.all("/functions/v1/:name{.+}", async (c) => {
+// Function dispatch. The pattern is built from the configurable prefix, so
+// Hono can't statically infer the `:name` param — hence the `?? ""` guard
+// (the `{.+}` matcher guarantees a non-empty value at runtime anyway).
+app.all(routeDispatchPattern(), async (c) => {
   // c.req.param("name") greedily captures the trailing path with the {.+}
   // matcher; restrict it to the first segment.
-  const rawName = c.req.param("name");
+  const rawName = c.req.param("name") ?? "";
   const name = rawName.split("/", 1)[0];
 
   // Workerd backend dispatch path. Same gateway pipeline (CORS, auth
@@ -1618,12 +1693,12 @@ app.all("/functions/v1/:name{.+}", async (c) => {
       }).body
       : null;
     // Mirror the Deno-path URL rewrite: user code expects to see the
-    // pathname without the `/functions/v1` prefix, matching Supabase
+    // pathname without the gateway route prefix, matching Supabase
     // Edge Runtime behaviour. Without this strip, hello/echo see the
     // gateway prefix in their `new URL(req.url).pathname`.
     const originalUrl = new URL(c.req.raw.url);
     const rewrittenPath =
-      originalUrl.pathname.replace(/^\/functions\/v1/, "") || "/";
+      stripRoutePrefixFromPathname(originalUrl.pathname) || "/";
     const rewrittenUrl = new URL(
       rewrittenPath + originalUrl.search,
       originalUrl.origin,
@@ -1831,9 +1906,9 @@ app.all("/functions/v1/:name{.+}", async (c) => {
   const timeoutMs = handle.timeoutMs ?? handle.manifest.timeoutMs ??
     opts.defaultTimeoutMs;
 
-  // Strip /functions/v1 prefix to match Supabase Edge Runtime behavior.
+  // Strip the gateway route prefix to match Supabase Edge Runtime behavior.
   const originalUrl = new URL(c.req.raw.url);
-  const rewrittenPath = originalUrl.pathname.replace(/^\/functions\/v1/, "") ||
+  const rewrittenPath = stripRoutePrefixFromPathname(originalUrl.pathname) ||
     "/";
   const rewrittenUrl = new URL(
     rewrittenPath + originalUrl.search,

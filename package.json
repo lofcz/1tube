@@ -62,7 +62,7 @@
   },
   "dependencies": {
     "drizzle-orm": "1.0.0-rc.3",
-    "hono": "^4.12.25"
+    "hono": "^4.12.27"
   },
   "devDependencies": {
     "drizzle-kit": "1.0.0-rc.3"

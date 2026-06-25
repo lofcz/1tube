@@ -11,6 +11,7 @@
 
 import type { Context, Next } from "npm:hono@4";
 import { logError, logInfo } from "../log-buffer.ts";
+import { getRoutePrefix, routeRemainder } from "./route-prefix.ts";
 import { uuidv7 } from "../logs/id.ts";
 import type {
   InvocationErrorKind,
@@ -95,7 +96,7 @@ export function setInvocationError(c: Context, info: InvocationErrorInfo): void 
 export async function loggingMiddleware(c: Context, next: Next) {
   const start = performance.now();
   const startedAtMs = Date.now();
-  const fnName = safeFnName(c.req.path.replace("/functions/v1/", "") || "unknown");
+  const fnName = safeFnName(routeRemainder(c.req.path) || "unknown");
   // UUIDv7: time-ordered, so the persisted id doubles as a stable sort
   // tiebreaker. Assigned for every request — even when persistence is
   // off the header is useful for support tickets / client-side traces.
@@ -157,7 +158,7 @@ export async function loggingMiddleware(c: Context, next: Next) {
 
   // Note: only method, function name, status, duration, and a truncated user
   // id are logged. No headers (esp. Authorization), no body, no query string.
-  const line = `\x1b[36m[1tube]${reset} ${c.req.method} /functions/v1/${fnName} → ${statusColor}${status}${reset} ${dim}(${durationMs}ms)${reset}${userTag}`;
+  const line = `\x1b[36m[1tube]${reset} ${c.req.method} ${getRoutePrefix()}/${fnName} → ${statusColor}${status}${reset} ${dim}(${durationMs}ms)${reset}${userTag}`;
 
   if (isError) {
     logError(line);

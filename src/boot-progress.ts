@@ -129,3 +129,102 @@ export function createBootProgress(
     },
   };
 }
+
+/**
+ * Live "scanning" indicator for the pre-spawn boot phase (directory
+ * discovery + the optional batch dep-graph build).
+ *
+ * Unlike {@link createBootProgress}, this DOES redraw a single line in
+ * place — and that's safe here precisely because it only runs before any
+ * function module is imported, so there are no foreign `console.log()`
+ * writers to corrupt the frame yet. {@link stop} clears the line so the
+ * append-only boot progress (or the final summary) starts on a clean
+ * row. On a non-TTY sink it renders nothing at all: a `\r`-spinner piped
+ * to a file or CI log is just noise.
+ */
+export interface ScanProgress {
+  /** Begin rendering and arm the elapsed-time ticker. */
+  start(): void;
+  /** Update the discovered-function count (scan phase). */
+  setFound(found: number): void;
+  /** Switch the phase label (e.g. "scan" → "graph"). */
+  setPhase(phase: "scan" | "graph"): void;
+  /** Clear the line and stop ticking. Idempotent. */
+  stop(): void;
+}
+
+export interface ScanProgressOptions {
+  /** Redraw cadence in ms. Default 120 — smooth elapsed counter. */
+  tickMs?: number;
+}
+
+export function createScanProgress(
+  sink: Sink = Deno.stdout,
+  opts: ScanProgressOptions = {},
+): ScanProgress {
+  const enc = new TextEncoder();
+  const tickMs = opts.tickMs ?? 120;
+  const isTty = (() => {
+    try {
+      return sink.isTerminal?.() ?? false;
+    } catch {
+      return false;
+    }
+  })();
+
+  let found = 0;
+  let phase: "scan" | "graph" = "scan";
+  let startedAt = 0;
+  let timer: number | undefined;
+  let active = false;
+
+  const write = (s: string) => {
+    try {
+      sink.writeSync(enc.encode(s));
+    } catch {
+      // Closed pipe — never crash boot over a broken stdout.
+    }
+  };
+
+  const render = () => {
+    if (!isTty || !active) return;
+    const elapsed = ((performance.now() - startedAt) / 1000).toFixed(1);
+    const body = phase === "graph"
+      ? `Building dependency graph… ${
+        found > 0 ? `${found} function${found === 1 ? "" : "s"} ` : ""
+      }`
+      : `Scanning functions… ${found > 0 ? `found ${found} ` : ""}`;
+    // \r → column 0, \x1b[2K → clear the whole line, then repaint.
+    write(`\r\x1b[2K[1tube] ${body}\x1b[2m(${elapsed}s)\x1b[0m`);
+  };
+
+  return {
+    start() {
+      if (active) return;
+      active = true;
+      startedAt = performance.now();
+      render();
+      if (isTty && tickMs > 0) {
+        timer = setInterval(render, tickMs) as unknown as number;
+      }
+    },
+    setFound(n) {
+      found = n;
+      render();
+    },
+    setPhase(p) {
+      phase = p;
+      render();
+    },
+    stop() {
+      if (!active) return;
+      active = false;
+      if (timer !== undefined) {
+        clearInterval(timer);
+        timer = undefined;
+      }
+      // Wipe the line so the next writer starts clean.
+      if (isTty) write("\r\x1b[2K");
+    },
+  };
+}

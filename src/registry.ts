@@ -104,7 +104,13 @@ export interface WorkerFunctionHandle {
      */
     invocationId?: string,
   ): Promise<Response>;
-  terminate(): Promise<void>;
+  /**
+   * Tear down the worker. With `drainMs > 0`, in-flight requests are
+   * allowed to finish (up to `drainMs`) before the worker is killed —
+   * the graceful HMR handoff path. Omitting it (or passing 0) hard-
+   * terminates immediately, rejecting anything still pending.
+   */
+  terminate(opts?: { drainMs?: number }): Promise<void>;
 }
 
 export class FunctionRegistry {

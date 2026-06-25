@@ -154,3 +154,108 @@ Deno.test("cors: OPTIONS from a disallowed origin returns 204 with no allow-orig
   assertEquals(res.status, 204);
   assertEquals(res.headers.get("access-control-allow-origin"), null);
 });
+
+// ---------------------------------------------------------------------------
+// De-hardcoded CORS response shape (headers/methods/expose/max-age/creds)
+// ---------------------------------------------------------------------------
+
+Deno.test("cors: default expose-headers carries the internal x-1tube set", async () => {
+  resetTubeEnv();
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com");
+  const { corsMiddleware } = await freshCors();
+  const app = appWith(corsMiddleware);
+  const res = await app.fetch(
+    new Request("http://localhost/x", {
+      headers: { Origin: "https://app.example.com" },
+    }),
+  );
+  const expose = res.headers.get("access-control-expose-headers") ?? "";
+  assertEquals(expose.includes("x-1tube-warming"), true);
+  assertEquals(expose.includes("x-1tube-stale"), true);
+  assertEquals(expose.includes("retry-after"), true);
+});
+
+Deno.test("cors: 1TUBE_CORS_ALLOW_HEADERS / _METHODS override the defaults", async () => {
+  resetTubeEnv();
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com");
+  Deno.env.set("1TUBE_CORS_ALLOW_HEADERS", "authorization, x-tenant-id");
+  Deno.env.set("1TUBE_CORS_ALLOW_METHODS", "GET, POST");
+  const { corsMiddleware } = await freshCors();
+  const app = appWith(corsMiddleware);
+  const res = await app.fetch(
+    new Request("http://localhost/x", {
+      method: "OPTIONS",
+      headers: { Origin: "https://app.example.com" },
+    }),
+  );
+  assertEquals(res.headers.get("access-control-allow-headers"), "authorization, x-tenant-id");
+  assertEquals(res.headers.get("access-control-allow-methods"), "GET, POST");
+});
+
+Deno.test("cors: 1TUBE_CORS_EXPOSE_HEADERS adds to (never drops) the internal set", async () => {
+  resetTubeEnv();
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com");
+  Deno.env.set("1TUBE_CORS_EXPOSE_HEADERS", "x-total-count, x-1tube-warming");
+  const { corsMiddleware } = await freshCors();
+  const app = appWith(corsMiddleware);
+  const res = await app.fetch(
+    new Request("http://localhost/x", {
+      headers: { Origin: "https://app.example.com" },
+    }),
+  );
+  const expose = res.headers.get("access-control-expose-headers") ?? "";
+  // Internal headers survive; the operator extra is appended; no dupes.
+  assertEquals(expose.includes("x-1tube-stale"), true);
+  assertEquals(expose.includes("x-total-count"), true);
+  assertEquals((expose.match(/x-1tube-warming/g) ?? []).length, 1);
+});
+
+Deno.test("cors: Access-Control-Max-Age is omitted by default, emitted when configured", async () => {
+  resetTubeEnv();
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com");
+  const off = await freshCors();
+  const resOff = await appWith(off.corsMiddleware).fetch(
+    new Request("http://localhost/x", {
+      method: "OPTIONS",
+      headers: { Origin: "https://app.example.com" },
+    }),
+  );
+  assertEquals(resOff.headers.get("access-control-max-age"), null);
+
+  Deno.env.set("1TUBE_CORS_MAX_AGE", "600");
+  const on = await freshCors();
+  const resOn = await appWith(on.corsMiddleware).fetch(
+    new Request("http://localhost/x", {
+      method: "OPTIONS",
+      headers: { Origin: "https://app.example.com" },
+    }),
+  );
+  assertEquals(resOn.headers.get("access-control-max-age"), "600");
+});
+
+Deno.test("cors: 1TUBE_CORS_ALLOW_CREDENTIALS=false suppresses credentials for an allowlist", async () => {
+  resetTubeEnv();
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com");
+  Deno.env.set("1TUBE_CORS_ALLOW_CREDENTIALS", "false");
+  const { corsMiddleware } = await freshCors();
+  const res = await appWith(corsMiddleware).fetch(
+    new Request("http://localhost/x", {
+      headers: { Origin: "https://app.example.com" },
+    }),
+  );
+  assertEquals(res.headers.get("access-control-allow-origin"), "https://app.example.com");
+  assertEquals(res.headers.get("access-control-allow-credentials"), null);
+});
+
+Deno.test("cors: credentials are never claimed alongside a literal '*' origin", async () => {
+  resetTubeEnv();
+  Deno.env.set("1TUBE_CORS_ORIGIN", "*");
+  // Force-on, but with no request Origin the resolved value is literal "*".
+  Deno.env.set("1TUBE_CORS_ALLOW_CREDENTIALS", "true");
+  const { corsMiddleware } = await freshCors();
+  const res = await appWith(corsMiddleware).fetch(
+    new Request("http://localhost/x"),
+  );
+  assertEquals(res.headers.get("access-control-allow-origin"), "*");
+  assertEquals(res.headers.get("access-control-allow-credentials"), null);
+});

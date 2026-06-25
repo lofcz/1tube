@@ -6,18 +6,21 @@
  * cursor escapes, so we assert their absence here as a regression guard.
  */
 
+import { assert, assertEquals, assertStringIncludes } from "@std/assert";
 import {
-  assert,
-  assertEquals,
-  assertStringIncludes,
-} from "@std/assert";
-import { createBootProgress } from "../src/boot-progress.ts";
+  createBootProgress,
+  createScanProgress,
+} from "../src/boot-progress.ts";
 
 class FakeSink {
   private chunks: string[] = [];
   private dec = new TextDecoder();
+  private tty: boolean;
+  constructor(tty = true) {
+    this.tty = tty;
+  }
   isTerminal() {
-    return true;
+    return this.tty;
   }
   writeSync(chunk: Uint8Array): number {
     this.chunks.push(this.dec.decode(chunk));
@@ -157,6 +160,54 @@ Deno.test("boot-progress: stop() is idempotent and writes nothing on repeated ca
   p.stop();
   p.stop();
   assertEquals(sink.text().length, before);
+});
+
+Deno.test("scan-progress: renders an in-place line with the found count on a TTY", () => {
+  const sink = new FakeSink(true);
+  const p = createScanProgress(sink, { tickMs: 0 });
+  p.start();
+  p.setFound(3);
+  p.setFound(7);
+  const text = sink.text();
+  // In-place redraw IS expected here (unlike boot-progress) — nothing
+  // else writes to the TTY during the pre-spawn scan.
+  assert(text.includes("\r"), "scan line should redraw in place");
+  assertStringIncludes(text, "\x1b[2K");
+  assertStringIncludes(text, "Scanning functions");
+  assertStringIncludes(text, "found 7");
+});
+
+Deno.test("scan-progress: setPhase switches to the dependency-graph label", () => {
+  const sink = new FakeSink(true);
+  const p = createScanProgress(sink, { tickMs: 0 });
+  p.start();
+  p.setFound(5);
+  p.setPhase("graph");
+  assertStringIncludes(sink.text(), "Building dependency graph");
+});
+
+Deno.test("scan-progress: stop clears the line and is idempotent", () => {
+  const sink = new FakeSink(true);
+  const p = createScanProgress(sink, { tickMs: 0 });
+  p.start();
+  p.setFound(2);
+  p.stop();
+  // The final write must clear the row so the next output starts clean.
+  assert(sink.text().endsWith("\r\x1b[2K"), "stop should wipe the line");
+  const before = sink.text().length;
+  p.stop();
+  p.stop();
+  assertEquals(sink.text().length, before, "stop is idempotent");
+});
+
+Deno.test("scan-progress: a non-TTY sink renders nothing (no \\r spam in logs)", () => {
+  const sink = new FakeSink(false);
+  const p = createScanProgress(sink, { tickMs: 0 });
+  p.start();
+  p.setFound(4);
+  p.setPhase("graph");
+  p.stop();
+  assertEquals(sink.text(), "", "piped/CI output must stay clean");
 });
 
 Deno.test("boot-progress: write errors on the sink don't crash the renderer", async () => {
