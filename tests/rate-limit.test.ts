@@ -198,3 +198,114 @@ Deno.test("rate-limit: manifest.rpm overrides static config when registry is sup
   );
   assertEquals(blocked.status, 429);
 });
+
+Deno.test("rate-limit: manifest rpm 0 exempts the function entirely", async () => {
+  resetTubeEnv();
+  const { createRateLimiter } = await freshLimiter();
+  const { FunctionRegistry } = await import("../src/registry.ts");
+  const { defaultManifest } = await import("../src/manifest.ts");
+
+  const registry = new FunctionRegistry();
+  const m = defaultManifest();
+  m.rpm = 0; // 0 = unlimited (e.g. a signed server-to-server webhook)
+  registry.attachManifest("hook", m);
+  registry.runWithCurrentFunction("hook", () => {
+    registry.register(() => new Response("ok"), { public: true });
+  });
+
+  const limiter = createRateLimiter({
+    defaultRpm: 1, // would 429 after one hit if the function weren't exempt
+    overrides: {},
+    maxBuckets: 100,
+    registry,
+  });
+  const app = buildApp(limiter);
+
+  for (let i = 0; i < 10; i++) {
+    const res = await app.fetch(
+      new Request("http://localhost/functions/v1/hook"),
+    );
+    assertEquals(res.status, 200, `request ${i + 1} should never be limited`);
+  }
+});
+
+Deno.test("rate-limit: rateLimitBy 'global' shares one bucket across users", async () => {
+  resetTubeEnv();
+  const { createRateLimiter } = await freshLimiter();
+  const { FunctionRegistry } = await import("../src/registry.ts");
+  const { defaultManifest } = await import("../src/manifest.ts");
+
+  const registry = new FunctionRegistry();
+  const m = defaultManifest();
+  m.rpm = 1;
+  m.rateLimitBy = "global";
+  registry.attachManifest("shared", m);
+  registry.runWithCurrentFunction("shared", () => {
+    registry.register(() => new Response("ok"), { public: true });
+  });
+
+  const limiter = createRateLimiter({
+    defaultRpm: 100,
+    overrides: {},
+    maxBuckets: 100,
+    registry,
+  });
+
+  let currentUser = "alice";
+  const app = buildApp(limiter, (c, n) => {
+    c.set("userId" as never, currentUser as never);
+    return n();
+  });
+
+  // Unlike the identity default, a second *different* user draws from the same
+  // single bucket — so the second request is blocked.
+  const aliceOk = await app.fetch(
+    new Request("http://localhost/functions/v1/shared"),
+  );
+  assertEquals(aliceOk.status, 200);
+  currentUser = "bob";
+  const bobBlocked = await app.fetch(
+    new Request("http://localhost/functions/v1/shared"),
+  );
+  assertEquals(bobBlocked.status, 429);
+});
+
+Deno.test("rate-limit: rateLimitBy 'ip' ignores the authenticated userId", async () => {
+  resetTubeEnv();
+  const { createRateLimiter } = await freshLimiter();
+  const { FunctionRegistry } = await import("../src/registry.ts");
+  const { defaultManifest } = await import("../src/manifest.ts");
+
+  const registry = new FunctionRegistry();
+  const m = defaultManifest();
+  m.rpm = 1;
+  m.rateLimitBy = "ip";
+  registry.attachManifest("byip", m);
+  registry.runWithCurrentFunction("byip", () => {
+    registry.register(() => new Response("ok"), { public: true });
+  });
+
+  const limiter = createRateLimiter({
+    defaultRpm: 100,
+    overrides: {},
+    maxBuckets: 100,
+    registry,
+  });
+
+  let currentUser = "alice";
+  const app = buildApp(limiter, (c, n) => {
+    c.set("userId" as never, currentUser as never);
+    return n();
+  });
+
+  // Both users resolve to the same client IP bucket, so identity is irrelevant.
+  const aliceOk = await app.fetch(
+    new Request("http://localhost/functions/v1/byip"),
+  );
+  assertEquals(aliceOk.status, 200);
+  currentUser = "bob";
+  const bobBlocked = await app.fetch(
+    new Request("http://localhost/functions/v1/byip"),
+  );
+  assertEquals(bobBlocked.status, 429);
+});

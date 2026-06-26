@@ -56,7 +56,9 @@ Deno.test("manifest: parses a fully-populated object", () => {
 Deno.test("manifest: clamps invalid numeric inputs", () => {
   const m = parseManifest({
     timeoutMs: -10,
-    rpm: 0,
+    // Negative rpm is invalid and drops to undefined. (rpm: 0 is NOT invalid —
+    // it's the "unlimited" sentinel; see the dedicated test below.)
+    rpm: -5,
     memoryMB: "garbage",
     recycle: { errorRate: 5, errorWindow: -1 },
   });
@@ -67,6 +69,21 @@ Deno.test("manifest: clamps invalid numeric inputs", () => {
   assertEquals(m.recycle.errorRate, 1);
   // errorWindow falls back to default when invalid
   assert(m.recycle.errorWindow > 0);
+});
+
+Deno.test("manifest: rpm 0 is unlimited; parses rateLimitBy", () => {
+  // 0 is preserved (exempt / unlimited), distinct from undefined (use default).
+  assertEquals(parseManifest({ rpm: 0 }).rpm, 0);
+  assertEquals(parseManifest({ rpm: 30 }).rpm, 30);
+  assertEquals(parseManifest({ rpm: -1 }).rpm, undefined);
+  assertEquals(parseManifest({}).rpm, undefined);
+
+  // rateLimitBy accepts the known strategies and drops anything else.
+  assertEquals(parseManifest({ rateLimitBy: "identity" }).rateLimitBy, "identity");
+  assertEquals(parseManifest({ rateLimitBy: "ip" }).rateLimitBy, "ip");
+  assertEquals(parseManifest({ rateLimitBy: "global" }).rateLimitBy, "global");
+  assertEquals(parseManifest({ rateLimitBy: "bogus" }).rateLimitBy, undefined);
+  assertEquals(parseManifest({}).rateLimitBy, undefined);
 });
 
 Deno.test("manifest: ignores non-string entries in permission arrays", () => {
