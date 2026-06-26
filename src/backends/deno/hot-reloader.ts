@@ -95,7 +95,10 @@ export interface DenoReloadDebouncerOptions {
    * `debounceMs`. Unset = classic trailing-only behavior.
    */
   leadingMs?: number;
-  flushFn: (paths: readonly string[]) => Promise<void>;
+  // Awaited at the call site, so a synchronous callback is fine too (a test
+  // that just records the paths needn't be `async`, which would trip
+  // require-await). The real reloader flush is async.
+  flushFn: (paths: readonly string[]) => void | Promise<void>;
   setTimer?: (cb: () => void, ms: number) => number;
   clearTimer?: (id: number) => void;
 }
