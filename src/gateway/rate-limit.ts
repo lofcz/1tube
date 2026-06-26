@@ -1,6 +1,13 @@
 /**
  * In-memory token bucket rate limiter.
- * Keyed by user ID (set by the auth middleware) or remote IP.
+ *
+ * Buckets are keyed by the per-function `rateLimitBy` strategy (manifest /
+ * `serve({ rateLimit })`), defaulting to "identity": user ID when the auth
+ * middleware set one, otherwise remote IP. `"ip"` forces IP keying even for
+ * authenticated callers; `"global"` shares one bucket across all callers.
+ *
+ * A resolved rpm of `0` (or less) exempts the function entirely — used for
+ * trusted, already-authenticated traffic like signed server-to-server webhooks.
  *
  * X-Forwarded-For is only honored when the immediate connection comes from a
  * trusted proxy (env `1TUBE_TRUSTED_PROXIES`, comma-separated CIDRs/IPs).
@@ -11,6 +18,7 @@
 import type { Context, Next } from "npm:hono@4";
 import { getConnInfo } from "npm:hono@4/deno";
 import type { FunctionRegistry } from "../registry.ts";
+import type { RateLimitBy } from "../manifest.ts";
 import { routeRemainder } from "./route-prefix.ts";
 
 interface Bucket {
@@ -81,9 +89,19 @@ function getOrCreateBucket(key: string, rpm: number): Bucket {
   return bucket;
 }
 
-function resolveKey(c: Context): string {
-  const userId = c.get("userId") as string | undefined;
-  if (userId) return `user:${userId}`;
+function resolveKey(c: Context, by: RateLimitBy): string {
+  // A single shared bucket for the whole function — every caller draws from
+  // the same tokens regardless of identity or IP.
+  if (by === "global") return "global";
+
+  // Identity-first (the default): one bucket per authenticated user so a
+  // noisy IP can't starve everyone behind a shared NAT, and a single user
+  // can't mint fresh buckets by hopping IPs. `by: "ip"` opts out and always
+  // keys by IP even for authenticated callers.
+  if (by !== "ip") {
+    const userId = c.get("userId") as string | undefined;
+    if (userId) return `user:${userId}`;
+  }
 
   const trusted = loadTrustedProxies();
   let socketAddr = "unknown";
@@ -138,12 +156,21 @@ export function createRateLimiter(config: Partial<RateLimitConfig> = {}) {
     // (configurable) prefix, before any nested route.
     const fnName = routeRemainder(c.req.path).split("/", 1)[0] || "";
 
-    const manifestRpm = fnName
-      ? cfg.registry?.manifestFor(fnName)?.rpm
-      : undefined;
-    const rpm = manifestRpm ??
+    const manifest = fnName ? cfg.registry?.manifestFor(fnName) : undefined;
+    // `??` (not `||`) so a manifest `rpm: 0` survives — it's the "unlimited"
+    // sentinel, distinct from "unset" (undefined → fall back to overrides).
+    const rpm = manifest?.rpm ??
       ((fnName && cfg.overrides[fnName]) || cfg.defaultRpm);
-    const key = `${resolveKey(c)}:${fnName || "global"}`;
+
+    // rpm <= 0 means the function is explicitly exempt (e.g. a signed
+    // server-to-server webhook). Skip the bucket entirely.
+    if (rpm <= 0) {
+      await next();
+      return;
+    }
+
+    const by: RateLimitBy = manifest?.rateLimitBy ?? "identity";
+    const key = `${resolveKey(c, by)}:${fnName || "global"}`;
     const bucket = getOrCreateBucket(key, rpm);
 
     if (bucket.tokens <= 0) {

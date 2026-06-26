@@ -5,18 +5,18 @@
  * bootstrap hosts EVERY function in a single isolate. The point is
  * dependency sharing: a 100-function project where most functions import
  * the same heavy npm graph (`ai`, `@supabase/supabase-js`, `@google/genai`,
- * `zod`, ù) pays to compile + evaluate that graph exactly once here,
+ * `zod`, ?) pays to compile + evaluate that graph exactly once here,
  * instead of once per function across 100 isolates. On a real project that
  * collapses warm-boot from ~per-function-sum/cores down to roughly the
  * one-time cost of the union graph (measured ~6s vs ~18s).
  *
  * Trade-off: functions share globals and a crash takes the whole isolate
- * down. That's why this mode is dev-only ù production keeps isolate-per-
+ * down. That's why this mode is dev-only ? production keeps isolate-per-
  * function (or workerd) for real isolation.
  *
  * Lifecycle:
  *
- *   host ? init      : { functions: [{name, entryUrl, manifest}], ù }
+ *   host ? init      : { functions: [{name, entryUrl, manifest}], ? }
  *                      Imported SERIALLY so each function's top-level
  *                      `serve()` registration can be attributed to the
  *                      right name (parallel imports would interleave the
@@ -26,7 +26,7 @@
  *                      Streams `fn_ready` / `fn_error` per function, then
  *                      `all_done`.
  *
- *   host ? dispatch  : { id, name, ù } ? look up the captured handler by
+ *   host ? dispatch  : { id, name, ? } ? look up the captured handler by
  *                      name and run it (per-request AsyncLocalStorage so
  *                      concurrent invocations attribute console output).
  *
@@ -42,7 +42,11 @@
 /// <reference lib="deno.worker" />
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { FunctionManifest } from "../../manifest.ts";
+import {
+  type FunctionManifest,
+  mergeServeRateLimit,
+  type RateLimitBy,
+} from "../../manifest.ts";
 import type { AuthContext } from "../../registry.ts";
 
 interface FnSpec {
@@ -96,7 +100,12 @@ type Handler = (
 interface RegistryStub {
   register(
     handler: Handler,
-    opts: { public: boolean; timeoutMs?: number },
+    opts: {
+      public: boolean;
+      timeoutMs?: number;
+      rpm?: number;
+      rateLimitBy?: RateLimitBy;
+    },
   ): void;
 }
 
@@ -104,6 +113,8 @@ interface CapturedHandler {
   handler: Handler;
   isPublic: boolean;
   timeoutMs?: number;
+  rpm?: number;
+  rateLimitBy?: RateLimitBy;
   manifest: FunctionManifest;
 }
 
@@ -159,7 +170,7 @@ function installConsoleCapture(): void {
       try {
         let message = args.map(formatConsoleArg).join(" ");
         if (message.length > MAX_CONSOLE_MESSAGE) {
-          message = message.slice(0, MAX_CONSOLE_MESSAGE) + "ù";
+          message = message.slice(0, MAX_CONSOLE_MESSAGE) + "?";
         }
         postMessage({
           type: "console",
@@ -184,7 +195,7 @@ function installConsoleCapture(): void {
 
 const stub: RegistryStub = {
   register(handler, opts) {
-    if (!importing) return; // serve() called outside an import window ù ignore
+    if (!importing) return; // serve() called outside an import window ? ignore
     if (importing.captured) {
       console.warn(
         `[1tube] "${importing.name}" called serve() twice; using the last handler`,
@@ -194,6 +205,8 @@ const stub: RegistryStub = {
       handler,
       isPublic: opts.public,
       timeoutMs: opts.timeoutMs,
+      rpm: opts.rpm,
+      rateLimitBy: opts.rateLimitBy,
       manifest: { runtime: "deno" } as unknown as FunctionManifest,
     };
   },
@@ -282,7 +295,14 @@ async function loadFunction(
     });
     return;
   }
-  captured.manifest = fn.manifest;
+  // Fold any `serve({ rateLimit })` override into the manifest reported to the
+  // gateway so its rate-limiter (which reads `manifestFor()`) honours
+  // code-declared limits ? this isolate, not the gateway, ran the module.
+  const reportedManifest = mergeServeRateLimit(fn.manifest, {
+    rpm: captured.rpm,
+    rateLimitBy: captured.rateLimitBy,
+  });
+  captured.manifest = reportedManifest;
   handlers.set(fn.name, captured);
   postMessage({
     type: "fn_ready",
@@ -290,7 +310,7 @@ async function loadFunction(
     ms: performance.now() - t0,
     isPublic: captured.isPublic,
     timeoutMs: captured.timeoutMs,
-    manifest: fn.manifest,
+    manifest: reportedManifest,
   });
 }
 

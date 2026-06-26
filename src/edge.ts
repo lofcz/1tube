@@ -446,6 +446,64 @@ export function gatewayTimeout(
   return jsonError(HttpStatus.GATEWAY_TIMEOUT, message, details);
 }
 
+/**
+ * How the rate limiter buckets requests for a function:
+ *   - "identity" (default): one bucket per authenticated user, falling back to
+ *     the client IP for unauthenticated/public functions.
+ *   - "ip": always bucket by client IP, even when a user is authenticated.
+ *   - "global": a single shared bucket for the whole function.
+ *
+ * Defined here (the self-contained `edge` surface) rather than in `manifest.ts`
+ * so the published `dist/edge.d.ts` has no dangling cross-module reference;
+ * `manifest.ts` re-exports it for the gateway side.
+ */
+export type RateLimitBy = "identity" | "ip" | "global";
+
+/** Full-control form of `serve({ rateLimit })`. */
+export interface RateLimitConfig {
+  /**
+   * Requests per minute. `0` = unlimited (the function is exempt). Omit to use
+   * the gateway default / any `1tube.json` value.
+   */
+  rpm?: number;
+  /**
+   * Bucket key strategy. Defaults to "identity" (per authenticated user,
+   * falling back to client IP). See {@link RateLimitBy}.
+   */
+  by?: RateLimitBy;
+}
+
+/**
+ * Per-function rate-limit declaration for `serve({ rateLimit })`:
+ *   - `false`  → exempt from rate limiting entirely (signed webhooks, trusted
+ *     server-to-server callers).
+ *   - `true`   → gateway default limit, keyed by identity (the implicit default
+ *     when `rateLimit` is omitted).
+ *   - `number` → requests-per-minute, keyed by identity.
+ *   - object   → full control over rpm + key strategy.
+ */
+export type RateLimitOption = boolean | number | RateLimitConfig;
+
+/** Normalized shape consumed by the registry / Worker `register()` contract. */
+export interface NormalizedRateLimit {
+  rpm?: number;
+  rateLimitBy?: RateLimitBy;
+}
+
+/**
+ * Collapse the friendly {@link RateLimitOption} into `{ rpm?, rateLimitBy? }`.
+ * `undefined`/`true` leave both unset (gateway default); `false` maps to the
+ * `rpm: 0` "unlimited" sentinel the gateway limiter understands.
+ */
+export function normalizeRateLimit(
+  rl: RateLimitOption | undefined,
+): NormalizedRateLimit {
+  if (rl === undefined || rl === true) return {};
+  if (rl === false) return { rpm: 0 };
+  if (typeof rl === "number") return { rpm: rl };
+  return { rpm: rl.rpm, rateLimitBy: rl.by };
+}
+
 export interface ServeConfig<TContext = unknown> {
   name: string;
   require: unknown;
@@ -463,6 +521,13 @@ export interface ServeConfig<TContext = unknown> {
    * different prefix while keeping the same function modules.
    */
   pathPrefix?: string;
+  /**
+   * Per-function rate-limit declaration. Overrides any `1tube.json` `rpm`.
+   * Use `false` to exempt the function from rate limiting (e.g. a signed
+   * server-to-server webhook). Honoured by the 1tube gateway; standalone
+   * runtimes that front their own limiter ignore it.
+   */
+  rateLimit?: RateLimitOption;
 }
 
 export interface MatchedRoute {

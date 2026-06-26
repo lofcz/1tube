@@ -8,7 +8,8 @@
  *     metadata — the in-process TS gateway has no way to enforce them inside
  *     a single V8 isolate; treat them as documentation for now.
  *   - `timeoutMs` — wall-clock dispatch timeout (real today).
- *   - `rpm` — per-function rate-limit override (real today).
+ *   - `rpm` — per-function rate-limit override (real today). `0` = unlimited.
+ *   - `rateLimitBy` — rate-limit bucket key strategy (identity/ip/global).
  *   - `memoryMB` — recorded only; cannot be enforced from inside V8. Use the
  *     host process's cgroup / job-object cap instead (visible on /health as
  *     `memory.limit_mb`).
@@ -25,6 +26,13 @@
 // node:path so this loads from node_modules in any host Deno project
 // without depending on a shared import-map entry.
 import { join } from "node:path";
+
+// `RateLimitBy` is defined on the self-contained `edge` surface so the
+// published `dist/edge.d.ts` stays free of cross-module references. The gateway
+// side imports it from here; this re-export is type-only and erased at runtime,
+// so manifest.ts gains no runtime dependency on edge.ts.
+import type { RateLimitBy } from "./edge.ts";
+export type { RateLimitBy };
 
 export interface ManifestPermissions {
   /** Hostnames the function may reach (e.g. "api.example.com"). [] = none. */
@@ -52,8 +60,17 @@ export interface FunctionManifest {
   permissions: ManifestPermissions;
   /** Per-function timeout in ms. Undefined = use gateway default. */
   timeoutMs?: number;
-  /** Per-function rate limit (requests per minute). Undefined = use gateway default. */
+  /**
+   * Per-function rate limit (requests per minute). Undefined = use gateway
+   * default. `0` = unlimited — the function is exempt from rate limiting (use
+   * for signed server-to-server webhooks and other trusted callers).
+   */
   rpm?: number;
+  /**
+   * Bucket key strategy for this function's rate limit. Undefined = "identity".
+   * See {@link RateLimitBy}.
+   */
+  rateLimitBy?: RateLimitBy;
   /** Memory cap (MB). Recorded only; not enforced by the TS runtime. */
   memoryMB?: number;
   /** Eagerly load + keep alive. Recorded only by the TS runtime. */
@@ -97,6 +114,21 @@ function asPositiveInt(v: unknown): number | undefined {
   return n > 0 ? n : undefined;
 }
 
+/**
+ * Like {@link asPositiveInt} but preserves `0`. Used for `rpm`, where `0` is a
+ * meaningful value ("unlimited") distinct from "unset". Negatives/NaN drop to
+ * undefined so a typo can't accidentally exempt a function.
+ */
+function asNonNegativeInt(v: unknown): number | undefined {
+  if (typeof v !== "number" || !Number.isFinite(v)) return undefined;
+  const n = Math.floor(v);
+  return n >= 0 ? n : undefined;
+}
+
+function asRateLimitBy(v: unknown): RateLimitBy | undefined {
+  return v === "identity" || v === "ip" || v === "global" ? v : undefined;
+}
+
 function asRatio(v: unknown, fallback: number): number {
   if (typeof v !== "number" || !Number.isFinite(v)) return fallback;
   if (v < 0) return 0;
@@ -123,7 +155,8 @@ export function parseManifest(raw: unknown, fromFile = true): FunctionManifest {
   };
 
   base.timeoutMs = asPositiveInt(obj.timeoutMs);
-  base.rpm = asPositiveInt(obj.rpm);
+  base.rpm = asNonNegativeInt(obj.rpm);
+  base.rateLimitBy = asRateLimitBy(obj.rateLimitBy);
   base.memoryMB = asPositiveInt(obj.memoryMB);
 
   if (typeof obj.warm === "boolean") base.warm = obj.warm;
@@ -140,6 +173,29 @@ export function parseManifest(raw: unknown, fromFile = true): FunctionManifest {
   };
 
   return base;
+}
+
+/**
+ * Fold a code-declared `serve({ rateLimit })` override (already normalized to
+ * `{ rpm?, rateLimitBy? }`) into a manifest. Used by the in-process registry
+ * and the Worker entries so the gateway's rate-limiter — which only ever reads
+ * the manifest via `manifestFor()` — picks up values declared in the function
+ * module. Serve-config values win over `1tube.json`; absent ones are left as-is.
+ * Returns the original manifest unchanged when there is nothing to apply, so
+ * callers can keep object identity in the common case.
+ */
+export function mergeServeRateLimit(
+  manifest: FunctionManifest,
+  override: { rpm?: number; rateLimitBy?: RateLimitBy },
+): FunctionManifest {
+  if (override.rpm === undefined && override.rateLimitBy === undefined) {
+    return manifest;
+  }
+  return {
+    ...manifest,
+    rpm: override.rpm ?? manifest.rpm,
+    rateLimitBy: override.rateLimitBy ?? manifest.rateLimitBy,
+  };
 }
 
 /**

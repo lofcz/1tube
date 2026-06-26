@@ -7,7 +7,12 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import { defaultManifest, type FunctionManifest } from "./manifest.ts";
+import {
+  defaultManifest,
+  type FunctionManifest,
+  mergeServeRateLimit,
+  type RateLimitBy,
+} from "./manifest.ts";
 
 export interface AuthContext {
   userId: string;
@@ -169,7 +174,14 @@ export class FunctionRegistry {
    */
   register(
     handler: AuthenticatedHandler | PublicHandler,
-    opts: { public: boolean; timeoutMs?: number },
+    opts: {
+      public: boolean;
+      timeoutMs?: number;
+      /** `serve({ rateLimit })` override. `0` = unlimited. Wins over `1tube.json`. */
+      rpm?: number;
+      /** `serve({ rateLimit })` bucket key strategy. Wins over `1tube.json`. */
+      rateLimitBy?: RateLimitBy;
+    },
   ): void {
     const name = currentNameStorage.getStore();
     if (!name) {
@@ -178,7 +190,11 @@ export class FunctionRegistry {
           "This is a bug in the function loader — must be wrapped in runWithCurrentFunction().",
       );
     }
-    const manifest = this.pendingManifests.get(name) ?? defaultManifest();
+    const base = this.pendingManifests.get(name) ?? defaultManifest();
+    // Fold any `serve({ rateLimit })` override into the manifest so the
+    // gateway's rate-limiter (which only ever reads `manifestFor()`) sees the
+    // code-declared value without a separate lookup path.
+    const manifest = mergeServeRateLimit(base, opts);
     this.handlers.set(name, {
       handler,
       isPublic: opts.public,

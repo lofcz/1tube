@@ -27,7 +27,11 @@
 /// <reference lib="deno.worker" />
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { FunctionManifest } from "../../manifest.ts";
+import {
+  type FunctionManifest,
+  mergeServeRateLimit,
+  type RateLimitBy,
+} from "../../manifest.ts";
 import type { AuthContext } from "../../registry.ts";
 
 interface InitMessage {
@@ -70,7 +74,12 @@ type Handler = (
 interface RegistryStub {
   register(
     handler: Handler,
-    opts: { public: boolean; timeoutMs?: number },
+    opts: {
+      public: boolean;
+      timeoutMs?: number;
+      rpm?: number;
+      rateLimitBy?: RateLimitBy;
+    },
   ): void;
 }
 
@@ -78,6 +87,8 @@ interface CapturedHandler {
   handler: Handler;
   isPublic: boolean;
   timeoutMs?: number;
+  rpm?: number;
+  rateLimitBy?: RateLimitBy;
 }
 
 let captured: CapturedHandler | null = null;
@@ -202,6 +213,8 @@ const stub: RegistryStub = {
       handler,
       isPublic: opts.public,
       timeoutMs: opts.timeoutMs,
+      rpm: opts.rpm,
+      rateLimitBy: opts.rateLimitBy,
     };
   },
 };
@@ -322,12 +335,22 @@ self.onmessage = (ev: MessageEvent<HostMessage>) => {
         });
         return;
       }
+      // Fold any `serve({ rateLimit })` override into the manifest we report
+      // so the gateway's rate-limiter (which reads `manifestFor()`) honours
+      // code-declared limits — the function module runs in this Worker, not in
+      // the gateway process, so this `ready` handshake is the only channel.
+      const reportedManifest = manifest
+        ? mergeServeRateLimit(manifest, {
+          rpm: captured.rpm,
+          rateLimitBy: captured.rateLimitBy,
+        })
+        : manifest;
       postMessage({
         type: "ready",
         name: functionName,
         isPublic: captured.isPublic,
         timeoutMs: captured.timeoutMs,
-        manifest,
+        manifest: reportedManifest,
       });
     })();
     return;
