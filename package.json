@@ -55,7 +55,7 @@
     "serve": "deno task serve",
     "build:edge": "deno run -A npm:typescript@latest/tsc --target ES2022 --module ESNext --moduleResolution Bundler --declaration --outDir dist src/edge.ts src/edge-caller.ts src/warmup-client.ts",
     "prepack": "bun run build:edge",
-    "typecheck": "deno check src/server.ts src/cli.ts src/edge.ts src/edge-caller.ts src/warmup-client.ts eslint-plugin.js",
+    "typecheck": "deno check src/server.ts src/cli.ts src/launch.ts src/edge.ts src/edge-caller.ts src/warmup-client.ts eslint-plugin.js",
     "check": "deno cache --allow-scripts=npm:protobufjs src/server.ts",
     "smoke:bin": "node ./scripts/npm-cli.js --version",
     "prepublishOnly": "bun run build:edge && bun run typecheck && bun run check && bun run smoke:bin"

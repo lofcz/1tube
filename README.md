@@ -62,25 +62,57 @@ npx 1tube package --functions supabase/functions --in dist --out fw.1tube --sign
 This replaces local-source invocations such as
 `deno run -A ../1tube/src/cli.ts ...` in downstream CI pipelines.
 
-### Passing deno flags through the launcher
+### One launcher, one path
 
-Arguments before a standalone `--` are 1tube CLI args; everything **after** `--`
-is forwarded verbatim to `deno run` (inserted before the entrypoint). This lets
-the launcher fully replace a project's bespoke `deno run … src/server.ts`
-command — including project-level deno flags like `--config`, `--env-file`,
-`--node-modules-dir` and `--no-lock`:
+There is a single launcher (`src/launch.ts`): the npm bin, the deno tasks, and
+host projects all funnel through it, and `serve` **always** spawns the gateway
+as a child `deno run`. That child process is what lets the launcher reconcile
+the lockfile with your installed dependencies _before_ Deno resolves any npm
+specifier — and fully reload it when a dependency changes (see below).
+
+The launcher recognizes its own flags and forwards everything else to the
+gateway, so it fully replaces a bespoke `deno run … src/server.ts` line — no
+`--` split needed:
 
 ```bash
 npx 1tube serve --functions ./supabase/functions --dev --hmr \
-  -- --no-lock --env-file=.env --config ./supabase/functions/deno.json --node-modules-dir=false
+  --config ./supabase/functions/deno.json --env-file=.env --node-modules-dir=false
 ```
 
-- If your passthrough includes its own `--config`, the launcher does **not** add
-  1tube's bundled `deno.json` — your import map wins (the gateway's own sources
-  use fully-qualified `npm:`/`jsr:` specifiers, so they resolve regardless).
+Launcher flags: `--lock <path>` (managed lockfile, default
+`<cwd>/.1tube/deno.lock`), `--no-lock`, `--refresh-lock`, `--config <path>`,
+`--env-file[=<path>]` (repeatable), `--minimum-dependency-age <n>`,
+`--node-modules-dir <v>`, `--no-pin`, `--no-dep-watch`. Anything after a `--`
+is forwarded verbatim to the gateway.
+
+- If you don't pass `--config`, the launcher falls back to 1tube's bundled
+  `deno.json`; the gateway's own sources use fully-qualified `npm:`/`jsr:`
+  specifiers, so they resolve either way.
 - Prefer keeping the command line clean? Set the same flags in
-  `1TUBE_DENO_ARGS` (space-separated) instead of after `--`. CLI passthrough
-  takes precedence on any duplicate flag.
+  `1TUBE_DENO_ARGS` (space-separated); they're appended to the launcher args.
+
+### Dependency pinning & live reload
+
+The edge runtime runs with `--node-modules-dir=false`, so Deno resolves npm
+specifiers from its own cache + lockfile, not from `node_modules`. An import map
+that maps a dependency with an **unconstrained** specifier (`npm:1tube/edge`,
+i.e. `@*`) is satisfied by _any_ locked version — so bumping that dependency in
+`package.json` would silently never reach the edge runtime, and the gateway
+could end up a different version than the edge surface its functions import.
+
+The launcher closes this gap: before spawning the gateway it rewrites every
+unconstrained `npm:` specifier in your `--config` import map to the **exact
+version installed in `node_modules`** (the source of truth your package manager
+controls), writing the result to `<.1tube>/deno.gen.json`. Now the specifier's
+version tracks the installed dependency, so Deno's native lockfile auto-update
+recomputes just that entry — every already-pinned dependency keeps its locked
+version (and the warm-boot speed a lockfile buys).
+
+While serving, the launcher watches your deno config and each pinned
+dependency's `package.json`. When an install or a config edit changes the
+effective version set, it prints `dependency change detected — reloading
+gateway` and fully restarts the gateway so Deno re-resolves. Disable with
+`--no-pin` / `--no-dep-watch`.
 
 ### Minimum dependency age
 
