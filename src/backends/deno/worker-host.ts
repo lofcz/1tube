@@ -1188,6 +1188,13 @@ export function createDenoWorkerHost(
    */
   let coloReloadChain: Promise<unknown> = Promise.resolve();
 
+  // In-flight worker-retirement drains. A retiring worker leaves `coloWorkers`
+  // immediately but lingers (its `kill` armed on a timer) so in-flight
+  // requests can finish. Tracked so `stop()` can both cancel the timer AND
+  // run the kill now — otherwise the timer (and the Worker) outlive the host
+  // and leak, which Deno's test sanitizer flags.
+  const coloDrains = new Set<{ timer: number; kill: () => void }>();
+
   interface ColoFnResult {
     name: string;
     ok: boolean;
@@ -1379,7 +1386,12 @@ export function createDenoWorkerHost(
    */
   function terminateColoWorker(w: Worker, drainMs: number): void {
     coloWorkers.delete(w);
+    let entry: { timer: number; kill: () => void } | null = null;
     const kill = () => {
+      if (entry) {
+        clearTimeout(entry.timer);
+        coloDrains.delete(entry);
+      }
       try {
         w.terminate();
       } catch { /* already gone */ }
@@ -1390,8 +1402,13 @@ export function createDenoWorkerHost(
         }
       }
     };
-    if (drainMs > 0) setTimeout(kill, drainMs);
-    else kill();
+    if (drainMs > 0) {
+      const timer = setTimeout(kill, drainMs) as unknown as number;
+      entry = { timer, kill };
+      coloDrains.add(entry);
+    } else {
+      kill();
+    }
   }
 
   /**
@@ -1768,6 +1785,11 @@ export function createDenoWorkerHost(
   }
 
   function stopColocated(): void {
+    // Cancel + finish any in-flight retirement drains first: this clears their
+    // timers and terminates the lingering workers (which already left
+    // `coloWorkers`), so nothing outlives the host.
+    for (const d of [...coloDrains]) d.kill();
+    coloDrains.clear();
     for (const p of coloPending.values()) {
       p.reject(new Error("gateway shutting down"));
     }
