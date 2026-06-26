@@ -39,7 +39,11 @@ import {
   type FunctionManifest,
   loadManifest,
 } from "../../manifest.ts";
-import type { FunctionRegistry, WorkerFunctionHandle } from "../../registry.ts";
+import type {
+  AuthContext,
+  FunctionRegistry,
+  WorkerFunctionHandle,
+} from "../../registry.ts";
 import type { FunctionSupervisor } from "../../supervisor.ts";
 import { createDepGraph, type DepGraph } from "./dep-graph.ts";
 import type { DenoSharedRuntime } from "./shared-runtime.ts";
@@ -103,6 +107,16 @@ export interface DenoWorkerHostOptions {
    * before when the gateway's invocation log store is disabled.
    */
   captureConsole?: boolean;
+  /**
+   * Colocated dev mode: host EVERY function in ONE isolate instead of one
+   * Worker per function. Shared npm/jsr deps then compile + evaluate once
+   * total rather than once per function, which is the dominant warm-boot
+   * cost on large projects. Trades crash/global isolation for speed, so
+   * it's intended for `--dev` only; production keeps isolate-per-function.
+   * When set, {@link sharedRuntime}/{@link rewriteCache} are ignored — a
+   * shared module simply runs once in the colocated isolate.
+   */
+  colocate?: boolean;
   /** Sink for captured console lines + worker runtime errors. */
   onConsole?: (event: WorkerConsoleEvent) => void;
   /**
@@ -124,6 +138,19 @@ export interface ReloadSummary {
   durationMs: number;
 }
 
+export interface ReloadOptions {
+  /**
+   * The actual file paths that changed in this reload batch. Only the
+   * colocated backend consults it: when every change is a function's own
+   * `index.ts`, it can cheaply cache-bust just those entries; a change to
+   * any imported file (a sidecar or `_shared/*`) instead forces a full
+   * isolate recycle, because Deno can't evict a transitively-cached module
+   * in place. The isolate-per-function backend ignores this — it always
+   * respawns the whole Worker, which drops its module cache wholesale.
+   */
+  changedPaths?: readonly string[];
+}
+
 interface PendingRequest {
   resolve: (resp: Response) => void;
   reject: (err: unknown) => void;
@@ -138,6 +165,10 @@ interface InternalHandle extends WorkerFunctionHandle {
  * via the option bag if they need to point at a fake.
  */
 const DEFAULT_WORKER_ENTRY = new URL("./worker-entry.ts", import.meta.url).href;
+
+/** Bootstrap for the single-isolate (colocated) dev mode. */
+const COLOCATED_WORKER_ENTRY =
+  new URL("./worker-entry-colocated.ts", import.meta.url).href;
 
 interface SpawnOpts {
   name: string;
@@ -166,6 +197,12 @@ interface SpawnOpts {
   captureConsole?: boolean;
   /** Sink for captured console lines + worker runtime errors. */
   onConsole?: (event: WorkerConsoleEvent) => void;
+}
+
+interface ColocatedFnSpec {
+  name: string;
+  entryUrl: string;
+  manifest: FunctionManifest;
 }
 
 function spawnWorker(opts: SpawnOpts): Promise<InternalHandle> {
@@ -586,6 +623,7 @@ export interface DenoWorkerHost {
   reload(
     names: ReadonlySet<string> | "all",
     reason?: string,
+    opts?: ReloadOptions,
   ): Promise<ReloadSummary>;
   stop(): Promise<void>;
   /** Currently registered function names (loaded + booting). */
@@ -741,6 +779,11 @@ export function createDenoWorkerHost(
   })();
   const concurrency = Math.max(1, opts.concurrency ?? defaultConcurrency);
   const reloadDrainMs = Math.max(0, opts.reloadDrainMs ?? 10_000);
+  // `1TUBE_FORCE_COLOCATE=1` lets the existing host/HMR test corpus run
+  // against the colocated path without rewriting each test's option bag;
+  // an explicit `colocate` on the options always wins.
+  const colocate = opts.colocate ??
+    (Deno.env.get("1TUBE_FORCE_COLOCATE") === "1");
 
   const sharedRuntime = opts.sharedRuntime;
   const rewriteCache = opts.rewriteCache;
@@ -1097,7 +1140,651 @@ export function createDenoWorkerHost(
     await Promise.all(workers);
   }
 
+  // ===================================================================
+  // Colocated (single-isolate) dev mode
+  //
+  // One Worker hosts every function. Shared deps load once; functions are
+  // dispatched by name. We still drive the SAME registry + boot-state +
+  // progress machinery, so the gateway/router/HMR see no difference — the
+  // only change is that every per-function "handle" forwards into the one
+  // colocated Worker instead of owning its own.
+  // ===================================================================
+  // Per-function-worker routing. Cold boot hosts EVERY function in one
+  // worker (shared deps load once). HMR then PEELS only the functions an
+  // edit actually touches into a fresh worker — so a reload re-imports the
+  // affected set, never the whole project, keeping colocated HMR at least
+  // as fast as isolate-per-function while cold boot stays single-isolate.
+  let coloNextId = 1;
+  /** Every live colocated worker (the boot isolate + any peel isolates). */
+  const coloWorkers = new Set<Worker>();
+  /** name → the worker currently serving it (dispatch + cache-bust target). */
+  const functionWorker = new Map<string, Worker>();
+  /** The most recent full-set ("boot") worker — default host for adds. */
+  let coloPrimary: Worker | null = null;
+  const coloPending = new Map<number, {
+    resolve: (r: Response) => void;
+    reject: (e: unknown) => void;
+    worker: Worker;
+  }>();
+  /** Per-function result timings for the in-flight boot/reload phase. */
+  const coloPhaseStart = new Map<string, number>();
+  /** Sink for streamed fn_ready / fn_error during a boot/reload phase. */
+  let coloFnSink: ((r: ColoFnResult) => void) | null = null;
+  /** Resolves the in-flight phase when the worker reports it finished. */
+  let coloPhaseDone: (() => void) | null = null;
+  /**
+   * Serializes import phases. The streaming sink + done-resolver above are
+   * singletons, so two phases (a deferred background boot and an HMR
+   * reload that lands before it finished, say) must not overlap — they
+   * chain through here instead.
+   */
+  let coloPhaseChain: Promise<unknown> = Promise.resolve();
+  /**
+   * Serializes whole reloads. Phase serialization alone isn't enough — a
+   * reload also mutates the routing map + retires workers around its
+   * phases, and two overlapping reloads (rapid saves, multiple agents)
+   * must not interleave those mutations. Reloads queue here; each runs to
+   * completion before the next starts.
+   */
+  let coloReloadChain: Promise<unknown> = Promise.resolve();
+
+  interface ColoFnResult {
+    name: string;
+    ok: boolean;
+    isPublic?: boolean;
+    timeoutMs?: number;
+    manifest?: FunctionManifest;
+    ms?: number;
+    error?: string;
+  }
+
+  function registerColoHandle(
+    name: string,
+    isPublic: boolean,
+    timeoutMs: number | undefined,
+    manifest: FunctionManifest,
+  ): void {
+    opts.registry.setWorkerHandle(name, {
+      name,
+      manifest,
+      isPublic,
+      timeoutMs,
+      dispatch: (req, auth, signal, invocationId) => {
+        lastDispatch.set(name, Date.now());
+        return coloDispatch(name, req, auth, signal, invocationId);
+      },
+      // No per-function teardown in a shared isolate; reloads re-import.
+      terminate: () => Promise.resolve(),
+    });
+    opts.supervisor.setManifest(name, manifest);
+    if (opts.registry.candidate(name)) {
+      opts.registry.registerCandidate({
+        name,
+        moduleUrl: name,
+        manifest,
+      });
+    }
+  }
+
+  function coloDispatch(
+    name: string,
+    req: Request,
+    auth: AuthContext | null,
+    signal: AbortSignal,
+    invocationId?: string,
+  ): Promise<Response> {
+    const worker = functionWorker.get(name);
+    if (!worker) {
+      return Promise.reject(
+        new Error(`Colocated worker not running for "${name}"`),
+      );
+    }
+    if (signal.aborted) {
+      return Promise.reject(new DOMException("Aborted", "AbortError"));
+    }
+    const id = coloNextId++;
+    const headers: Array<[string, string]> = [];
+    req.headers.forEach((v, k) => headers.push([k, v]));
+    const body = req.body;
+    const transferList: Transferable[] = body
+      ? [body as unknown as Transferable]
+      : [];
+    const promise = new Promise<Response>((resolve, reject) => {
+      coloPending.set(id, { resolve, reject, worker });
+    });
+    const onAbort = () => {
+      const p = coloPending.get(id);
+      if (p) {
+        coloPending.delete(id);
+        p.reject(new DOMException("Aborted", "AbortError"));
+      }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      worker.postMessage(
+        { type: "dispatch", id, name, url: req.url, method: req.method, headers, body, auth, invocationId },
+        transferList,
+      );
+    } catch (err) {
+      coloPending.delete(id);
+      signal.removeEventListener("abort", onAbort);
+      return Promise.reject(err);
+    }
+    return promise.finally(() => signal.removeEventListener("abort", onAbort));
+  }
+
+  function handleColoMessage(m: { type: string; [k: string]: unknown }): void {
+    switch (m.type) {
+      case "fn_ready":
+        coloFnSink?.({
+          name: m.name as string,
+          ok: true,
+          isPublic: Boolean(m.isPublic),
+          timeoutMs: typeof m.timeoutMs === "number" ? m.timeoutMs : undefined,
+          manifest: m.manifest as FunctionManifest,
+          ms: typeof m.ms === "number" ? m.ms : undefined,
+        });
+        return;
+      case "fn_error":
+        coloFnSink?.({
+          name: m.name as string,
+          ok: false,
+          error: (m.message as string) ?? "import failed",
+          ms: typeof m.ms === "number" ? m.ms : undefined,
+        });
+        return;
+      case "all_done":
+      case "reload_done":
+        coloPhaseDone?.();
+        return;
+      case "response": {
+        const p = coloPending.get(m.id as number);
+        if (!p) return;
+        coloPending.delete(m.id as number);
+        p.resolve(
+          new Response(m.body as ReadableStream<Uint8Array> | null, {
+            status: m.status as number,
+            headers: m.headers as Array<[string, string]>,
+          }),
+        );
+        return;
+      }
+      case "response_error": {
+        const p = coloPending.get(m.id as number);
+        if (!p) return;
+        coloPending.delete(m.id as number);
+        const err = new Error((m.message as string) ?? "function error");
+        if (m.stack) (err as Error).stack = m.stack as string;
+        p.reject(err);
+        return;
+      }
+      case "console":
+        opts.onConsole?.({
+          functionName: (m.name as string) ?? "<colocated>",
+          invocationId: (m.invocationId as string | null) ?? null,
+          level: (m.level as WorkerConsoleEvent["level"]) ?? "log",
+          message: (m.message as string) ?? "",
+          tsMs: typeof m.tsMs === "number" ? m.tsMs : Date.now(),
+        });
+        return;
+      case "unhandledrejection":
+        opts.supervisor.record((m.name as string) ?? "<colocated>", true);
+        console.error(
+          `[1tube] Unhandled rejection in "${m.name}": ${m.message}`,
+        );
+        return;
+    }
+  }
+
+  function createColoWorker(): Worker {
+    const w = new Worker(COLOCATED_WORKER_ENTRY, {
+      type: "module",
+      name: "1tube-colocated",
+    });
+    coloWorkers.add(w);
+    w.onmessage = (ev) => handleColoMessage(ev.data);
+    w.onerror = (e) => {
+      // A fatal error in a colocated isolate takes its functions down.
+      // Reject only the in-flight dispatches that targeted THIS worker
+      // (other isolates are unaffected), drop its routing entries, and
+      // forget it. The functions it hosted go unrouted (503) until the
+      // next reload re-imports them.
+      const message = (e as ErrorEvent).message || "colocated worker error";
+      for (const [id, p] of coloPending) {
+        if (p.worker === w) {
+          coloPending.delete(id);
+          p.reject(new Error(message));
+        }
+      }
+      for (const [name, host] of functionWorker) {
+        if (host === w) functionWorker.delete(name);
+      }
+      coloWorkers.delete(w);
+      if (coloPrimary === w) coloPrimary = null;
+      console.error(`[1tube] colocated worker crashed: ${message}`);
+      e.preventDefault?.();
+    };
+    return w;
+  }
+
+  function ensureColoWorker(): Worker {
+    if (!coloPrimary) coloPrimary = createColoWorker();
+    return coloPrimary;
+  }
+
+  /**
+   * Terminate a colocated worker after a drain grace so its in-flight
+   * requests can finish, then reject anything that didn't. Used to retire
+   * a worker once no function routes to it anymore.
+   */
+  function terminateColoWorker(w: Worker, drainMs: number): void {
+    coloWorkers.delete(w);
+    const kill = () => {
+      try {
+        w.terminate();
+      } catch { /* already gone */ }
+      for (const [id, p] of coloPending) {
+        if (p.worker === w) {
+          coloPending.delete(id);
+          p.reject(new Error("colocated worker retired"));
+        }
+      }
+    };
+    if (drainMs > 0) setTimeout(kill, drainMs);
+    else kill();
+  }
+
+  /**
+   * Retire colocated workers that no longer serve any function (their
+   * functions all migrated to fresher isolates). The `keep` worker is
+   * never retired even if momentarily empty.
+   */
+  function retireEmptyColoWorkers(keep?: Worker): void {
+    const hosting = new Set(functionWorker.values());
+    for (const w of [...coloWorkers]) {
+      if (w === keep || hosting.has(w)) continue;
+      if (coloPrimary === w) coloPrimary = null;
+      terminateColoWorker(w, reloadDrainMs);
+    }
+  }
+
+  /**
+   * Build the dep-graph for the colocated functions in the BACKGROUND.
+   * Colocated boot deliberately skips the graph (it's not on the warm
+   * path), but HMR needs it to map an edited `_shared/*` or sidecar file
+   * back to the functions that import it. Fire-and-forget so warm time is
+   * unaffected; precise reloads light up a moment after boot.
+   */
+  function buildColoGraph(specs: ColocatedFnSpec[]): Promise<void> {
+    if (specs.length === 0) return Promise.resolve();
+    return depGraph
+      .refreshMany(
+        specs.map((c) => ({ name: c.name, entryFileUrl: c.entryUrl })),
+      )
+      .catch(() => {});
+  }
+
+  function buildColoGraphInBackground(specs: ColocatedFnSpec[]): void {
+    void buildColoGraph(specs);
+  }
+
+  /**
+   * Run one boot/reload phase against the colocated worker: send the
+   * specs, stream each fn_ready/fn_error back through the normal
+   * registry + boot-state + progress callbacks, and resolve when the
+   * worker reports the phase finished.
+   */
+  function runColoPhaseOn(
+    worker: Worker,
+    specs: ColocatedFnSpec[],
+    kind: "init" | "reload",
+    startOpts: StartOptions,
+    indexBase: () => number,
+  ): Promise<{
+    loaded: string[];
+    errors: Array<{ name: string; error: string }>;
+  }> {
+    return serializeColoPhase(() => {
+      const loaded: string[] = [];
+      const errors: Array<{ name: string; error: string }> = [];
+      const total = specs.length;
+      // The worker imports serially, so exactly one function is "in flight"
+      // at a time; surfacing all of them up front lets the progress UI
+      // count down as each lands.
+      for (const s of specs) {
+        coloPhaseStart.set(s.name, performance.now());
+        startOpts.onSpawnStart?.({ index: indexBase(), total, name: s.name });
+      }
+      return new Promise<{
+        loaded: string[];
+        errors: Array<{ name: string; error: string }>;
+      }>((resolve) => {
+        coloPhaseDone = () => {
+          coloFnSink = null;
+          coloPhaseDone = null;
+          resolve({ loaded, errors });
+        };
+        coloFnSink = (r) => {
+          const index = indexBase();
+          const t0 = coloPhaseStart.get(r.name);
+          const durationMs = r.ms ?? (t0 ? performance.now() - t0 : 0);
+          if (r.ok) {
+            functionWorker.set(r.name, worker);
+            registerColoHandle(
+              r.name,
+              r.isPublic ?? false,
+              r.timeoutMs,
+              r.manifest ?? defaultManifest(),
+            );
+            loaded.push(r.name);
+            settleBootState(r.name, true);
+            opts.supervisor.reset(r.name);
+            startOpts.onSpawnFinish?.({
+              index,
+              total,
+              name: r.name,
+              ok: true,
+              durationMs,
+              graphMs: 0,
+              rewriteMs: 0,
+              workerMs: durationMs,
+            });
+          } else {
+            errors.push({ name: r.name, error: r.error ?? "import failed" });
+            settleBootState(r.name, false, r.error);
+            startOpts.onSpawnFinish?.({
+              index,
+              total,
+              name: r.name,
+              ok: false,
+              durationMs,
+              graphMs: 0,
+              rewriteMs: 0,
+              workerMs: durationMs,
+              error: r.error,
+            });
+          }
+        };
+        worker.postMessage({
+          type: kind,
+          functions: specs,
+          captureConsole: opts.captureConsole,
+        });
+      });
+    });
+  }
+
+  function serializeColoPhase<T>(fn: () => Promise<T>): Promise<T> {
+    const run = coloPhaseChain.then(fn, fn);
+    coloPhaseChain = run.then(() => {}, () => {});
+    return run;
+  }
+
+  function runColoPhase(
+    specs: ColocatedFnSpec[],
+    kind: "init" | "reload",
+    startOpts: StartOptions,
+    indexBase: () => number,
+  ) {
+    return runColoPhaseOn(ensureColoWorker(), specs, kind, startOpts, indexBase);
+  }
+
+  async function startColocated(startOpts: StartOptions) {
+    const candidates = await discoverCandidates(
+      await functionsRoot(),
+      (found) => startOpts.onScanProgress?.({ found, phase: "scan" }),
+    );
+    for (const c of candidates) bootStates.set(c.name, "loading");
+    let printed = 0;
+    const result = await runColoPhase(candidates, "init", startOpts, () =>
+      ++printed);
+    // Eager boot awaits the graph (like isolate-per-function does) so HMR's
+    // affected-set is precise the instant the gateway starts serving.
+    await buildColoGraph(candidates);
+    return result;
+  }
+
+  async function startDeferredColocated(
+    startOpts: StartOptions,
+  ): Promise<DeferredStart> {
+    const candidates = await discoverCandidates(
+      await functionsRoot(),
+      (found) => startOpts.onScanProgress?.({ found, phase: "scan" }),
+    );
+    candidates.sort((a, b) =>
+      (lastDispatch.get(b.name) ?? 0) - (lastDispatch.get(a.name) ?? 0) ||
+      a.name.localeCompare(b.name)
+    );
+    for (const c of candidates) {
+      bootStates.set(c.name, "loading");
+      // Make names known to the gateway (fast-fail middleware, rate
+      // limiter) before the colocated isolate finishes importing them.
+      opts.registry.registerCandidate({
+        name: c.name,
+        moduleUrl: c.entryUrl,
+        manifest: c.manifest,
+      });
+    }
+    let printed = 0;
+    const done = runColoPhase(candidates, "init", startOpts, () => ++printed)
+      .then((r) => {
+        buildColoGraphInBackground(candidates);
+        return r;
+      });
+    return { discovered: candidates.map((c) => c.name), done };
+  }
+
+  /**
+   * Classify a changed path against the functions root. Returns the owning
+   * function name and whether the path IS that function's own entry, or
+   * `null` for anything outside a public function dir (a `_shared/*` file,
+   * the functions `deno.json`, a sidecar at the root, …). A `null` owner
+   * is an "external" change: only the dep-graph knows which functions it
+   * affects, and they can be refreshed only by a fresh isolate.
+   */
+  function coloPathOwner(
+    p: string,
+    root: string,
+  ): { name: string; isEntry: boolean } | null {
+    // The changed paths come from the watcher (`resolve()`-based) while
+    // `root` comes from `Deno.realPath` — on Windows those can differ in
+    // casing or separators. Compare case-insensitively with unified
+    // separators, but slice the ORIGINAL (correctly-cased) path so the
+    // returned function name still matches the on-disk directory name.
+    const ci = Deno.build.os === "windows";
+    const dirOrig = root.replace(/[\\/]+$/, "").replace(/\\/g, "/");
+    const pOrig = p.replace(/\\/g, "/");
+    const dirCmp = ci ? dirOrig.toLowerCase() : dirOrig;
+    const pCmp = ci ? pOrig.toLowerCase() : pOrig;
+    if (!pCmp.startsWith(dirCmp + "/")) return null;
+    const rest = pOrig.slice(dirOrig.length + 1);
+    const m = /^([^/]+)(?:\/.*)?$/.exec(rest);
+    if (!m) return null;
+    const seg = m[1];
+    if (seg.startsWith("_") || seg.endsWith("_shared")) return null;
+    return { name: seg, isEntry: /^[^/]+\/index\.ts$/.test(rest) };
+  }
+
+  /**
+   * Colocated HMR.
+   *
+   * The reload re-imports ONLY the functions an edit actually touches —
+   * never the whole project — so it stays at least as fast as
+   * isolate-per-function:
+   *
+   *   - entry-only edit  → cache-bust just that entry in its live worker
+   *     (sub-millisecond: the heavy deps are already resident). This is
+   *     strictly faster than respawning an isolate.
+   *   - sidecar / shared / new fn → "peel" the touched functions into ONE
+   *     fresh worker and re-point their routing at it. A fresh isolate is
+   *     the only way to re-evaluate a transitively-cached module, and
+   *     importing just the affected set (with their shared deps loaded
+   *     once) is no worse than the isolate-per-function respawns it
+   *     replaces — usually better for a shared-module edit that fans out.
+   *
+   * Workers that end up serving no function are retired after a drain.
+   * Everything is serialized so rapid/concurrent saves can't interleave
+   * routing mutations.
+   */
+  function reloadColocated(
+    names: ReadonlySet<string> | "all",
+    reason: string,
+    reloadOpts?: ReloadOptions,
+  ): Promise<ReloadSummary> {
+    const run = coloReloadChain.then(() =>
+      reloadColocatedInner(names, reason, reloadOpts)
+    );
+    coloReloadChain = run.then(() => {}, () => {});
+    return run;
+  }
+
+  async function reloadColocatedInner(
+    names: ReadonlySet<string> | "all",
+    reason: string,
+    reloadOpts?: ReloadOptions,
+  ): Promise<ReloadSummary> {
+    const start = performance.now();
+    const root = await functionsRoot();
+    const changed = reloadOpts?.changedPaths ?? [];
+    const targetNames = names === "all"
+      ? new Set(functionWorker.keys())
+      : new Set(names);
+
+    const candidates = names === "all"
+      ? await discoverCandidates(root)
+      : await discoverNamed(root, targetNames);
+    const candByName = new Map(candidates.map((c) => [c.name, c]));
+
+    // Removals: targeted names whose entry no longer exists on disk.
+    const removed: string[] = [];
+    for (const n of targetNames) {
+      if (!candByName.has(n) && functionWorker.has(n)) removed.push(n);
+    }
+    for (const n of removed) {
+      functionWorker.get(n)?.postMessage({ type: "remove", names: [n] });
+      functionWorker.delete(n);
+      opts.registry.clearWorkerHandle(n);
+      opts.registry.delete(n);
+      opts.supervisor.forget(n);
+      forgetBootState(n);
+    }
+
+    // An external (non-function-owned) change — a `_shared/*` file, the
+    // functions deno.json, a "reload all", or a batch with no path detail
+    // — can't be cache-busted in place, so every survivor goes fresh.
+    const hasExternalChange = names === "all" || changed.length === 0 ||
+      changed.some((p) => coloPathOwner(p, root) === null);
+
+    // Per-name: were this function's OWN changed paths all its entry file?
+    const ownEntryOnly = new Map<string, boolean>();
+    for (const p of changed) {
+      const owner = coloPathOwner(p, root);
+      if (!owner) continue;
+      ownEntryOnly.set(
+        owner.name,
+        (ownEntryOnly.get(owner.name) ?? true) && owner.isEntry,
+      );
+    }
+
+    const survivors = [...targetNames].filter((n) => candByName.has(n));
+    const known = new Set(functionWorker.keys());
+
+    const entryNames: string[] = [];
+    const freshNames: string[] = [];
+    for (const n of survivors) {
+      const canFast = functionWorker.has(n) && !hasExternalChange &&
+        ownEntryOnly.get(n) === true;
+      (canFast ? entryNames : freshNames).push(n);
+    }
+
+    const errors: Array<{ name: string; error: string }> = [];
+
+    // FAST: cache-bust entries in place, grouped by their host worker.
+    if (entryNames.length > 0) {
+      const byHost = new Map<Worker, ColocatedFnSpec[]>();
+      for (const n of entryNames) {
+        const host = functionWorker.get(n);
+        if (!host) {
+          freshNames.push(n);
+          continue;
+        }
+        (byHost.get(host) ?? byHost.set(host, []).get(host)!).push(
+          candByName.get(n)!,
+        );
+      }
+      for (const [host, specs] of byHost) {
+        let printed = 0;
+        const r = await runColoPhaseOn(host, specs, "reload", {}, () =>
+          ++printed);
+        for (const e of r.errors) errors.push(e);
+      }
+    }
+
+    // FRESH: peel the touched functions into one new isolate.
+    if (freshNames.length > 0) {
+      const fresh = createColoWorker();
+      const specs = freshNames
+        .map((n) => candByName.get(n)!)
+        .sort((a, b) =>
+          (lastDispatch.get(b.name) ?? 0) - (lastDispatch.get(a.name) ?? 0) ||
+          a.name.localeCompare(b.name)
+        );
+      let printed = 0;
+      const r = await runColoPhaseOn(fresh, specs, "init", {}, () => ++printed);
+      for (const e of r.errors) errors.push(e);
+      if (r.loaded.length === 0) terminateColoWorker(fresh, 0);
+    }
+
+    // Retire isolates that no longer serve anyone (their functions moved).
+    retireEmptyColoWorkers();
+
+    const failed = new Set(errors.map((e) => e.name));
+    const reloaded: string[] = [];
+    const added: string[] = [];
+    for (const n of survivors) {
+      if (failed.has(n)) continue;
+      (known.has(n) ? reloaded : added).push(n);
+    }
+
+    // Refresh the dep-graph for the touched names BEFORE returning (like
+    // isolate-per-function awaits its per-spawn graph) so the NEXT edit —
+    // e.g. to a dependency this reload just introduced — classifies and
+    // maps to its importers precisely.
+    await buildColoGraph(
+      survivors.map((n) => candByName.get(n)).filter((c): c is
+        DiscoveredCandidate => c != null),
+    );
+
+    const summary: ReloadSummary = {
+      reason,
+      reloaded: reloaded.sort(),
+      added: added.sort(),
+      removed: removed.sort(),
+      errors,
+      durationMs: performance.now() - start,
+    };
+    opts.onReloaded?.(summary);
+    return summary;
+  }
+
+  function stopColocated(): void {
+    for (const p of coloPending.values()) {
+      p.reject(new Error("gateway shutting down"));
+    }
+    coloPending.clear();
+    const workers = [...coloWorkers];
+    coloWorkers.clear();
+    functionWorker.clear();
+    coloPrimary = null;
+    for (const w of workers) {
+      try {
+        w.terminate();
+      } catch { /* already dead */ }
+    }
+  }
+
   async function start(startOpts: StartOptions = {}) {
+    if (colocate) return startColocated(startOpts);
     const candidates = await discoverCandidates(
       await functionsRoot(),
       (found) => startOpts.onScanProgress?.({ found, phase: "scan" }),
@@ -1234,6 +1921,7 @@ export function createDenoWorkerHost(
   async function startDeferred(
     startOpts: StartOptions = {},
   ): Promise<DeferredStart> {
+    if (colocate) return startDeferredColocated(startOpts);
     const candidates = await discoverCandidates(
       await functionsRoot(),
       (found) => startOpts.onScanProgress?.({ found, phase: "scan" }),
@@ -1321,7 +2009,9 @@ export function createDenoWorkerHost(
   async function reload(
     names: ReadonlySet<string> | "all",
     reason = "fs change",
+    reloadOpts?: ReloadOptions,
   ): Promise<ReloadSummary> {
+    if (colocate) return reloadColocated(names, reason, reloadOpts);
     const start = performance.now();
     const root = await functionsRoot();
     // Targeted re-discovery: only stat/load the affected names. The
@@ -1428,6 +2118,7 @@ export function createDenoWorkerHost(
   }
 
   async function stop() {
+    if (colocate) return stopColocated();
     // Include workers still draining from a recent reload. Hard-terminate
     // everything (no drain grace) so shutdown stays prompt; each handle's
     // in-flight graceful drain resolves the instant its worker is killed.
@@ -1442,7 +2133,8 @@ export function createDenoWorkerHost(
     startDeferred,
     reload,
     stop,
-    list: () => [...handles.keys()].sort(),
+    list: () =>
+      (colocate ? [...functionWorker.keys()] : [...handles.keys()]).sort(),
     bootState: (name) => bootStates.get(name),
     bootStatus,
     prioritize,

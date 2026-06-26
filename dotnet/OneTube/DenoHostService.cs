@@ -857,6 +857,12 @@ const config :Workerd.Config = (
         try
         {
             Directory.CreateDirectory(denoCacheDir);
+            // Deno writes the managed lockfile here on first resolve, but it
+            // won't create the parent directory — make sure it exists before
+            // the child starts (the gateway hasn't opened the log DB, which
+            // normally creates this dir, yet).
+            var lockDir = Path.GetDirectoryName(GatewayCommand.ResolveManagedLockPath(_options));
+            if (!string.IsNullOrEmpty(lockDir)) Directory.CreateDirectory(lockDir);
             _process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             _process.Exited += OnDenoProcessExited;
             _process.OutputDataReceived += (_, e) =>

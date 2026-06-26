@@ -57,6 +57,17 @@ internal static class GatewayCommand
             "--port", slot.Port.ToString(),
             "--host", opts.Host,
             "--backend", opts.Backend == OneTubeBackend.Workerd ? "workerd" : "deno",
+            // A lockfile is the single biggest boot-speed lever on a large
+            // functions project: without one Deno re-solves the entire
+            // npm/jsr version graph on every start, a multi-second floor the
+            // Worker herd all block on. We point --lock at a host-owned,
+            // absolute scratch path (next to the invocation-log DB) rather
+            // than letting Deno default to one next to the bundled gateway
+            // config — the child runs with cwd = OneTubeGateway/, so a
+            // relative default would land in the wrong place. We never pass
+            // --frozen, so a consumer bumping a function's dependency is
+            // appended to the lock without error on the next boot.
+            "--lock", ResolveManagedLockPath(opts),
         };
 
         if (opts.Hmr) args.Add("--hmr");
@@ -183,6 +194,21 @@ internal static class GatewayCommand
             : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, path));
 
     /// <summary>
+    /// Resolve the 1tube-managed Deno lockfile path. Kept next to the
+    /// invocation-log DB so all gateway scratch state lives together, and
+    /// always absolute because the Deno child runs with cwd =
+    /// OneTubeGateway/ — a relative path would resolve against the bundled
+    /// gateway dir, not the host. Owned by 1tube (not the consumer's repo),
+    /// so it never adds git churn or clashes with a project's own deno.lock.
+    /// </summary>
+    internal static string ResolveManagedLockPath(OneTubeOptions opts)
+    {
+        var logDb = ResolveLogDbPath(opts);
+        var dir = Path.GetDirectoryName(logDb) ?? AppContext.BaseDirectory;
+        return Path.Combine(dir, "deno.lock");
+    }
+
+    /// <summary>
     /// Resolve the invocation-log DB file the gateway should write and
     /// the host-side reader should read. Single source of truth — the
     /// logs reader (<c>AddOneTubeLogs</c>) calls this too.
@@ -247,6 +273,10 @@ internal static class GatewayCommand
         env["PORT"] = slot.Port.ToString();
         env["FUNCTIONS_PATH"] = ResolveHostPath(opts.FunctionsPath);
         env["1TUBE_HOST"] = opts.Host;
+        // Let the gateway print which lockfile is in effect (it can't read
+        // its own process's --lock flag back out of Deno). Mirrors the
+        // --lock we pass in BuildArgs.
+        env["ONETUBE_LOCK"] = ResolveManagedLockPath(opts);
 
         if (opts.BodyLimitMb is double bodyMb && bodyMb > 0)
         {

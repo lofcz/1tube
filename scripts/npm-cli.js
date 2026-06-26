@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -55,8 +55,27 @@ const userSuppliedConfig = denoPassthrough.some((a) =>
   a.startsWith("--config=") || a.startsWith("-c=")
 );
 
+// Managed lockfile
+// ----------------
+// A lockfile is what makes a big functions project boot fast: without one
+// (`--no-lock`) Deno re-solves the entire npm/jsr version graph from
+// scratch on every start, and a 100-function project pays that as a
+// multi-second floor every boot. People reach for `--no-lock` to dodge
+// "the lock went stale when I bumped a dep" pain — but in dev Deno's
+// lockfile is ADDITIVE and non-frozen: a changed dependency is appended
+// without error. So the right default is a lockfile we own, not none.
+//
+// We point `--lock` at `.1tube/deno.lock` — a gateway-owned scratch path
+// (already gitignored alongside `.1tube/logs.db`) so it never adds git
+// churn and never collides with a project's own committed `deno.lock`.
+// We never pass `--frozen`, so dep changes self-heal. `1TUBE_REFRESH_LOCK=1`
+// drops the managed lock for a clean rebuild. Any explicit `--lock`,
+// `--no-lock`, or `--frozen` the user passes wins — we don't second-guess.
+const managedLock = resolveManagedLock(denoPassthrough);
+
 const denoArgs = ["run", "--quiet", "-A"];
 if (!userSuppliedConfig) denoArgs.push("--config", denoConfig);
+if (managedLock) denoArgs.push("--lock", managedLock);
 denoArgs.push(...denoPassthrough, cliEntrypoint, ...forwardedTubeArgs);
 
 // Deno 2.9 enables a 24h "minimum dependency age" by default, which makes
@@ -78,6 +97,9 @@ if (
 ) {
   childEnv.NPM_CONFIG_MIN_RELEASE_AGE = "0";
 }
+// Let the gateway print which lockfile is in effect (it can't read its own
+// process's `--lock` flag back out of Deno).
+if (managedLock) childEnv.ONETUBE_LOCK = managedLock;
 
 // Resolve the real deno binary up front. Node ≥18.20 refuses to spawn a
 // `.cmd`/`.bat` shim without a shell, but spawning a real `.exe` (or a
@@ -141,6 +163,60 @@ child.on("exit", (code, signal) => {
   }
   process.exit(code ?? 1);
 });
+
+/**
+ * Decide whether to inject a 1tube-managed lockfile, and where.
+ *
+ * Returns the absolute lock path to pass to `--lock`, or null when the
+ * caller already made an explicit locking choice (`--lock`, `--no-lock`,
+ * or `--frozen`) — in which case we stay out of the way entirely.
+ *
+ * The managed lock lives at `<cwd>/.1tube/deno.lock`: a scratch path that
+ * 1tube already owns and gitignores, so enabling it adds no git churn and
+ * never clashes with a project's own committed `deno.lock`.
+ *
+ * @param {string[]} passthrough  Raw deno flags being forwarded to `deno run`.
+ * @returns {string | null}
+ */
+function resolveManagedLock(passthrough) {
+  const explicit = passthrough.some((a) =>
+    a === "--lock" || a.startsWith("--lock=") ||
+    a === "--no-lock" || a.startsWith("--no-lock=") ||
+    a === "--frozen" || a.startsWith("--frozen=")
+  );
+  if (explicit) return null;
+
+  const dir = join(process.cwd(), ".1tube");
+  const lockPath = join(dir, "deno.lock");
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    // If we can't create the scratch dir, fall back to no managed lock
+    // rather than crash the launcher.
+    return null;
+  }
+
+  // `1TUBE_REFRESH_LOCK=1` forces a clean rebuild by dropping the managed
+  // lock; Deno then re-derives it from the current deps on this boot.
+  if (truthy(process.env.ONETUBE_REFRESH_LOCK ?? process.env["1TUBE_REFRESH_LOCK"])) {
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      // Best-effort.
+    }
+  }
+  return lockPath;
+}
+
+/**
+ * Loose truthiness for env-var flags: "1", "true", "yes", "on" (any case).
+ *
+ * @param {string | undefined} v
+ * @returns {boolean}
+ */
+function truthy(v) {
+  return v !== undefined && /^(1|true|yes|on)$/i.test(v.trim());
+}
 
 /**
  * Split a flag string into argv tokens, honoring single/double quotes so

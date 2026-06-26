@@ -152,6 +152,15 @@ interface CliOpts {
    */
   deferBoot: boolean;
   /**
+   * Colocated (single-isolate) dev mode for the Deno backend. Hosts every
+   * function in ONE Worker so shared deps compile + evaluate once total
+   * instead of once per function — the dominant warm-boot cost on large
+   * projects. Trades crash/global isolation for speed, so it defaults on
+   * only in dev/HMR and is forced off under workerd. Override with
+   * `--colocate` / `--isolate-per-function` or `1TUBE_COLOCATE=1|0`.
+   */
+  colocate: boolean;
+  /**
    * How long (ms) the dispatcher waits for a warming function before
    * answering with the warming 503. Keeps fast-loading functions from
    * flashing the frontend overlay. `1TUBE_WARMUP_GRACE_MS`, default 250.
@@ -300,6 +309,14 @@ function parseArgs(): CliOpts {
   let deferBoot: boolean | undefined = deferEnv === undefined
     ? undefined
     : (deferEnv === "1" || deferEnv.toLowerCase() === "true");
+  // Colocated (single-isolate) dev mode: tri-state until the end of
+  // parsing. When undecided it follows dev/hmr (Deno backend only), since
+  // its whole point is a fast dev loop. `1TUBE_COLOCATE=1|0` or
+  // `--colocate` / `--isolate-per-function` force it either way.
+  const colocateEnv = Deno.env.get("1TUBE_COLOCATE");
+  let colocate: boolean | undefined = colocateEnv === undefined
+    ? undefined
+    : (colocateEnv === "1" || colocateEnv.toLowerCase() === "true");
   let warmupGraceMs = (() => {
     const v = parseInt(Deno.env.get("1TUBE_WARMUP_GRACE_MS") || "", 10);
     return Number.isFinite(v) && v >= 0 ? v : 250;
@@ -444,6 +461,13 @@ function parseArgs(): CliOpts {
       deferBoot = true;
     } else if (a === "--defer-boot=false" || a === "--no-defer-boot") {
       deferBoot = false;
+    } else if (a === "--colocate" || a === "--colocate=true") {
+      colocate = true;
+    } else if (
+      a === "--colocate=false" || a === "--no-colocate" ||
+      a === "--isolate-per-function"
+    ) {
+      colocate = false;
     } else if (a === "--warmup-grace-ms" && args[i + 1]) {
       const n = parseInt(args[++i], 10);
       if (Number.isFinite(n) && n >= 0) warmupGraceMs = n;
@@ -611,6 +635,18 @@ function parseArgs(): CliOpts {
     );
   }
 
+  // Colocated mode is a DEV accelerator: in a single isolate, shared deps
+  // compile + evaluate once instead of once per function (the dominant
+  // warm-boot cost on large projects). It trades crash/global isolation
+  // for speed, so it's the default only when iterating (dev/hmr) on the
+  // Deno backend, and never in prod or under workerd.
+  const colocateResolved = backend === "deno" && (colocate ?? (dev || hmr));
+  if (colocate === true && backend === "workerd") {
+    console.warn(
+      "[1tube] --colocate is ignored on the workerd backend (functions already share one bundle generation).",
+    );
+  }
+
   return {
     port,
     host,
@@ -624,6 +660,7 @@ function parseArgs(): CliOpts {
     hmr,
     lazy,
     deferBoot: deferBootResolved,
+    colocate: colocateResolved,
     warmupGraceMs,
     hmrFreshWaitMs,
     backend,
@@ -927,6 +964,24 @@ console.log(
       opts.bodyReadIdleMs > 0 ? opts.bodyReadIdleMs + "ms" : "off"
     }`,
 );
+
+// A lockfile is the single biggest boot-speed lever on a large functions
+// project: without one Deno re-solves the whole npm/jsr version graph on
+// every start (a multi-second floor that the Worker herd all block on).
+// The launcher and the .NET host point `--lock` at a gateway-owned
+// `.1tube/deno.lock` and advertise it here via ONETUBE_LOCK so the choice
+// is visible. We can't read our own process's `--lock` back from Deno, so
+// when that hint is absent we can't tell a lockfile boot from a `--no-lock`
+// boot — hence only a positive confirmation is printed.
+{
+  const managedLock = Deno.env.get("ONETUBE_LOCK") ??
+    Deno.env.get("1TUBE_LOCK");
+  if (managedLock) {
+    console.log(
+      `[1tube] Lockfile: ${managedLock} (managed — deps auto-tracked, no --no-lock needed)`,
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Invocation log store (SQLite + FTS5)
@@ -1349,7 +1404,11 @@ if (opts.backend === "workerd") {
   // RPC stubs in place of the real source via the source rewriter,
   // so a top-level `subscribeToProfileChanges()` runs once total
   // instead of once per Worker.
-  const discoveredShared = await discoverSharedModules(
+  // Colocated mode hosts every function in one isolate, so a shared
+  // module is imported exactly once there naturally — the gateway-side
+  // "load once + RPC stub" machinery (and the source rewriter it needs)
+  // is redundant and is skipped entirely.
+  const discoveredShared = opts.colocate ? [] : await discoverSharedModules(
     resolvedFunctionsPath,
     opts.workerdShared ?? [],
   );
@@ -1406,6 +1465,7 @@ if (opts.backend === "workerd") {
     ...(opts.denoReloadDrainMs !== undefined
       ? { reloadDrainMs: opts.denoReloadDrainMs }
       : {}),
+    ...(opts.colocate ? { colocate: true } : {}),
     ...(denoImportMapOptions ?? {}),
     ...(denoSharedRuntime ? { sharedRuntime: denoSharedRuntime } : {}),
     ...(denoRewriteCache ? { rewriteCache: denoRewriteCache } : {}),

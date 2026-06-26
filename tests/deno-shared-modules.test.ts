@@ -31,6 +31,18 @@ import {
 } from "../src/backends/deno/shared-runtime.ts";
 import { createRewriteCache } from "../src/backends/deno/source-rewriter.ts";
 
+// These cases assert the isolate-per-function *source-rewriter* mechanism:
+// a shared module is evaluated once in the gateway and reached via an RPC
+// stub, so its top-level side effect fires exactly once across N Workers.
+// Colocated mode reaches the same end (shared side effects run once) by a
+// different route — every function lives in one isolate, so the module is
+// simply imported once there — making the rewriter (and these gateway-eval
+// counters / per-Worker expectations) inapplicable. The colocated equivalent
+// is covered by "hmr-e2e: shared profile-cache … runs once". So when the
+// corpus is re-run with `1TUBE_FORCE_COLOCATE=1`, the rewriter-mechanism
+// cases are skipped while the pure rewriter unit tests still run.
+const FORCE_COLO = Deno.env.get("1TUBE_FORCE_COLOCATE") === "1";
+
 async function write(path: string, text: string): Promise<void> {
   await Deno.mkdir(join(path, ".."), { recursive: true });
   await Deno.writeTextFile(path, text);
@@ -115,9 +127,11 @@ reg.register(
   };
 }
 
-Deno.test(
-  "shared modules: top-level side effect runs ONCE across many Workers",
-  async () => {
+Deno.test({
+  name: "shared modules: top-level side effect runs ONCE across many Workers",
+  // Rewriter mechanism: see file header. Colocated runs it once in-isolate.
+  ignore: FORCE_COLO,
+  fn: async () => {
     const proj = await makeProject(5);
     try {
       const evalLog = join(proj.dir, ".shared-evals.log");
@@ -187,11 +201,14 @@ Deno.test(
       await proj.cleanup();
     }
   },
-);
+});
 
-Deno.test(
-  "shared modules: reloading a shared module re-runs the gateway evaluation",
-  async () => {
+Deno.test({
+  name:
+    "shared modules: reloading a shared module re-runs the gateway evaluation",
+  // Rewriter mechanism: see file header. Colocated re-imports in-isolate.
+  ignore: FORCE_COLO,
+  fn: async () => {
     const proj = await makeProject(1);
     try {
       const evalLog = join(proj.dir, ".shared-evals.log");
@@ -248,7 +265,7 @@ Deno.test(
       await proj.cleanup();
     }
   },
-);
+});
 
 Deno.test(
   "shared modules: dynamic import() of a non-shared dep keeps quotes around the rewritten URL",
@@ -410,47 +427,55 @@ export async function run() { return await getCachedProfile("u1"); }
   }
 });
 
-Deno.test("shared modules: rewriter is a no-op when no shared modules are configured", async () => {
-  const proj = await makeProject(2);
-  try {
-    // Empty shared runtime → the rewriter should leave entries alone
-    // and the Workers should evaluate the shared file themselves
-    // (i.e. the side-effect counter should rise — proving the test
-    // boundary is correct).
-    const sharedRuntime = await createDenoSharedRuntime([]);
-    const cacheDir = await Deno.makeTempDir({ prefix: "1tube-rewrite-" });
-    const rewriteCache = createRewriteCache({ cacheDir, sharedRuntime });
-
-    const registry = new FunctionRegistry();
-    const supervisor = new FunctionSupervisor();
-    const host = createDenoWorkerHost({
-      functionsDir: proj.dir,
-      registry,
-      supervisor,
-      sharedRuntime,
-      rewriteCache,
-    });
+Deno.test({
+  name:
+    "shared modules: rewriter is a no-op when no shared modules are configured",
+  // Asserts isolate-per-function behavior explicitly: with no shared-runtime,
+  // each Worker re-evaluates the module (2 markers from 2 fns). Colocated
+  // shares one isolate, so it would (correctly) produce 1 — a different mode.
+  ignore: FORCE_COLO,
+  fn: async () => {
+    const proj = await makeProject(2);
     try {
-      const { loaded, errors } = await host.start();
-      assertEquals(errors, []);
-      assertEquals(loaded.length, 2);
+      // Empty shared runtime → the rewriter should leave entries alone
+      // and the Workers should evaluate the shared file themselves
+      // (i.e. the side-effect counter should rise — proving the test
+      // boundary is correct).
+      const sharedRuntime = await createDenoSharedRuntime([]);
+      const cacheDir = await Deno.makeTempDir({ prefix: "1tube-rewrite-" });
+      const rewriteCache = createRewriteCache({ cacheDir, sharedRuntime });
 
-      const evalLog = join(proj.dir, ".shared-evals.log");
-      const log = await Deno.readTextFile(evalLog);
-      assertEquals(
-        log.length,
-        2,
-        "without shared-runtime registration each Worker evaluates the module itself; expected 2 markers from 2 fns",
-      );
+      const registry = new FunctionRegistry();
+      const supervisor = new FunctionSupervisor();
+      const host = createDenoWorkerHost({
+        functionsDir: proj.dir,
+        registry,
+        supervisor,
+        sharedRuntime,
+        rewriteCache,
+      });
+      try {
+        const { loaded, errors } = await host.start();
+        assertEquals(errors, []);
+        assertEquals(loaded.length, 2);
 
-      assertEquals(rewriteCache.inspect().rewrites.length, 0);
-      assertEquals(rewriteCache.inspect().stubs.length, 0);
+        const evalLog = join(proj.dir, ".shared-evals.log");
+        const log = await Deno.readTextFile(evalLog);
+        assertEquals(
+          log.length,
+          2,
+          "without shared-runtime registration each Worker evaluates the module itself; expected 2 markers from 2 fns",
+        );
+
+        assertEquals(rewriteCache.inspect().rewrites.length, 0);
+        assertEquals(rewriteCache.inspect().stubs.length, 0);
+      } finally {
+        await host.stop();
+        await sharedRuntime.stop();
+        await rewriteCache.stop();
+      }
     } finally {
-      await host.stop();
-      await sharedRuntime.stop();
-      await rewriteCache.stop();
+      await proj.cleanup();
     }
-  } finally {
-    await proj.cleanup();
-  }
+  },
 });

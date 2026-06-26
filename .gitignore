@@ -12,3 +12,4 @@ node_modules/
 /dotnet/OneTube.Tests/obj
 /.1tube
 /dotnet/artifacts
+/.perf

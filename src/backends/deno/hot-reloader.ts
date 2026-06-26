@@ -398,7 +398,9 @@ export function createDenoHotReloader(
       }`;
       log(`[1tube] HMR ${reason}`);
       try {
-        const summary = await opts.host.reload(affected, reason);
+        const summary = await opts.host.reload(affected, reason, {
+          changedPaths: paths,
+        });
         const parts: string[] = [];
         if (summary.reloaded.length > 0) {
           parts.push(`reloaded=${summary.reloaded.join(",")}`);

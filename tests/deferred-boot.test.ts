@@ -16,6 +16,14 @@ import { FunctionRegistry } from "../src/registry.ts";
 import { FunctionSupervisor } from "../src/supervisor.ts";
 import { createDenoWorkerHost } from "../src/backends/deno/worker-host.ts";
 
+// The whole suite can be re-run against the colocated host with
+// `1TUBE_FORCE_COLOCATE=1` (see createDenoWorkerHost). Most cases are
+// mode-agnostic and MUST pass under both. A few assert per-function *lane*
+// semantics — a queued function jumping a busy concurrency lane — which
+// simply don't exist in colocated mode (one isolate imports serially, there
+// is no lane to jump). Those are skipped under the flag, not deleted.
+const FORCE_COLO = Deno.env.get("1TUBE_FORCE_COLOCATE") === "1";
+
 async function writeFn(
   dir: string,
   name: string,
@@ -95,47 +103,55 @@ Deno.test("deferred boot: returns immediately, functions become ready in backgro
   }
 });
 
-Deno.test("deferred boot: prioritize() jumps a queued function past slow ones", async () => {
-  const tmp = await Deno.makeTempDir({ prefix: "1tube-defer-prio-" });
-  try {
-    // Alphabetical queue order: aa, bb, zz. With concurrency 1 the lane
-    // grinds through aa (slow) then bb (slow); zz would normally go last.
-    await writeFn(tmp, "aa", "aa", { delayMs: 800 });
-    await writeFn(tmp, "bb", "bb", { delayMs: 800 });
-    await writeFn(tmp, "zz", "zz");
-
-    const registry = new FunctionRegistry();
-    const supervisor = new FunctionSupervisor();
-    const host = createDenoWorkerHost({
-      functionsDir: tmp,
-      registry,
-      supervisor,
-      concurrency: 1,
-    });
+Deno.test({
+  name: "deferred boot: prioritize() jumps a queued function past slow ones",
+  // Lane-jumping is an isolate-per-function concept: with concurrency 1 the
+  // single lane grinds aa→bb→zz and prioritize() reorders the pending queue.
+  // Colocated imports every function serially in one isolate; there is no
+  // separate lane to jump, so this assertion can't hold there.
+  ignore: FORCE_COLO,
+  fn: async () => {
+    const tmp = await Deno.makeTempDir({ prefix: "1tube-defer-prio-" });
     try {
-      const { done } = await host.startDeferred();
+      // Alphabetical queue order: aa, bb, zz. With concurrency 1 the lane
+      // grinds through aa (slow) then bb (slow); zz would normally go last.
+      await writeFn(tmp, "aa", "aa", { delayMs: 800 });
+      await writeFn(tmp, "bb", "bb", { delayMs: 800 });
+      await writeFn(tmp, "zz", "zz");
 
-      // Simulate "a request arrived for zz".
-      host.prioritize("zz");
-      const outcome = await host.whenReady("zz", 30_000);
-      assertEquals(outcome, "ready");
+      const registry = new FunctionRegistry();
+      const supervisor = new FunctionSupervisor();
+      const host = createDenoWorkerHost({
+        functionsDir: tmp,
+        registry,
+        supervisor,
+        concurrency: 1,
+      });
+      try {
+        const { done } = await host.startDeferred();
 
-      // zz finished while the slow lane was still busy — bb (queued
-      // behind aa) must not have completed yet.
-      assert(
-        host.bootState("bb") !== "ready",
-        "bb should still be warming when prioritized zz is ready",
-      );
+        // Simulate "a request arrived for zz".
+        host.prioritize("zz");
+        const outcome = await host.whenReady("zz", 30_000);
+        assertEquals(outcome, "ready");
 
-      const { loaded, errors } = await done;
-      assertEquals(errors, []);
-      assertEquals(loaded.sort(), ["aa", "bb", "zz"]);
+        // zz finished while the slow lane was still busy — bb (queued
+        // behind aa) must not have completed yet.
+        assert(
+          host.bootState("bb") !== "ready",
+          "bb should still be warming when prioritized zz is ready",
+        );
+
+        const { loaded, errors } = await done;
+        assertEquals(errors, []);
+        assertEquals(loaded.sort(), ["aa", "bb", "zz"]);
+      } finally {
+        await host.stop();
+      }
     } finally {
-      await host.stop();
+      await Deno.remove(tmp, { recursive: true });
     }
-  } finally {
-    await Deno.remove(tmp, { recursive: true });
-  }
+  },
 });
 
 Deno.test("deferred boot: initialRecency warms recently used functions first", async () => {
