@@ -125,6 +125,8 @@ Deno.test({
   // Use a bogus functions dir + ephemeral port; the boot still proceeds past
   // the guard, and we kill it after 1.5s. We assert the dev-defaults log
   // appeared and the process did NOT exit with the guard's code 1.
+  // Provide anon/service keys so this case does not depend on a live local
+  // Supabase stack (or wait on status retries).
   const tmp = await Deno.makeTempDir();
   try {
     const cmd = new Deno.Command(Deno.execPath(), {
@@ -142,8 +144,10 @@ Deno.test({
       ],
       env: {
         "1TUBE_DEV": "",
+        "1TUBE_DEV_SKIP_SUPABASE_STATUS": "1",
         JWT_SECRET: "",
-        SUPABASE_SERVICE_ROLE_KEY: "",
+        SUPABASE_ANON_KEY: "test-anon-key",
+        SUPABASE_SERVICE_ROLE_KEY: "test-service-role-key",
       },
       stdout: "piped",
       stderr: "piped",
@@ -170,6 +174,48 @@ Deno.test({
     assert(
       !combined.includes("FATAL"),
       `dev mode should not emit FATAL, got:\n${combined}`,
+    );
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+Deno.test({
+  name:
+    "dev-guard: --dev mode fatals cleanly when anon/service keys stay unresolved",
+  permissions: { run: true, read: true, write: true, env: true },
+}, async () => {
+  const tmp = await Deno.makeTempDir();
+  try {
+    const { code, stderr, stdout } = await runServer(
+      {
+        "1TUBE_DEV": "",
+        "1TUBE_DEV_SKIP_SUPABASE_STATUS": "1",
+        "1TUBE_DEV_STATUS_ATTEMPTS": "1",
+        JWT_SECRET: "",
+        SUPABASE_ANON_KEY: "",
+        SUPABASE_SERVICE_ROLE_KEY: "",
+        SUPABASE_PUBLISHABLE_KEY: "",
+        SUPABASE_SECRET_KEY: "",
+        VITE_SUPABASE_PUBLISHABLE_KEY: "",
+      },
+      [
+        "--dev",
+        "--port",
+        "0",
+        "--functions",
+        tmp,
+        "--host",
+        "127.0.0.1",
+      ],
+    );
+    const combined = `${stdout}\n${stderr}`;
+    assertEquals(code, 78, `expected CONFIG exit 78, got ${code}\n${combined}`);
+    assert(
+      combined.includes("FATAL") &&
+        combined.includes("SUPABASE_ANON_KEY") &&
+        combined.includes("could not resolve"),
+      `expected clean missing-key FATAL, got:\n${combined}`,
     );
   } finally {
     await Deno.remove(tmp, { recursive: true });

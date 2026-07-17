@@ -819,9 +819,18 @@ async function readDenoImportMap(
 // confusing failures.
 const SECRETS_REQUIRED_IN_PROD = ["JWT_SECRET"];
 
-async function applyDevDefaults() {
+/** Keys edge handlers typically need once `--dev` has finished bootstrapping. */
+const DEV_SUPABASE_KEYS_REQUIRED = [
+  "SUPABASE_ANON_KEY",
+  "SUPABASE_SERVICE_ROLE_KEY",
+] as const;
+
+function missingDevSupabaseKeys(): string[] {
+  return DEV_SUPABASE_KEYS_REQUIRED.filter((key) => !Deno.env.get(key));
+}
+
+function applyStatusEnv(statusEnv: Record<string, string>): number {
   let applied = 0;
-  const statusEnv = await readLocalSupabaseStatusEnv();
   for (const [target, sources] of Object.entries(LOCAL_SUPABASE_STATUS_KEYS)) {
     if (Deno.env.get(target)) continue;
     const value = sources
@@ -833,10 +842,86 @@ async function applyDevDefaults() {
     Deno.env.set(target, value);
     applied++;
   }
+  return applied;
+}
 
-  if (!Deno.env.get("SUPABASE_URL") && Deno.env.get("VITE_SUPABASE_URL")) {
-    Deno.env.set("SUPABASE_URL", Deno.env.get("VITE_SUPABASE_URL")!);
+/**
+ * Map host-project aliases (Vite publishable key, modern secret names) onto
+ * the legacy SUPABASE_* names edge functions still read.
+ */
+function applyDevEnvAliases(): number {
+  let applied = 0;
+  const aliasPairs: Array<[from: string, to: string]> = [
+    ["VITE_SUPABASE_URL", "SUPABASE_URL"],
+    ["VITE_SUPABASE_PUBLISHABLE_KEY", "SUPABASE_PUBLISHABLE_KEY"],
+    ["VITE_SUPABASE_PUBLISHABLE_KEY", "SUPABASE_ANON_KEY"],
+    ["SUPABASE_PUBLISHABLE_KEY", "SUPABASE_ANON_KEY"],
+    ["SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY"],
+  ];
+  for (const [from, to] of aliasPairs) {
+    if (Deno.env.get(to)) continue;
+    const value = Deno.env.get(from);
+    if (!value) continue;
+    Deno.env.set(to, value);
     applied++;
+  }
+  return applied;
+}
+
+function devStatusRetryConfig(): { attempts: number; delayMs: number } {
+  const attemptsRaw = parseInt(
+    Deno.env.get("1TUBE_DEV_STATUS_ATTEMPTS") || "",
+    10,
+  );
+  const delayRaw = parseInt(
+    Deno.env.get("1TUBE_DEV_STATUS_RETRY_MS") || "",
+    10,
+  );
+  return {
+    attempts: Number.isFinite(attemptsRaw) && attemptsRaw > 0
+      ? attemptsRaw
+      : 5,
+    delayMs: Number.isFinite(delayRaw) && delayRaw >= 0 ? delayRaw : 1000,
+  };
+}
+
+async function applyDevDefaults() {
+  let applied = applyDevEnvAliases();
+
+  const skipStatus = (Deno.env.get("1TUBE_DEV_SKIP_SUPABASE_STATUS") || "") ===
+    "1";
+  const { attempts, delayMs } = devStatusRetryConfig();
+
+  if (!skipStatus) {
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const missing = missingDevSupabaseKeys();
+      if (missing.length === 0) break;
+
+      if (attempt > 1) {
+        console.warn(
+          `[1tube] Local Supabase keys still missing (${
+            missing.join(", ")
+          }); retrying \`supabase status\` (${attempt}/${attempts})…`,
+        );
+        if (delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+
+      const statusEnv = await readLocalSupabaseStatusEnv();
+      if (Object.keys(statusEnv).length === 0) {
+        if (attempt === 1) {
+          console.warn(
+            "[1tube] Could not read local Supabase keys via `supabase status` " +
+              "(CLI missing or stack not ready); will retry…",
+          );
+        }
+        continue;
+      }
+      applied += applyStatusEnv(statusEnv);
+      // Status may only populate PUBLISHABLE/SECRET; re-alias onto ANON/SERVICE.
+      applied += applyDevEnvAliases();
+    }
   }
 
   for (const [key, value] of Object.entries(LOCAL_SUPABASE_DEFAULTS)) {
@@ -848,12 +933,27 @@ async function applyDevDefaults() {
   if (applied > 0) {
     console.log(`[1tube] Applied ${applied} dev default(s) (1TUBE_DEV=1)`);
   }
+
+  const missing = missingDevSupabaseKeys();
+  if (missing.length > 0) {
+    console.error(
+      `[1tube] FATAL: --dev could not resolve ${missing.join(", ")} after ` +
+        `${skipStatus ? "skipping" : `${attempts} attempt(s) at`} ` +
+        `\`supabase status\`. ` +
+        `Start local Supabase (\`supabase start\`) so status works, or set ` +
+        `the missing vars in .env (SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY, ` +
+        `or VITE_SUPABASE_PUBLISHABLE_KEY + SUPABASE_SERVICE_ROLE_KEY).`,
+    );
+    Deno.exit(EXIT_CODES.CONFIG);
+  }
 }
 
 async function readLocalSupabaseStatusEnv(): Promise<Record<string, string>> {
   const runners: Array<{ command: string; args: string[] }> = [
     { command: "supabase", args: ["status", "-o", "env"] },
     { command: "bunx", args: ["supabase", "status", "-o", "env"] },
+    { command: "bun", args: ["x", "supabase", "status", "-o", "env"] },
+    { command: "npx", args: ["--yes", "supabase", "status", "-o", "env"] },
   ];
 
   for (const runner of runners) {
@@ -861,12 +961,17 @@ async function readLocalSupabaseStatusEnv(): Promise<Record<string, string>> {
       const output = await new Deno.Command(runner.command, {
         args: runner.args,
         stdout: "piped",
-        stderr: "null",
+        stderr: "piped",
       }).output();
-      if (!output.success) continue;
-      return parseSupabaseStatusEnv(new TextDecoder().decode(output.stdout));
+      const stdout = new TextDecoder().decode(output.stdout);
+      const parsed = parseSupabaseStatusEnv(stdout);
+      // Accept stdout even on non-zero exit — `supabase status` often warns
+      // about stopped optional services while still printing usable keys.
+      if (parsed.ANON_KEY || parsed.PUBLISHABLE_KEY || parsed.SERVICE_ROLE_KEY) {
+        return parsed;
+      }
     } catch {
-      // CLI not installed on PATH (or bunx unavailable). Try the next runner.
+      // CLI not installed on PATH (or bunx/npx unavailable). Try the next runner.
     }
   }
   return {};
