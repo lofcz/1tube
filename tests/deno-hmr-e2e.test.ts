@@ -34,6 +34,7 @@ import {
   createDenoHotReloader,
   type DenoHotReloader,
 } from "../src/backends/deno/hot-reloader.ts";
+import { devGatewayEnv } from "./_helpers.ts";
 
 const SERVER = join(
   fromFileUrl(new URL(".", import.meta.url)),
@@ -411,13 +412,13 @@ Deno.test({
         "2",
       ],
       cwd: root,
-      env: {
+      env: devGatewayEnv({
         "1TUBE_DEV": "1",
         "1TUBE_BOOT_PROFILE": "",
         // HMR correctness tests, not rate-limit tests: keep the health-check
         // poller (~10 req/s) from tripping the gateway limiter into a 429.
         "1TUBE_DISABLE_RATE_LIMIT": "1",
-      },
+      }),
       stdout: "piped",
       stderr: "piped",
     });
@@ -519,13 +520,13 @@ Deno.test({
         "1",
       ],
       cwd: root,
-      env: {
+      env: devGatewayEnv({
         "1TUBE_DEV": "1",
         "1TUBE_BOOT_PROFILE": "",
         // HMR correctness tests, not rate-limit tests: keep the health-check
         // poller (~10 req/s) from tripping the gateway limiter into a 429.
         "1TUBE_DISABLE_RATE_LIMIT": "1",
-      },
+      }),
       stdout: "piped",
       stderr: "piped",
     });
@@ -631,12 +632,12 @@ reg.register(async () => {
         "2",
       ],
       cwd: root,
-      env: {
+      env: devGatewayEnv({
         "1TUBE_DEV": "1",
         // HMR correctness test, not a rate-limit test: keep the health-check
         // poller (~10 req/s) from tripping the gateway limiter into a 429.
         "1TUBE_DISABLE_RATE_LIMIT": "1",
-      },
+      }),
       stdout: "piped",
       stderr: "piped",
     });

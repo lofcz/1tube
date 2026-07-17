@@ -63,6 +63,22 @@ export async function signJwt(
   return `${signingInput}.${sigB64}`;
 }
 
+/**
+ * Env required by `--dev` gateway spawns after the anon/service-key boot
+ * guard. Skips `supabase status` so CI / temp projects don't wait on a
+ * local stack that isn't there.
+ */
+export function devGatewayEnv(
+  extra: Record<string, string> = {},
+): Record<string, string> {
+  return {
+    "1TUBE_DEV_SKIP_SUPABASE_STATUS": "1",
+    SUPABASE_ANON_KEY: "test-anon-key",
+    SUPABASE_SERVICE_ROLE_KEY: "test-service-role-key",
+    ...extra,
+  };
+}
+
 /** Reset every `1TUBE_*` env var so each test starts from a clean slate. */
 export function resetTubeEnv(): void {
   const keys = [
@@ -85,8 +101,10 @@ export function resetTubeEnv(): void {
     "1TUBE_LAZY",
     "1TUBE_LOG_BUFFER_MS",
     "1TUBE_LOG_BUFFER_LINES",
+    "1TUBE_DEV_SKIP_SUPABASE_STATUS",
     "INTERNAL_KEY",
     "JWT_SECRET",
+    "SUPABASE_ANON_KEY",
     "SUPABASE_SERVICE_ROLE_KEY",
     "SUPABASE_URL",
   ];

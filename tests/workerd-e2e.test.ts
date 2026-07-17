@@ -19,7 +19,7 @@ import { assert, assertEquals } from "@std/assert";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fromFileUrl } from "jsr:@std/path@^1/from-file-url";
 import { probeVersion } from "../src/backends/workerd/process.ts";
-import { signJwt } from "./_helpers.ts";
+import { devGatewayEnv, signJwt } from "./_helpers.ts";
 
 // Same value the dev defaults block in src/server.ts seeds when --dev
 // is passed. Keeping it inline (rather than importing the consts
@@ -138,6 +138,7 @@ Deno.test(
       cwd: PROJECT_ROOT,
       env: {
         ...Deno.env.toObject(),
+        ...devGatewayEnv(),
         // Force eager + non-watch — HMR doesn't apply to workerd anyway
         // and we want a deterministic boot.
         "1TUBE_HMR": "0",
@@ -482,6 +483,7 @@ serve(async () => Response.json(await getCachedProfile("u1")), { public: true })
       cwd: PROJECT_ROOT,
       env: {
         ...Deno.env.toObject(),
+        ...devGatewayEnv(),
         "1TUBE_HMR": "0",
         "1TUBE_LAZY": "0",
       },
@@ -625,6 +627,7 @@ Deno.test(
       cwd: PROJECT_ROOT,
       env: {
         ...Deno.env.toObject(),
+        ...devGatewayEnv(),
         "1TUBE_LAZY": "0",
       },
       stdout: "piped",
@@ -781,6 +784,7 @@ Deno.test(
       cwd: PROJECT_ROOT,
       env: {
         ...Deno.env.toObject(),
+        ...devGatewayEnv(),
         "1TUBE_HMR": "0",
         "1TUBE_LAZY": "0",
         "INTERNAL_KEY": internalKey,

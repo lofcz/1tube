@@ -22,6 +22,7 @@ import { fromFileUrl } from "jsr:@std/path@^1/from-file-url";
 import { build } from "../src/cli/build.ts";
 import { createWorkerdBackend } from "../src/backends/workerd/backend.ts";
 import { probeVersion } from "../src/backends/workerd/process.ts";
+import { devGatewayEnv } from "./_helpers.ts";
 
 const PROJECT_ROOT = resolvePath(dirname(fromFileUrl(import.meta.url)), "..");
 const PLAYGROUND = join(PROJECT_ROOT, "playground");
@@ -126,6 +127,7 @@ Deno.test(
       cwd: PROJECT_ROOT,
       env: {
         ...Deno.env.toObject(),
+        ...devGatewayEnv(),
         // HMR must no-op against a sealed artifact; test that the
         // gateway warns and continues rather than booting a watcher.
         "1TUBE_HMR": "1",
@@ -294,7 +296,11 @@ serve(() => Response.json({ value: answer(${
         "--dev",
       ],
       cwd: PROJECT_ROOT,
-      env: { ...Deno.env.toObject(), "1TUBE_LAZY": "0" },
+      env: {
+        ...Deno.env.toObject(),
+        ...devGatewayEnv(),
+        "1TUBE_LAZY": "0",
+      },
       stdout: "piped",
       stderr: "piped",
     }).spawn();
