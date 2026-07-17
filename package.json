@@ -61,10 +61,10 @@
     "prepublishOnly": "bun run build:edge && bun run typecheck && bun run check && bun run smoke:bin"
   },
   "dependencies": {
-    "drizzle-orm": "1.0.0-rc.3",
-    "hono": "^4.12.27"
+    "drizzle-orm": "1.0.0-rc.4",
+    "hono": "^4.12.30"
   },
   "devDependencies": {
-    "drizzle-kit": "1.0.0-rc.3"
+    "drizzle-kit": "1.0.0-rc.4"
   }
 }
