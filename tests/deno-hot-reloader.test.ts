@@ -29,6 +29,9 @@ import type {
 class FakeClock {
   private timers = new Map<number, () => void>();
   private next = 1;
+  get pending(): number {
+    return this.timers.size;
+  }
   setTimer = (cb: () => void, _ms: number): number => {
     const id = this.next++;
     this.timers.set(id, cb);
@@ -37,11 +40,18 @@ class FakeClock {
   clearTimer = (id: number): void => {
     this.timers.delete(id);
   };
-  fireAll(): void {
+  async fireAll(): Promise<void> {
     const cbs = [...this.timers.values()];
     this.timers.clear();
-    for (const cb of cbs) cb();
+    for (const cb of cbs) await cb();
   }
+}
+
+async function waitForTimer(clock: FakeClock, label: string): Promise<void> {
+  for (let i = 0; i < 40 && clock.pending === 0; i++) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert(clock.pending > 0, `expected ${label} to arm a flush timer`);
 }
 
 Deno.test("debouncer: coalesces rapid pushes into a single flush", () => {
@@ -256,11 +266,8 @@ Deno.test("hot-reloader: fs events trigger a precise reload via the dep-graph", 
     await reloader.start();
     try {
       stream.emit([join(tmp, "_shared", "x.ts")]);
-      // Allow the consume loop to deliver into the debouncer.
-      await new Promise((r) => setTimeout(r, 0));
-      clock.fireAll();
-      // Let the flushFn promise resolve.
-      await new Promise((r) => setTimeout(r, 10));
+      await waitForTimer(clock, "dep-graph reload");
+      await clock.fireAll();
 
       assertEquals(reloads.length, 1);
       const set = reloads[0] as ReadonlySet<string>;
@@ -307,9 +314,8 @@ Deno.test("hot-reloader: relative functionsDir misses absolute directory event f
       // path. Linux can report only this directory path for a brand-new
       // function directory, so the reloader must normalize before matching.
       stream.emit([join(tmp, "brand-new")]);
-      await new Promise((r) => setTimeout(r, 0));
-      clock.fireAll();
-      await new Promise((r) => setTimeout(r, 10));
+      await waitForTimer(clock, "directory-event reload");
+      await clock.fireAll();
 
       assertEquals(reloads.length, 1);
       const set = reloads[0] as ReadonlySet<string>;

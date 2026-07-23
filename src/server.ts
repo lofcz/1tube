@@ -74,6 +74,11 @@ import {
   createRewriteCache,
   type RewriteCache,
 } from "./backends/deno/source-rewriter.ts";
+import {
+  createEnvHotReloader,
+  type EnvHotReloader,
+} from "./backends/env-hot-reloader.ts";
+import { resolveWatchedEnvFiles } from "./env-file.ts";
 import { createBootProgress, createScanProgress } from "./boot-progress.ts";
 import {
   createWorkerdWatchdog,
@@ -1227,6 +1232,7 @@ let workerdWatchdog: WorkerdWatchdog | null = null;
 const workerdNames = new Set<string>();
 let denoWorkerHost: DenoWorkerHost | null = null;
 let denoHotReloader: DenoHotReloader | null = null;
+let envHotReloader: EnvHotReloader | null = null;
 let denoSharedRuntimeRef: DenoSharedRuntime | null = null;
 let denoRewriteCacheRef: RewriteCache | null = null;
 
@@ -1702,6 +1708,46 @@ if (opts.backend === "workerd") {
     console.log(
       "[1tube] HMR disabled (set 1TUBE_HMR=1 or pass --hmr to enable)",
     );
+  }
+}
+
+// Env-file HMR: Deno's `--env-file` only loads at process start, and
+// the functions-dir watcher never sees project-root `.env` saves.
+// Watch the same files the launcher forwarded (via 1TUBE_ENV_FILES)
+// or the conventional `.env*` in cwd, re-apply into Deno.env, and
+// respawn every function so secret rotations land immediately.
+if (opts.hmr && !opts.prebuiltDir) {
+  const envFiles = resolveWatchedEnvFiles();
+  if (envFiles.length > 0) {
+    envHotReloader = createEnvHotReloader({
+      envFiles,
+      onChanged: async () => {
+        if (workerdBackend) {
+          const result = await workerdBackend.reload("all");
+          console.log(
+            `[1tube] HMR env reload ok in ${result.durationMs.toFixed(0)}ms ` +
+              `(gen=${result.generation}; rebundled=all)`,
+          );
+          return;
+        }
+        if (denoWorkerHost) {
+          const summary = await denoWorkerHost.reload(
+            "all",
+            "env file changed",
+          );
+          console.log(
+            `[1tube] HMR env reload ok in ${summary.durationMs.toFixed(0)}ms` +
+              (summary.reloaded.length > 0
+                ? ` (reloaded=${summary.reloaded.join(",")})`
+                : ""),
+          );
+          for (const e of summary.errors) {
+            console.log(`[1tube] HMR ${e.name}: ${e.error}`);
+          }
+        }
+      },
+    });
+    await envHotReloader.start();
   }
 }
 
@@ -2478,6 +2524,11 @@ async function shutdown(reason: string) {
   if (denoHotReloader) {
     denoHotReloader.stop().catch((err) => {
       console.warn("[1tube] deno hot reloader stop() error:", err);
+    });
+  }
+  if (envHotReloader) {
+    envHotReloader.stop().catch((err) => {
+      console.warn("[1tube] env hot reloader stop() error:", err);
     });
   }
 

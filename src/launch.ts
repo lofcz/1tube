@@ -468,6 +468,14 @@ async function runServe(args: ServeArgs): Promise<never> {
   // Child env additions (merged onto the inherited environment).
   const childEnv: Record<string, string> = {};
   if (lockAbs) childEnv.ONETUBE_LOCK = lockAbs;
+  // Tell the gateway which `--env-file` paths to HMR-watch. Deno itself
+  // only loads them once at process start; the gateway re-applies on
+  // change so secret edits land without a full restart.
+  if (args.envFiles.length > 0) {
+    childEnv["1TUBE_ENV_FILES"] = args.envFiles
+      .map((p) => resolveToAbs(p))
+      .join(",");
+  }
   // Deno 2.9's 24h minimum-dependency-age default makes freshly published
   // pins fail to resolve; it must be set before the gateway's Deno starts.
   if (
