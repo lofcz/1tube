@@ -1857,6 +1857,100 @@ app.use(fnRouteWildcard, rateLimiter);
 // Function dispatch. The pattern is built from the configurable prefix, so
 // Hono can't statically infer the `:name` param — hence the `?? ""` guard
 // (the `{.+}` matcher guarantees a non-empty value at runtime anyway).
+
+/**
+ * Dev/localhost error detail body.
+ *
+ * In production the gateway deliberately collapses unhandled function
+ * failures to a generic `{"error":"Internal server error"}` so stack
+ * traces and internal messages never leak to clients. That makes local
+ * debugging painful, so when iterating (--dev / 1TUBE_DEV=1) and bound to
+ * loopback we instead return the real message + stack. Gated on BOTH dev
+ * mode AND loopback binding so `1TUBE_DEV=1 --host 0.0.0.0` still
+ * produces sanitized bodies.
+ */
+/**
+ * Dev/localhost error detail body.
+ *
+ * In production the gateway deliberately collapses unhandled function
+ * failures to a generic `{"error":"Internal server error"}` so stack
+ * traces and internal messages never leak to clients. That makes local
+ * debugging painful, so when iterating (--dev / 1TUBE_DEV=1) on a local
+ * address we instead return the real message + stack.
+ *
+ * "Local" is decided per-request from the request's `Host` header (NOT
+ * the bind address), because developers frequently map loopback to a
+ * custom name in their hosts file (e.g. `app.local`, `sciobot.test`) —
+ * the server still binds 127.0.0.1 but the request arrives under the
+ * alias. Matching by `Host` covers all of those.
+ *
+ * Configuration:
+ *   1TUBE_EXPOSE_ERRORS=0|1          force off / force on (overrides dev+host check)
+ *   1TUBE_EXPOSE_ERROR_HOSTS="a.test,b.local"  extra host suffixes to treat as local
+ *
+ * Defaults (local): loopback IPs, `localhost`, any `*.localhost`, `*.local`,
+ * `*.test`, `*.internal` host, plus the operator's extras.
+ */
+
+/** Loopback IPs (exact match) and well-known local TLD suffixes. */
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "[::1]", "localhost"]);
+const LOCAL_HOST_SUFFIXES = [".localhost", ".local", ".test", ".internal"];
+
+function parseExtraExposeHosts(): string[] {
+  const raw = Deno.env.get("1TUBE_EXPOSE_ERROR_HOSTS") ?? "";
+  return raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+}
+const extraExposeHosts = parseExtraExposeHosts();
+
+function isLocalHostname(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  if (LOOPBACK_HOSTS.has(h)) return true;
+  if (h.startsWith("127.")) return true; // entire 127.0.0.0/8 loopback block
+  for (const suffix of LOCAL_HOST_SUFFIXES) {
+    if (h.endsWith(suffix)) return true;
+  }
+  for (const extra of extraExposeHosts) {
+    if (h === extra || h.endsWith("." + extra)) return true;
+  }
+  return false;
+}
+
+/** Strip the port from a Host header value. */
+function hostHeaderHostname(c: { req: { header: (n: string) => string | undefined } }): string {
+  const host = c.req.header("host") ?? "";
+  if (host.startsWith("[")) {
+    const end = host.indexOf("]");
+    return end === -1 ? host : host.slice(0, end + 1);
+  }
+  const i = host.indexOf(":");
+  return i === -1 ? host : host.slice(0, i);
+}
+
+function shouldExposeErrorDetails(
+  c: { req: { header: (n: string) => string | undefined } },
+): boolean {
+  // Operator override wins both ways.
+  const override = Deno.env.get("1TUBE_EXPOSE_ERRORS");
+  if (override === "1" || override === "true") return true;
+  if (override === "0" || override === "false") return false;
+  if (!opts.dev) return false;
+  return isLocalHostname(hostHeaderHostname(c));
+}
+
+function errorDetailsBody(
+  c: { req: { header: (n: string) => string | undefined } },
+  err: unknown,
+): Record<string, unknown> {
+  if (!shouldExposeErrorDetails(c)) return { error: "Internal server error" };
+  const e = err instanceof Error ? err : new Error(String(err));
+  return {
+    error: "Internal server error",
+    message: e.message,
+    stack: e.stack,
+    name: e.name,
+  };
+}
+
 app.all(routeDispatchPattern(), async (c) => {
   // c.req.param("name") greedily captures the trailing path with the {.+}
   // matcher; restrict it to the first segment.
@@ -1982,7 +2076,7 @@ app.all(routeDispatchPattern(), async (c) => {
           message: err instanceof Error ? err.message : String(err),
           stack: err instanceof Error ? err.stack : undefined,
         });
-        response = c.json({ error: "Internal server error" }, 500);
+        response = c.json(errorDetailsBody(c, err), 500);
       }
     } finally {
       if (timer !== null) clearTimeout(timer);
@@ -2207,7 +2301,7 @@ app.all(routeDispatchPattern(), async (c) => {
         message: err instanceof Error ? err.message : String(err),
         stack: err instanceof Error ? err.stack : undefined,
       });
-      response = c.json({ error: "Internal server error" }, 500);
+      response = c.json(errorDetailsBody(c, err), 500);
     }
   } finally {
     if (timer !== null) clearTimeout(timer);
@@ -2460,7 +2554,19 @@ const server = Deno.serve(
     },
     onError: (err) => {
       console.error(`[1tube] Request error: ${err}`);
-      return new Response("Internal error", { status: 500 });
+      // No request context here, so fall back to bind-address + extras.
+      const override = Deno.env.get("1TUBE_EXPOSE_ERRORS");
+      const expose = override === "1" || override === "true"
+        ? true
+        : override === "0" || override === "false"
+        ? false
+        : opts.dev && isLocalHostname(opts.host);
+      if (!expose) return new Response("Internal error", { status: 500 });
+      const e = err instanceof Error ? err : new Error(String(err));
+      return Response.json(
+        { error: "Internal error", message: e.message, stack: e.stack, name: e.name },
+        { status: 500 },
+      );
     },
   },
   app.fetch,
