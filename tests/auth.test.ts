@@ -7,7 +7,7 @@
  */
 
 import { assertEquals, assertExists } from "@std/assert";
-import { validateRequest } from "../src/gateway/auth.ts";
+import { probeRequest, validateRequest } from "../src/gateway/auth.ts";
 import { resetTubeEnv, signJwt } from "./_helpers.ts";
 
 const SECRET = "test-secret-which-is-long-enough-for-hmac-sha256";
@@ -84,6 +84,37 @@ Deno.test("auth: rejects when JWT_SECRET is unset", async () => {
   const token = await signJwt(SECRET);
   const auth = await validateRequest(reqWith(token));
   assertEquals(auth, null);
+});
+
+Deno.test("auth: probe reports unavailable when JWT_SECRET is unset", async () => {
+  resetTubeEnv();
+  const token = await signJwt(SECRET);
+  const probed = await probeRequest(reqWith(token));
+  assertEquals(probed.status, "unavailable");
+});
+
+Deno.test("auth: probe reports missing without a bearer", async () => {
+  resetTubeEnv();
+  Deno.env.set("JWT_SECRET", SECRET);
+  const probed = await probeRequest(reqWith(null));
+  assertEquals(probed.status, "missing");
+});
+
+Deno.test("auth: probe reports invalid for a bad signature", async () => {
+  resetTubeEnv();
+  Deno.env.set("JWT_SECRET", SECRET);
+  const token = await signJwt("a-different-secret-also-long-enough-for-hs256");
+  const probed = await probeRequest(reqWith(token));
+  assertEquals(probed.status, "invalid");
+});
+
+Deno.test("auth: probe reports ok for a live token", async () => {
+  resetTubeEnv();
+  Deno.env.set("JWT_SECRET", SECRET);
+  const token = await signJwt(SECRET, { sub: "user-abc" });
+  const probed = await probeRequest(reqWith(token));
+  assertEquals(probed.status, "ok");
+  if (probed.status === "ok") assertEquals(probed.auth.userId, "user-abc");
 });
 
 Deno.test("auth: accepts a token matching SUPABASE_SERVICE_ROLE_KEY as service role", async () => {

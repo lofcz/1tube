@@ -19,7 +19,7 @@
 import { type Context, Hono } from "npm:hono@4";
 import { bodyLimit } from "npm:hono@4/body-limit";
 import { currentRequestStorage, FunctionRegistry } from "./registry.ts";
-import { validateRequest } from "./gateway/auth.ts";
+import { probeRequest } from "./gateway/auth.ts";
 import { watchdogBody } from "./gateway/body-watchdog.ts";
 import { corsMiddleware } from "./gateway/cors.ts";
 import {
@@ -1842,13 +1842,15 @@ app.use(fnRouteWildcard, async (c, next) => {
   // unauthenticated requests here. Public functions need to pass through and
   // rate-limit by IP; protected functions are gated below in the dispatcher.
   try {
-    const auth = await validateRequest(c.req.raw);
-    if (auth) {
-      c.set("userId", auth.userId);
-      (c as any).set("__authContext", auth);
+    const probed = await probeRequest(c.req.raw);
+    (c as any).set("__authProbe", probed.status);
+    if (probed.status === "ok") {
+      c.set("userId", probed.auth.userId);
+      (c as any).set("__authContext", probed.auth);
     }
   } catch {
-    // Ignore validation errors at probe time — dispatcher will return 401.
+    // Ignore validation errors at probe time — dispatcher will 401/503.
+    (c as any).set("__authProbe", "invalid");
   }
   await next();
 });
@@ -2024,6 +2026,15 @@ app.all(routeDispatchPattern(), async (c) => {
       duplex: "half",
     });
     const auth = (c as any).get("__authContext") ?? null;
+    const knownPublic = registry.get(name)?.isPublic ??
+      registry.workerHandle(name)?.isPublic;
+    if (knownPublic === false && !auth && (c as any).get("__authProbe") === "unavailable") {
+      return c.json(
+        { error: "Auth temporarily unavailable", reason: "jwt_secret_unavailable" },
+        503,
+        { "X-1tube-Auth-Unavailable": "1" },
+      );
+    }
 
     // Per-function timeout from the manifest, falling back to the
     // gateway-wide default. Same precedence the Deno path uses.
@@ -2248,6 +2259,13 @@ app.all(routeDispatchPattern(), async (c) => {
 
   const auth = (c as any).get("__authContext") ?? null;
   if (!handle.isPublic && !auth) {
+    if ((c as any).get("__authProbe") === "unavailable") {
+      return c.json(
+        { error: "Auth temporarily unavailable", reason: "jwt_secret_unavailable" },
+        503,
+        { "X-1tube-Auth-Unavailable": "1" },
+      );
+    }
     return c.json({ error: "Unauthorized" }, 401);
   }
 

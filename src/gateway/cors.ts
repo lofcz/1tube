@@ -36,7 +36,8 @@ const DEFAULT_ALLOWED_METHODS = "POST, GET, OPTIONS, PUT, PATCH, DELETE";
 // its HMR respawn is still in flight; `retry-after` lets clients
 // honour the gateway's suggested backoff. These are always exposed —
 // operator config only ADDS to them.
-const INTERNAL_EXPOSED_HEADERS = "x-1tube-warming, x-1tube-stale, retry-after";
+const INTERNAL_EXPOSED_HEADERS =
+  "x-1tube-warming, x-1tube-stale, x-1tube-auth-unavailable, retry-after";
 
 interface CorsConfig {
   /** "*" means allow any. Empty array means CORS disabled. */

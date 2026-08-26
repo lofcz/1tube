@@ -53,7 +53,7 @@ function getSecret(): string {
     verifyCache.clear();
     if (!current && !_warnedNoSecret) {
       console.warn(
-        "[1tube] JWT_SECRET not set — authenticated endpoints will reject all requests",
+        "[1tube] JWT_SECRET not set — authenticated endpoints return 503, not 401",
       );
       _warnedNoSecret = true;
     }
@@ -165,6 +165,64 @@ async function verifyToken(token: string): Promise<JWTPayload | null> {
   }
 }
 
+export type RequestAuthProbe =
+  | { status: "ok"; auth: AuthContext }
+  | { status: "missing" }
+  | { status: "invalid" }
+  | { status: "unavailable" };
+
+function serviceRoleAuth(token: string): AuthContext {
+  const nowSec = Math.floor(Date.now() / 1000);
+  return {
+    userId: "",
+    email: "",
+    payload: {
+      sub: "",
+      email: "",
+      role: "service_role",
+      iss: "supabase",
+      aud: "service_role",
+      iat: nowSec,
+      // Synthetic exp matching JWTPayload shape; the token has no real
+      // expiry of its own — rotation is governed by env reload.
+      exp: nowSec + 60 * 60,
+    },
+    rawToken: token,
+  };
+}
+
+/**
+ * Probe the Authorization header without collapsing every miss into `null`.
+ *
+ * A missing `JWT_SECRET` is `unavailable` — the gateway cannot tell a live
+ * session from a bad one, so the dispatcher must return 503 rather than 401.
+ * Treating that as Unauthorized signs SPAs out during deploys.
+ */
+export async function probeRequest(req: Request): Promise<RequestAuthProbe> {
+  const token = parseBearer(req.headers.get("Authorization"));
+  if (!token) return { status: "missing" };
+
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+  if (serviceKey && token === serviceKey) {
+    return { status: "ok", auth: serviceRoleAuth(token) };
+  }
+
+  if (!getSecret()) return { status: "unavailable" };
+
+  const payload = await verifyToken(token);
+  if (!payload) return { status: "invalid" };
+
+  return {
+    status: "ok",
+    auth: {
+      userId: payload.sub,
+      email: payload.email,
+      payload,
+      rawToken: token,
+    },
+  };
+}
+
 /**
  * Validate the Authorization header and return an AuthContext, or null if invalid.
  *
@@ -187,39 +245,8 @@ async function verifyToken(token: string): Promise<JWTPayload | null> {
 export async function validateRequest(
   req: Request,
 ): Promise<AuthContext | null> {
-  const token = parseBearer(req.headers.get("Authorization"));
-  if (!token) return null;
-
-  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-  if (serviceKey && token === serviceKey) {
-    const nowSec = Math.floor(Date.now() / 1000);
-    return {
-      userId: "",
-      email: "",
-      payload: {
-        sub: "",
-        email: "",
-        role: "service_role",
-        iss: "supabase",
-        aud: "service_role",
-        iat: nowSec,
-        // Synthetic exp matching JWTPayload shape; the token has no real
-        // expiry of its own — rotation is governed by env reload.
-        exp: nowSec + 60 * 60,
-      },
-      rawToken: token,
-    };
-  }
-
-  const payload = await verifyToken(token);
-  if (!payload) return null;
-
-  return {
-    userId: payload.sub,
-    email: payload.email,
-    payload,
-    rawToken: token,
-  };
+  const probed = await probeRequest(req);
+  return probed.status === "ok" ? probed.auth : null;
 }
 
 // ---------------------------------------------------------------------------
