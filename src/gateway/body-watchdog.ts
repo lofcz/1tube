@@ -3,7 +3,7 @@
  *
  * `Deno.serve` does not enforce a per-request body-read timeout. A client that
  * dribbles bytes at a few per second can occupy a request slot for the full
- * `FUNCTION_TIMEOUT_MS` (default 150 s), starving real traffic. We don't want
+ * `FUNCTION_TIMEOUT_MS` (default 800 s), starving real traffic. We don't want
  * to *cap total body read time* — large but fast uploads are fine — we want
  * to detect *stalled progress*: too long a gap between consecutive chunks.
  *

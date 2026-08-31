@@ -426,8 +426,11 @@ function parseArgs(): CliOpts {
   // Normalized at the end via setRoutePrefix(); kept raw here so an
   // explicit CLI flag can still override the env var.
   let routePrefix = Deno.env.get("1TUBE_ROUTE_PREFIX") || "/functions/v1";
+  // Matches Vercel Fluid's maxDuration cap. Per-function `serve({ timeoutMs })`
+  // / `1tube.json` still override. `FUNCTION_TIMEOUT_MS` / `--timeout` win last.
+  const DEFAULT_FUNCTION_TIMEOUT_MS = 800_000;
   let defaultTimeoutMs = parseInt(
-    Deno.env.get("FUNCTION_TIMEOUT_MS") || "150000",
+    Deno.env.get("FUNCTION_TIMEOUT_MS") || String(DEFAULT_FUNCTION_TIMEOUT_MS),
     10,
   );
   const bodyLimitMb = parseFloat(Deno.env.get("1TUBE_BODY_LIMIT_MB") || "30");
