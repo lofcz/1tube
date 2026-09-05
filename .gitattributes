@@ -1,0 +1,19 @@
+# Normalize line endings: LF in the repo, CRLF in the working tree by default.
+* text=auto eol=crlf
+
+# Shell scripts must stay LF so they run on POSIX shells.
+*.sh text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.zip binary
+*.gz binary
+*.dll binary
+*.exe binary
+*.pdb binary
