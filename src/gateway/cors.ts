@@ -27,17 +27,21 @@
 
 import type { Context, Next } from "npm:hono@4";
 
+// `x-deployment-id` is Vercel's Skew Protection request pin; a cross-origin
+// client that sends it needs the preflight to allow it, otherwise the browser
+// blocks the call before Vercel's edge ever sees the pin.
 const DEFAULT_ALLOWED_HEADERS =
-  "authorization, x-client-info, apikey, content-type, x-application-name, user-agent";
+  "authorization, x-client-info, apikey, content-type, x-application-name, user-agent, x-deployment-id";
 const DEFAULT_ALLOWED_METHODS = "POST, GET, OPTIONS, PUT, PATCH, DELETE";
 // Headers browser JS must be able to read on cross-origin responses.
 // `x-1tube-warming` drives the "backend is warming up" overlay;
 // `x-1tube-stale` marks a response served by a pre-edit worker while
 // its HMR respawn is still in flight; `retry-after` lets clients
-// honour the gateway's suggested backoff. These are always exposed —
-// operator config only ADDS to them.
+// honour the gateway's suggested backoff; `x-deployment-id` is the
+// serving deployment echoed by the Vercel wrapper so clients can detect
+// version skew. These are always exposed — operator config only ADDS to them.
 const INTERNAL_EXPOSED_HEADERS =
-  "x-1tube-warming, x-1tube-stale, x-1tube-auth-unavailable, retry-after";
+  "x-1tube-warming, x-1tube-stale, x-1tube-auth-unavailable, retry-after, x-deployment-id";
 
 interface CorsConfig {
   /** "*" means allow any. Empty array means CORS disabled. */

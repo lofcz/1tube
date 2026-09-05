@@ -222,6 +222,30 @@ Deno.test("cors: default expose-headers carries the internal x-1tube set", async
   assertEquals(expose.includes("x-1tube-warming"), true);
   assertEquals(expose.includes("x-1tube-stale"), true);
   assertEquals(expose.includes("retry-after"), true);
+  assertEquals(expose.includes("x-deployment-id"), true);
+});
+
+Deno.test("cors: default allow-headers admits the Vercel Skew Protection pin", async () => {
+  resetTubeEnv();
+  Deno.env.set("1TUBE_CORS_ORIGIN", "app.example.com");
+  const { corsMiddleware } = await freshCors();
+  const app = appWith(corsMiddleware);
+  const res = await app.fetch(
+    new Request("http://localhost/x", {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://app.example.com",
+        "Access-Control-Request-Headers": "x-deployment-id",
+      },
+    }),
+  );
+  assertEquals(res.status, 204);
+  const allow = (res.headers.get("access-control-allow-headers") ?? "")
+    .toLowerCase();
+  assertEquals(allow.includes("x-deployment-id"), true);
+  // The historical defaults are still there.
+  assertEquals(allow.includes("authorization"), true);
+  assertEquals(allow.includes("apikey"), true);
 });
 
 Deno.test("cors: 1TUBE_CORS_ALLOW_HEADERS / _METHODS override the defaults", async () => {

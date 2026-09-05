@@ -32,9 +32,23 @@
  *     handler, and streams the Web `Response` back to the Node `res` (so SSE /
  *     NDJSON / AI token streaming keep flowing incrementally).
  *
+ *  5. **Skew Protection marker.** When Vercel provides `VERCEL_DEPLOYMENT_ID`
+ *     (system env vars enabled), every response carries it as
+ *     `x-deployment-id` unless the function already set that header. A client
+ *     that bakes its own deployment id at build time (see `1tube build
+ *     --target vercel --deployment-id`) compares the two to detect skew — e.g.
+ *     when its pinned deployment aged out and Vercel fell through to the
+ *     latest one — and can prompt a reload instead of failing mid-session.
+ *
  * The banner intentionally avoids the workerd console-capture marker: on Vercel
  * `console.*` is already routed to the function's logs.
  */
+
+/**
+ * Response header carrying the serving deployment's id. Same name Vercel uses
+ * for the request-side pin so one constant covers both directions on clients.
+ */
+export const DEPLOYMENT_ID_HEADER = "x-deployment-id";
 
 /**
  * Node builtin module names. Imports of these (bare or `node:`-prefixed) are
@@ -264,17 +278,30 @@ function __1tubeToWebRequest(req) {
   return new Request(url, init);
 }
 
+const __1tubeDeploymentIdHeader = ${JSON.stringify(DEPLOYMENT_ID_HEADER)};
+
 async function __1tubeWriteWebResponse(res, response) {
   res.statusCode = response.status;
   const setCookie = typeof response.headers.getSetCookie === "function"
     ? response.headers.getSetCookie()
     : [];
+  let hasDeploymentIdHeader = false;
   response.headers.forEach((value, key) => {
-    if (key.toLowerCase() === "set-cookie") return;
+    const lower = key.toLowerCase();
+    if (lower === "set-cookie") return;
+    if (lower === __1tubeDeploymentIdHeader) hasDeploymentIdHeader = true;
     try { res.setHeader(key, value); } catch (_e) { /* ignore invalid header */ }
   });
   if (setCookie.length > 0) {
     try { res.setHeader("set-cookie", setCookie); } catch (_e) { /* ignore */ }
+  }
+  // Skew Protection: advertise the serving deployment so clients can compare
+  // it with the id they were built against. Function-set values win.
+  if (!hasDeploymentIdHeader) {
+    const deploymentId = __1tubeProcessEnv().VERCEL_DEPLOYMENT_ID;
+    if (typeof deploymentId === "string" && deploymentId.length > 0) {
+      try { res.setHeader(__1tubeDeploymentIdHeader, deploymentId); } catch (_e) { /* ignore */ }
+    }
   }
   if (!response.body) {
     res.end();

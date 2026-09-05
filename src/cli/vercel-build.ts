@@ -37,6 +37,14 @@
  * Each function is fully standalone — there is no gateway shared runtime on
  * Vercel, so modules like `_shared/profile-cache.ts` are bundled inline rather
  * than turned into RPC stubs.
+ *
+ * Skew Protection: a prebuilt deployment (`vercel deploy --prebuilt`) only gets
+ * a stable, client-knowable deployment ID when `config.json` carries a custom
+ * top-level `deploymentId` (Vercel validates it: ≤ 32 chars, `[A-Za-z0-9_-]`).
+ * Pass `--deployment-id <id>` (or `1TUBE_VERCEL_DEPLOYMENT_ID`) and this command
+ * writes it there; bake the SAME id into the frontend so its `fetch()` calls
+ * can pin themselves via `x-deployment-id` / `?dpl=`. See
+ * `docs/vercel-skew-protection.md`.
  */
 
 import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
@@ -92,6 +100,13 @@ export interface VercelBuildOptions {
   defaultMaxDuration?: number;
   /** Hard cap (seconds) applied to any derived maxDuration. */
   maxDurationCap?: number;
+  /**
+   * Custom Vercel deployment ID for Skew Protection on prebuilt deployments.
+   * Written as the top-level `deploymentId` of `config.json`. Must satisfy
+   * {@link validateDeploymentId}. When omitted an existing `deploymentId` in
+   * the merged `config.json` is left untouched.
+   */
+  deploymentId?: string;
   /** Progress callback for CLI/status reporting. */
   onProgress?: (event: VercelBuildProgress) => void;
 }
@@ -116,6 +131,8 @@ export type VercelBuildProgress =
     configPath: string;
     routes: number;
     created: boolean;
+    /** Deployment ID written into `config.json`, when one was requested. */
+    deploymentId?: string;
   }
   | { phase: "capture-warning"; message: string };
 
@@ -151,7 +168,40 @@ export interface VercelBuildResult {
   configPath: string;
   /** Number of per-function sub-path routes written into `config.json`. */
   subpathRoutes: number;
+  /** Custom deployment ID written into `config.json`, if one was requested. */
+  deploymentId?: string;
   durationMs: number;
+}
+
+/** Vercel's limit for a custom `deploymentId` (see `vercel build` validation). */
+const MAX_DEPLOYMENT_ID_LENGTH = 32;
+const DEPLOYMENT_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Validate a custom Skew Protection deployment ID the way `vercel build` /
+ * `vercel deploy --prebuilt` do (`INVALID_DEPLOYMENT_ID`): non-empty, at most
+ * {@link MAX_DEPLOYMENT_ID_LENGTH} characters, `[A-Za-z0-9_-]` only. Returns
+ * the trimmed id; throws a descriptive error otherwise so a bad CI variable
+ * fails the build locally instead of at upload time.
+ */
+export function validateDeploymentId(raw: string): string {
+  const id = raw.trim();
+  if (id.length === 0) {
+    throw new Error("1tube vercel-build: --deployment-id must not be empty");
+  }
+  if (id.length > MAX_DEPLOYMENT_ID_LENGTH) {
+    throw new Error(
+      `1tube vercel-build: deployment id "${id}" exceeds ${MAX_DEPLOYMENT_ID_LENGTH} characters ` +
+        `(${id.length}); Vercel rejects longer custom deployment ids`,
+    );
+  }
+  if (!DEPLOYMENT_ID_PATTERN.test(id)) {
+    throw new Error(
+      `1tube vercel-build: deployment id "${id}" contains invalid characters; ` +
+        `only a-z, A-Z, 0-9, "-" and "_" are allowed`,
+    );
+  }
+  return id;
 }
 
 /** `.vc-config.json` shape for a Build Output API Node function. */
@@ -212,6 +262,8 @@ interface VercelRoute {
 interface VercelOutputConfig {
   version?: number;
   routes?: VercelRoute[];
+  /** Custom Skew Protection deployment ID (read by `vercel deploy --prebuilt`). */
+  deploymentId?: string;
   [key: string]: unknown;
 }
 
@@ -237,11 +289,16 @@ interface VercelOutputConfig {
  * Existing routes are preserved; only this builder's own previously-written
  * sub-path routes (for the functions being built now) are replaced, so repeated
  * and `--only` builds stay idempotent.
+ *
+ * When `deploymentId` is given it is written as the top-level `deploymentId`
+ * (Skew Protection for prebuilt deployments); otherwise any existing value is
+ * kept as-is so an incremental `--only` build never strips it.
  */
 async function mergeSubpathRoutes(
   outDir: string,
   pathPrefix: string,
   functionNames: readonly string[],
+  deploymentId?: string,
 ): Promise<{ created: boolean; routeCount: number }> {
   const configPath = join(outDir, "config.json");
 
@@ -297,6 +354,8 @@ async function mergeSubpathRoutes(
     ...cleaned.slice(markerIdx),
   ];
 
+  if (deploymentId !== undefined) config.deploymentId = deploymentId;
+
   await ensureDir(outDir);
   await Deno.writeTextFile(
     configPath,
@@ -321,6 +380,10 @@ async function buildVercelOnce(
   const sourcemap = opts.sourcemap ?? "linked";
   const defaultMaxDuration = opts.defaultMaxDuration ?? DEFAULT_MAX_DURATION;
   const maxDurationCap = opts.maxDurationCap ?? DEFAULT_MAX_DURATION_CAP;
+  // Validate up front so a malformed id fails before any bundling work.
+  const deploymentId = opts.deploymentId !== undefined
+    ? validateDeploymentId(opts.deploymentId)
+    : undefined;
 
   let inputs = await discoverEntrypoints(functionsDir);
   if (opts.only && opts.only.length > 0) {
@@ -449,12 +512,14 @@ async function buildVercelOnce(
       outDir,
       pathPrefix,
       entries.map((e) => e.name),
+      deploymentId,
     );
     opts.onProgress?.({
       phase: "config-merge",
       configPath,
       routes: merge.routeCount,
       created: merge.created,
+      ...(deploymentId !== undefined ? { deploymentId } : {}),
     });
 
     return {
@@ -465,6 +530,7 @@ async function buildVercelOnce(
       functions: entries,
       configPath,
       subpathRoutes: merge.routeCount,
+      ...(deploymentId !== undefined ? { deploymentId } : {}),
       durationMs: performance.now() - startedAt,
     };
   } finally {
@@ -497,6 +563,8 @@ export async function buildVercel(
  *   --runtime <id>         Vercel runtime (default nodejs24.x)
  *   --max-duration <s>     fallback maxDuration seconds (default 800)
  *   --max-duration-cap <s> hard cap for maxDuration (default 800)
+ *   --deployment-id <id>   custom Skew Protection deployment id written to
+ *                          config.json (env: 1TUBE_VERCEL_DEPLOYMENT_ID)
  *   --config <path>        explicit deno.json path
  *   --no-config            skip the import map
  */
@@ -512,6 +580,11 @@ export async function runVercelBuild(args: string[]): Promise<number> {
   let defaultMaxDuration = DEFAULT_MAX_DURATION;
   let maxDurationCap = DEFAULT_MAX_DURATION_CAP;
   let configPathArg: string | undefined;
+  // Env fallback lets CI export the id once for both the frontend build and
+  // this command without threading it through every script.
+  let deploymentId: string | undefined = Deno.env.get(
+    "1TUBE_VERCEL_DEPLOYMENT_ID",
+  )?.trim() || undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -519,6 +592,10 @@ export async function runVercelBuild(args: string[]): Promise<number> {
       functionsDir = args[++i];
     } else if ((a === "--out" || a === "-o") && args[i + 1]) {
       outDir = args[++i];
+    } else if (a === "--deployment-id" && args[i + 1]) {
+      deploymentId = args[++i];
+    } else if (a.startsWith("--deployment-id=")) {
+      deploymentId = a.slice("--deployment-id=".length);
     } else if (a === "--only" && args[i + 1]) {
       only = args[++i].split(",").map((s) => s.trim()).filter((s) =>
         s.length > 0
@@ -593,9 +670,23 @@ export async function runVercelBuild(args: string[]): Promise<number> {
   }
   const configPath = configResult.configPath;
 
+  if (deploymentId !== undefined) {
+    try {
+      deploymentId = validateDeploymentId(deploymentId);
+    } catch (err) {
+      console.error(
+        `[1tube vercel-build] ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return 2;
+    }
+  }
+
   console.log(
     `[1tube vercel-build] bundling functions from ${functionsDir} → ${outDir} ` +
-      `(runtime ${runtime}, route /${normalizePrefix(pathPrefix)}/<name>)`,
+      `(runtime ${runtime}, route /${normalizePrefix(pathPrefix)}/<name>` +
+      `${deploymentId ? `, deployment id ${deploymentId}` : ""})`,
   );
   const fmt = (n: number) => {
     if (n < 1024) return `${n}B`;
@@ -616,6 +707,7 @@ export async function runVercelBuild(args: string[]): Promise<number> {
       runtime,
       defaultMaxDuration,
       maxDurationCap,
+      ...(deploymentId !== undefined ? { deploymentId } : {}),
       onProgress(event) {
         if (event.phase === "bundle-start") {
           console.log(
@@ -637,7 +729,10 @@ export async function runVercelBuild(args: string[]): Promise<number> {
           console.log(
             `[1tube vercel-build] ${
               event.created ? "wrote" : "merged"
-            } ${event.routes} sub-path route(s) into ${event.configPath}`,
+            } ${event.routes} sub-path route(s) into ${event.configPath}` +
+              (event.deploymentId
+                ? ` (deploymentId ${event.deploymentId} for Skew Protection)`
+                : ""),
           );
         } else if (event.phase === "capture-warning") {
           console.warn(`[1tube vercel-build] ${event.message}`);
@@ -685,6 +780,12 @@ Options:
                              declares no timeoutMs via serve()/1tube.json
                              (default: 800)
       --max-duration-cap <s> Hard cap for maxDuration seconds (default: 800)
+      --deployment-id <id>   Custom Vercel deployment id for Skew Protection on
+                             prebuilt deployments; written as config.json
+                             "deploymentId" (<= 32 chars, [A-Za-z0-9_-]).
+                             Bake the same id into the frontend and send it as
+                             x-deployment-id / ?dpl= on fetch() calls.
+                             Env fallback: 1TUBE_VERCEL_DEPLOYMENT_ID
       --config <path>        Explicit deno.json path for the import map.
                              Default: auto-detect cwd/deno.json[c] then
                              <functions-dir>/deno.json[c] (Supabase layout).

@@ -15,11 +15,16 @@ import {
   assertEquals,
   assertRejects,
   assertStringIncludes,
+  assertThrows,
 } from "@std/assert";
 import { join, resolve as resolvePath } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runBuild } from "../src/cli/build.ts";
-import { buildVercel } from "../src/cli/vercel-build.ts";
+import {
+  buildVercel,
+  runVercelBuild,
+  validateDeploymentId,
+} from "../src/cli/vercel-build.ts";
 
 const PROJECT_ROOT = resolvePath(
   new URL("..", import.meta.url).pathname.replace(/^\/(\w:)/, "$1"),
@@ -347,6 +352,222 @@ Deno.test(
   },
 );
 
+Deno.test("validateDeploymentId mirrors Vercel's custom deploymentId rules", () => {
+  assertEquals(validateDeploymentId(" abc-123_XYZ "), "abc-123_XYZ");
+  assertEquals(validateDeploymentId("a".repeat(32)), "a".repeat(32));
+  assertThrows(() => validateDeploymentId(""), Error, "must not be empty");
+  assertThrows(() => validateDeploymentId("   "), Error, "must not be empty");
+  assertThrows(
+    () => validateDeploymentId("a".repeat(33)),
+    Error,
+    "exceeds 32 characters",
+  );
+  assertThrows(
+    () => validateDeploymentId("has.dot"),
+    Error,
+    "invalid characters",
+  );
+  assertThrows(
+    () => validateDeploymentId("has space"),
+    Error,
+    "invalid characters",
+  );
+});
+
+Deno.test(
+  "buildVercel writes a custom deploymentId into config.json for Skew Protection",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("dpl");
+    try {
+      // Seed a frontend `vercel build` config so we prove the id is ADDED to
+      // the merged file rather than replacing it.
+      await Deno.mkdir(out, { recursive: true });
+      await Deno.writeTextFile(
+        join(out, "config.json"),
+        JSON.stringify({
+          version: 3,
+          routes: [{ handle: "filesystem" }, {
+            src: "^/((?!functions/).*)$",
+            dest: "/index.html",
+          }],
+        }),
+      );
+
+      const result = await buildVercel({
+        functionsDir: PLAYGROUND,
+        outDir: out,
+        configPath: DENO_JSON,
+        only: ["hello"],
+        sourcemap: false,
+        deploymentId: "abc1234-m1k2j3",
+      });
+      assertEquals(result.deploymentId, "abc1234-m1k2j3");
+
+      const config = await readJson(join(out, "config.json"));
+      assertEquals(config.deploymentId, "abc1234-m1k2j3");
+      assertEquals(config.version, 3);
+      const routes = config.routes as Array<Record<string, unknown>>;
+      assert(
+        routes.some((r) => r.dest === "/index.html"),
+        "existing routes must survive",
+      );
+      assert(routes.some((r) => r.dest === "/functions/v1/hello"));
+
+      // A follow-up incremental build WITHOUT the option must not strip the id
+      // (CI may build the function set in several `--only` passes).
+      const again = await buildVercel({
+        functionsDir: PLAYGROUND,
+        outDir: out,
+        configPath: DENO_JSON,
+        only: ["echo"],
+        sourcemap: false,
+      });
+      assertEquals(again.deploymentId, undefined);
+      const merged = await readJson(join(out, "config.json"));
+      assertEquals(merged.deploymentId, "abc1234-m1k2j3");
+
+      // A new id replaces the old one.
+      await buildVercel({
+        functionsDir: PLAYGROUND,
+        outDir: out,
+        configPath: DENO_JSON,
+        only: ["hello"],
+        sourcemap: false,
+        deploymentId: "next-2",
+      });
+      const replaced = await readJson(join(out, "config.json"));
+      assertEquals(replaced.deploymentId, "next-2");
+    } finally {
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
+  "buildVercel omits deploymentId from config.json when none is requested",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("nodpl");
+    try {
+      await buildVercel({
+        functionsDir: PLAYGROUND,
+        outDir: out,
+        configPath: DENO_JSON,
+        only: ["hello"],
+        sourcemap: false,
+      });
+      const config = await readJson(join(out, "config.json"));
+      assertEquals("deploymentId" in config, false);
+    } finally {
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
+  "buildVercel rejects an invalid deploymentId before bundling",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("baddpl");
+    try {
+      await assertRejects(
+        () =>
+          buildVercel({
+            functionsDir: PLAYGROUND,
+            outDir: out,
+            configPath: DENO_JSON,
+            only: ["hello"],
+            sourcemap: false,
+            deploymentId: "dpl with spaces",
+          }),
+        Error,
+        "invalid characters",
+      );
+      // Nothing was emitted — validation ran up front.
+      assertEquals(await exists(join(out, "config.json")), false);
+    } finally {
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+Deno.test(
+  "runVercelBuild accepts --deployment-id and the 1TUBE_VERCEL_DEPLOYMENT_ID env fallback",
+  TEST_OPTS,
+  async () => {
+    const outFlag = await tmpOutDir("cli-dpl-flag");
+    const outEnv = await tmpOutDir("cli-dpl-env");
+    const outBad = await tmpOutDir("cli-dpl-bad");
+    const prevEnv = Deno.env.get("1TUBE_VERCEL_DEPLOYMENT_ID");
+    Deno.env.delete("1TUBE_VERCEL_DEPLOYMENT_ID");
+    try {
+      const codeFlag = await runVercelBuild([
+        "--functions",
+        PLAYGROUND,
+        "--out",
+        outFlag,
+        "--config",
+        DENO_JSON,
+        "--only",
+        "hello",
+        "--sourcemap",
+        "none",
+        "--deployment-id=flag-id_1",
+      ]);
+      assertEquals(codeFlag, 0);
+      assertEquals(
+        (await readJson(join(outFlag, "config.json"))).deploymentId,
+        "flag-id_1",
+      );
+
+      Deno.env.set("1TUBE_VERCEL_DEPLOYMENT_ID", "env-id-2");
+      const codeEnv = await runVercelBuild([
+        "--functions",
+        PLAYGROUND,
+        "--out",
+        outEnv,
+        "--config",
+        DENO_JSON,
+        "--only",
+        "hello",
+        "--sourcemap",
+        "none",
+      ]);
+      assertEquals(codeEnv, 0);
+      assertEquals(
+        (await readJson(join(outEnv, "config.json"))).deploymentId,
+        "env-id-2",
+      );
+
+      // Explicit flag beats the env, and a bad value is a usage error (2)
+      // rather than a late upload failure.
+      const codeBad = await runVercelBuild([
+        "--functions",
+        PLAYGROUND,
+        "--out",
+        outBad,
+        "--config",
+        DENO_JSON,
+        "--only",
+        "hello",
+        "--sourcemap",
+        "none",
+        "--deployment-id",
+        "x".repeat(33),
+      ]);
+      assertEquals(codeBad, 2);
+      assertEquals(await exists(join(outBad, "config.json")), false);
+    } finally {
+      if (prevEnv === undefined) Deno.env.delete("1TUBE_VERCEL_DEPLOYMENT_ID");
+      else Deno.env.set("1TUBE_VERCEL_DEPLOYMENT_ID", prevEnv);
+      for (const d of [outFlag, outEnv, outBad]) {
+        await Deno.remove(d, { recursive: true }).catch(() => {});
+      }
+    }
+  },
+);
+
 Deno.test(
   "buildVercel output runs as a Vercel Node handler (Deno.serve capture + req/res bridge)",
   TEST_OPTS,
@@ -426,6 +647,119 @@ Deno.test(
         delete (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
       }
       await Deno.remove(out, { recursive: true }).catch(() => {});
+    }
+  },
+);
+
+/** Minimal Node `res` double for driving an emitted Vercel handler. */
+function mockNodeRes() {
+  const headers: Record<string, string | string[]> = {};
+  const chunks: Uint8Array[] = [];
+  const res = {
+    statusCode: 200,
+    headersSent: false,
+    setHeader(k: string, v: string | string[]) {
+      headers[k.toLowerCase()] = v;
+    },
+    write(chunk: Uint8Array | string) {
+      chunks.push(
+        typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk,
+      );
+      return true;
+    },
+    once(_event: string, _cb: () => void) {},
+    end(chunk?: Uint8Array | string) {
+      if (chunk !== undefined) this.write(chunk);
+    },
+  };
+  return { res, headers, chunks };
+}
+
+Deno.test(
+  "Vercel handler echoes VERCEL_DEPLOYMENT_ID as x-deployment-id unless the function set one",
+  TEST_OPTS,
+  async () => {
+    const out = await tmpOutDir("dpl-hdr");
+    // A fixture that pins its own id; must not be overridden by the wrapper.
+    const fixtures = await Deno.makeTempDir({ prefix: "1tube-vercel-dplfx-" });
+    await Deno.mkdir(join(fixtures, "pinned"));
+    await Deno.writeTextFile(
+      join(fixtures, "pinned", "index.ts"),
+      `Deno.serve(() =>
+  new Response("pinned", { headers: { "x-deployment-id": "from-fn" } }));
+`,
+    );
+    const origServe = (globalThis as { Deno: { serve: unknown } }).Deno.serve;
+    const hadEdge = "EdgeRuntime" in globalThis;
+    const origEdge = (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
+    const prevId = Deno.env.get("VERCEL_DEPLOYMENT_ID");
+    try {
+      const hello = await buildVercel({
+        functionsDir: PLAYGROUND,
+        outDir: out,
+        configPath: DENO_JSON,
+        only: ["hello"],
+        sourcemap: false,
+      });
+      const helloMod = await import(
+        pathToFileURL(
+          join(hello.functions[0].funcDir, hello.functions[0].handler),
+        )
+          .href
+      );
+      const helloHandler = helloMod.default as (
+        req: unknown,
+        res: unknown,
+      ) => Promise<void>;
+      const req = { method: "GET", url: "/", headers: { host: "localhost" } };
+
+      // No deployment id in the environment → header absent (local / non-Vercel).
+      Deno.env.delete("VERCEL_DEPLOYMENT_ID");
+      const plain = mockNodeRes();
+      await helloHandler(req, plain.res);
+      assertEquals(plain.headers["x-deployment-id"], undefined);
+
+      // Vercel-provided id → echoed on the response.
+      Deno.env.set("VERCEL_DEPLOYMENT_ID", "dpl_abc123");
+      const tagged = mockNodeRes();
+      await helloHandler(req, tagged.res);
+      assertEquals(tagged.headers["x-deployment-id"], "dpl_abc123");
+      assertStringIncludes(
+        String(tagged.headers["content-type"] ?? ""),
+        "application/json",
+      );
+
+      // A function that sets the header itself wins over the wrapper.
+      const pinned = await buildVercel({
+        functionsDir: fixtures,
+        outDir: out,
+        configPath: DENO_JSON,
+        only: ["pinned"],
+        sourcemap: false,
+      });
+      const pinnedMod = await import(
+        pathToFileURL(
+          join(pinned.functions[0].funcDir, pinned.functions[0].handler),
+        ).href
+      );
+      const pinnedHandler = pinnedMod.default as (
+        req: unknown,
+        res: unknown,
+      ) => Promise<void>;
+      const own = mockNodeRes();
+      await pinnedHandler(req, own.res);
+      assertEquals(own.headers["x-deployment-id"], "from-fn");
+    } finally {
+      if (prevId === undefined) Deno.env.delete("VERCEL_DEPLOYMENT_ID");
+      else Deno.env.set("VERCEL_DEPLOYMENT_ID", prevId);
+      (globalThis as { Deno: { serve: unknown } }).Deno.serve = origServe;
+      if (hadEdge) {
+        (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime = origEdge;
+      } else {
+        delete (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
+      }
+      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await Deno.remove(fixtures, { recursive: true }).catch(() => {});
     }
   },
 );
