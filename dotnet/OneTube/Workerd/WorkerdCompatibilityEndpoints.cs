@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
@@ -14,13 +15,13 @@ public static class WorkerdCompatibilityEndpoints
         var prefix = opts.RoutePrefix.TrimEnd('/');
         var group = endpoints.MapGroup($"{prefix}/workerd/compatibility");
 
-        group.MapGet("/", (WorkerdCompatibilityStore store) =>
+        group.MapGet("/", ([FromServices] WorkerdCompatibilityStore store) =>
             Results.Ok(store.Snapshot()));
 
-        group.MapGet("/status", (WorkerdCompatibilityHotSwapWatcher watcher) =>
+        group.MapGet("/status", ([FromServices] WorkerdCompatibilityHotSwapWatcher watcher) =>
             Results.Ok(watcher.GetStatus()));
 
-        group.MapPut("/", async (HttpContext ctx, WorkerdCompatibilityStore store, WorkerdCompatibilityHotSwapWatcher watcher) =>
+        group.MapPut("/", async (HttpContext ctx, [FromServices] WorkerdCompatibilityStore store, [FromServices] WorkerdCompatibilityHotSwapWatcher watcher) =>
         {
             WorkerdCompatibilitySettings? body;
             try { body = await ctx.Request.ReadFromJsonAsync<WorkerdCompatibilitySettings>(); }
@@ -43,7 +44,7 @@ public static class WorkerdCompatibilityEndpoints
             catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
         }).DisableAntiforgery();
 
-        group.MapPost("/reload", (WorkerdCompatibilityStore store, WorkerdCompatibilityHotSwapWatcher watcher) =>
+        group.MapPost("/reload", ([FromServices] WorkerdCompatibilityStore store, [FromServices] WorkerdCompatibilityHotSwapWatcher watcher) =>
         {
             store.Reload();
             return Results.Accepted(value: new { reloaded = true, apply = watcher.GetStatus() });

@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Routing;
 
 namespace OneTube.Logs;
@@ -31,7 +32,7 @@ public static class LogsEndpoints
         // ── GET /invocations ──────────────────────────────────────
         group.MapGet("/invocations", async (
             HttpContext ctx,
-            IOneTubeLogReader reader,
+            [FromServices] IOneTubeLogReader reader,
             CancellationToken ct) =>
         {
             var q = ctx.Request.Query;
@@ -60,7 +61,7 @@ public static class LogsEndpoints
         // ── GET /invocations/{id} ─────────────────────────────────
         group.MapGet("/invocations/{id}", async (
             string id,
-            IOneTubeLogReader reader,
+            [FromServices] IOneTubeLogReader reader,
             CancellationToken ct) =>
         {
             var detail = await reader.GetInvocationAsync(id, ct);
@@ -72,7 +73,7 @@ public static class LogsEndpoints
         // ── GET /search ───────────────────────────────────────────
         group.MapGet("/search", async (
             HttpContext ctx,
-            IOneTubeLogReader reader,
+            [FromServices] IOneTubeLogReader reader,
             CancellationToken ct) =>
         {
             var q = ctx.Request.Query;
@@ -94,7 +95,7 @@ public static class LogsEndpoints
         // ── GET /tail ─────────────────────────────────────────────
         group.MapGet("/tail", async (
             HttpContext ctx,
-            IOneTubeLogReader reader,
+            [FromServices] IOneTubeLogReader reader,
             CancellationToken ct) =>
         {
             var afterId = TryLong(ctx.Request.Query["afterId"].FirstOrDefault()) ?? 0;
@@ -108,7 +109,7 @@ public static class LogsEndpoints
         });
 
         // ── GET /functions ────────────────────────────────────────
-        group.MapGet("/functions", async (IOneTubeLogReader reader, CancellationToken ct) =>
+        group.MapGet("/functions", async ([FromServices] IOneTubeLogReader reader, CancellationToken ct) =>
             Results.Ok(new { functions = await reader.GetFunctionNamesAsync(ct) }));
 
         return group;
