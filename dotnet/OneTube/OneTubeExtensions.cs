@@ -1,3 +1,4 @@
+using System.Reflection;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -271,16 +272,29 @@ public static class OneTubeExtensions
         this WebApplication app,
         string pathPrefix = "/functions/v1")
     {
-        // Do not resolve IHttpForwarder from DI. Hosts that also
-        // reference Yarp.ReverseProxy (or load it into a second
-        // AssemblyLoadContext — IIS in-process is the usual case)
-        // end up with two IHttpForwarder identities. AddHttpForwarder
-        // registers one; GetRequiredService looks up the other and
-        // startup dies. Build the forwarder from the YARP assembly
-        // this library compiled against so the type is unambiguous.
-        var forwarder = CreateHttpForwarder(app.Services);
-        var destinationProvider = app.Services.GetRequiredService<IGatewayDestinationProvider>();
         var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("OneTube.Proxy");
+
+        // Never take the host down. A missing YARP registration or a
+        // second AssemblyLoadContext (IIS in-process) used to throw
+        // here and kill the entire ASP.NET app. Skip the proxy
+        // routes instead — the rest of the site must still boot.
+        IHttpForwarder forwarder;
+        try
+        {
+            forwarder = CreateHttpForwarder(app.Services);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "[1tube] HTTP forwarder could not be created; proxy routes not mapped");
+            return app;
+        }
+
+        var destinationProvider = app.Services.GetService<IGatewayDestinationProvider>();
+        if (destinationProvider is null)
+        {
+            logger.LogError("[1tube] IGatewayDestinationProvider is not registered; call AddOneTube before MapOneTube. Proxy routes not mapped.");
+            return app;
+        }
 
         var httpClient = new HttpMessageInvoker(new SocketsHttpHandler
         {
@@ -354,14 +368,28 @@ public static class OneTubeExtensions
             return existing;
         }
 
-        // Isolated container so AddHttpForwarder binds IHttpForwarder from
-        // the YARP assembly OneTube compiled against — not whatever copy
-        // the host (or IIS) loaded. Keep the provider; HttpForwarder is a
-        // singleton that outlives this call.
-        var isolated = new ServiceCollection();
-        isolated.AddSingleton(services.GetRequiredService<ILoggerFactory>());
-        isolated.AddSingleton(services.GetService<TimeProvider>() ?? TimeProvider.System);
-        isolated.AddHttpForwarder();
-        return isolated.BuildServiceProvider().GetRequiredService<IHttpForwarder>();
+        // HttpForwarder is internal. Its ctor is
+        // (ILogger<HttpForwarder>, TimeProvider) — a plain ILogger
+        // does not bind. Construct Logger<HttpForwarder> from the
+        // host factory, then new the forwarder from the YARP
+        // assembly this library compiled against so IIS loading a
+        // second Yarp.ReverseProxy copy cannot poison DI lookup.
+        var httpForwarderType = typeof(IHttpForwarder).Assembly.GetType(
+            "Yarp.ReverseProxy.Forwarder.HttpForwarder")
+            ?? throw new InvalidOperationException(
+                "Yarp.ReverseProxy.Forwarder.HttpForwarder was not found.");
+
+        var factory = services.GetRequiredService<ILoggerFactory>();
+        var typedLogger = Activator.CreateInstance(
+            typeof(Logger<>).MakeGenericType(httpForwarderType),
+            factory)!;
+        var timeProvider = services.GetService<TimeProvider>() ?? TimeProvider.System;
+
+        return (IHttpForwarder)Activator.CreateInstance(
+            httpForwarderType,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            args: [typedLogger, timeProvider],
+            culture: null)!;
     }
 }
