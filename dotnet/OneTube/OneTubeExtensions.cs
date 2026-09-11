@@ -271,7 +271,14 @@ public static class OneTubeExtensions
         this WebApplication app,
         string pathPrefix = "/functions/v1")
     {
-        var forwarder = app.Services.GetRequiredService<IHttpForwarder>();
+        // Do not resolve IHttpForwarder from DI. Hosts that also
+        // reference Yarp.ReverseProxy (or load it into a second
+        // AssemblyLoadContext — IIS in-process is the usual case)
+        // end up with two IHttpForwarder identities. AddHttpForwarder
+        // registers one; GetRequiredService looks up the other and
+        // startup dies. Build the forwarder from the YARP assembly
+        // this library compiled against so the type is unambiguous.
+        var forwarder = CreateHttpForwarder(app.Services);
         var destinationProvider = app.Services.GetRequiredService<IGatewayDestinationProvider>();
         var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("OneTube.Proxy");
 
@@ -337,5 +344,23 @@ public static class OneTubeExtensions
         });
 
         return app;
+    }
+
+    private static IHttpForwarder CreateHttpForwarder(IServiceProvider services)
+    {
+        var existing = services.GetService<IHttpForwarder>();
+        if (existing is not null)
+        {
+            return existing;
+        }
+
+        var implementation = typeof(IHttpForwarder).Assembly.GetType(
+            "Yarp.ReverseProxy.Forwarder.HttpForwarder")
+            ?? throw new InvalidOperationException(
+                "Yarp.ReverseProxy.Forwarder.HttpForwarder was not found in the YARP assembly referenced by OneTube.");
+
+        var logger = services.GetRequiredService<ILoggerFactory>().CreateLogger(implementation);
+        var timeProvider = services.GetService<TimeProvider>() ?? TimeProvider.System;
+        return (IHttpForwarder)Activator.CreateInstance(implementation, logger, timeProvider)!;
     }
 }

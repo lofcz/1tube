@@ -30,7 +30,7 @@
       isolation for CI and `dotnet pack`.
     -->
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="Yarp.ReverseProxy" Version="2.*" />
+    <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
     <!--
       Read-only access to the gateway's invocation log store
       (SQLite + FTS5). The gateway owns the schema and migrations;
