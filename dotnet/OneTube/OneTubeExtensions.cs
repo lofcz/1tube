@@ -354,13 +354,14 @@ public static class OneTubeExtensions
             return existing;
         }
 
-        var implementation = typeof(IHttpForwarder).Assembly.GetType(
-            "Yarp.ReverseProxy.Forwarder.HttpForwarder")
-            ?? throw new InvalidOperationException(
-                "Yarp.ReverseProxy.Forwarder.HttpForwarder was not found in the YARP assembly referenced by OneTube.");
-
-        var logger = services.GetRequiredService<ILoggerFactory>().CreateLogger(implementation);
-        var timeProvider = services.GetService<TimeProvider>() ?? TimeProvider.System;
-        return (IHttpForwarder)Activator.CreateInstance(implementation, logger, timeProvider)!;
+        // Isolated container so AddHttpForwarder binds IHttpForwarder from
+        // the YARP assembly OneTube compiled against — not whatever copy
+        // the host (or IIS) loaded. Keep the provider; HttpForwarder is a
+        // singleton that outlives this call.
+        var isolated = new ServiceCollection();
+        isolated.AddSingleton(services.GetRequiredService<ILoggerFactory>());
+        isolated.AddSingleton(services.GetService<TimeProvider>() ?? TimeProvider.System);
+        isolated.AddHttpForwarder();
+        return isolated.BuildServiceProvider().GetRequiredService<IHttpForwarder>();
     }
 }
