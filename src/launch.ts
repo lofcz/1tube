@@ -86,7 +86,7 @@ Serve options (everything else is forwarded to the gateway):
   --refresh-deps                Drop the managed store's lockfile for a clean re-resolve
   --config <path>               Import map functions use (import_map.json, or deno.json[c])
   --env-file[=<path>]           Env file loaded into the gateway (repeatable)
-  --minimum-dependency-age <n>  Minimum release age for managed installs (s, or 30m/24h/7d)
+  --minimum-dependency-age <n>  Minimum release age for managed installs (s, or 30m/24h/7d; default 0)
   --no-pin                      Ignore host node_modules; resolve npm: only via the managed store
   --no-dep-watch                Don't restart on dependency/config changes
 `);

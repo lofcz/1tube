@@ -1,2 +1,6 @@
 [test]
 root = "./tests"
+
+[install]
+# Install new releases immediately (Bun otherwise holds back fresh versions).
+minimumReleaseAge = 0
