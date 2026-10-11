@@ -5,43 +5,43 @@
  */
 
 import * as node from "node:test";
-import type { DescribeFunction, Hook, TestFn, TestFunction, TestOptions, TestRuntime } from "./api.ts";
+import type { TestRuntime } from "./api.ts";
+import { createTestApi } from "./core.ts";
 
 export * from "./assert.ts";
+export { createMock, deepEquals, expect, isMock, spyOn } from "./expect.ts";
 export type * from "./api.ts";
+export type { Assertion, AsymmetricMatcher, Expect, Matchers, Mock, MockResult, MockState } from "./expect.ts";
 
 export const runtime: TestRuntime = "node";
 
 // node:test passes a context (and a `done` callback to 2-arity functions);
 // the 1tube contract has neither, so wrap to keep the arity at zero.
-const register = (name: string, fn: TestFn, options: TestOptions) =>
-  node.test(name, { timeout: options.timeout, skip: options.skip, only: options.only }, async () => {
-    await fn();
-  });
+const wrap = (fn: () => unknown) => async () => {
+  await fn();
+};
 
-export const test: TestFunction = Object.assign(
-  (name: string, fn: TestFn, options: TestOptions = {}) => void register(name, fn, options),
-  {
-    skip: (name: string, fn: TestFn, options: TestOptions = {}) => void register(name, fn, { ...options, skip: true }),
-    only: (name: string, fn: TestFn, options: TestOptions = {}) => void register(name, fn, { ...options, only: true }),
-    todo: (name: string) => void node.test(name, { todo: true }),
+export const { test, it, describe, beforeAll, afterAll, beforeEach, afterEach, mock } = createTestApi({
+  test: (name, fn, { timeout, skip, only }) => void node.test(name, { timeout, skip, only }, wrap(fn)),
+  todo: (name) => void node.test(name, { todo: true }),
+  describe: (name, fn, mode) => void node.describe(name, { skip: mode === "skip", only: mode === "only" }, fn),
+  beforeAll: (fn) => node.before(wrap(fn)),
+  afterAll: (fn) => node.after(wrap(fn)),
+  beforeEach: (fn) => node.beforeEach(wrap(fn)),
+  afterEach: (fn) => node.afterEach(wrap(fn)),
+  mockModule: (specifier, factory) => {
+    const moduleMock = (node.mock as { module?: (s: string, o: object) => unknown }).module;
+    if (typeof moduleMock !== "function") {
+      throw new Error("mock.module on node:test needs `node --test --experimental-test-module-mocks`");
+    }
+    const exports = factory();
+    if (exports && typeof (exports as { then?: unknown }).then === "function") {
+      throw new Error("mock.module on node:test needs a synchronous factory");
+    }
+    const { default: defaultExport, ...namedExports } = exports;
+    moduleMock.call(node.mock, specifier, {
+      namedExports,
+      ...("default" in exports ? { defaultExport } : {}),
+    });
   },
-);
-
-export const describe: DescribeFunction = Object.assign(
-  (name: string, fn: () => void) => void node.describe(name, fn),
-  {
-    skip: (name: string, fn: () => void) => void node.describe(name, { skip: true }, fn),
-    only: (name: string, fn: () => void) => void node.describe(name, { only: true }, fn),
-  },
-);
-
-const hook = (register: (fn: () => Promise<void>) => void): Hook => (fn) =>
-  register(async () => {
-    await fn();
-  });
-
-export const beforeAll: Hook = hook((fn) => node.before(fn));
-export const afterAll: Hook = hook((fn) => node.after(fn));
-export const beforeEach: Hook = hook((fn) => node.beforeEach(fn));
-export const afterEach: Hook = hook((fn) => node.afterEach(fn));
+});

@@ -97,7 +97,7 @@ export function format(value: unknown): string {
 }
 
 /** Line-level diff of two formatted values (`-` actual, `+` expected). */
-function diff(actual: unknown, expected: unknown): string {
+export function formatDiff(actual: unknown, expected: unknown): string {
   const a = format(actual).split("\n");
   const b = format(expected).split("\n");
   // LCS over lines: values printed for assertion failures are small.
@@ -233,7 +233,7 @@ export function assertFalse(expr: unknown, msg = ""): void {
 export function assertEquals<T>(actual: T, expected: T, msg?: string): void {
   if (equal(actual, expected)) return;
   throw new AssertionError(
-    `Values are not equal${suffix(msg)}\n\n    [Diff] Actual / Expected\n\n${diff(actual, expected)}\n`,
+    `Values are not equal${suffix(msg)}\n\n    [Diff] Actual / Expected\n\n${formatDiff(actual, expected)}\n`,
   );
 }
 
@@ -249,7 +249,7 @@ export function assertStrictEquals<T>(actual: unknown, expected: T, msg?: string
   throw new AssertionError(
     sameRendering
       ? `Values have the same structure but are not reference-equal${suffix(msg)}\n\n    ${format(actual).replace(/\n/g, "\n    ")}\n`
-      : `Values are not strictly equal${suffix(msg)}\n\n    [Diff] Actual / Expected\n\n${diff(actual, expected)}\n`,
+      : `Values are not strictly equal${suffix(msg)}\n\n    [Diff] Actual / Expected\n\n${formatDiff(actual, expected)}\n`,
   );
 }
 

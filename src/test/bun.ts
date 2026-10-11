@@ -4,35 +4,31 @@
  */
 
 import * as bun from "bun:test";
-import type { DescribeFunction, Hook, TestFn, TestFunction, TestOptions, TestRuntime } from "./api.ts";
+import { fileURLToPath } from "node:url";
+import type { TestRuntime } from "./api.ts";
+import { createTestApi } from "./core.ts";
 
 export * from "./assert.ts";
+export { createMock, deepEquals, expect, isMock, spyOn } from "./expect.ts";
 export type * from "./api.ts";
+export type { Assertion, AsymmetricMatcher, Expect, Matchers, Mock, MockResult, MockState } from "./expect.ts";
 
 export const runtime: TestRuntime = "bun";
 
-export const test: TestFunction = Object.assign(
-  (name: string, fn: TestFn, options: TestOptions = {}) => {
-    if (options.skip) bun.test.skip(name, fn, options.timeout);
-    else if (options.only) bun.test.only(name, fn, options.timeout);
-    else bun.test(name, fn, options.timeout);
+export const { test, it, describe, beforeAll, afterAll, beforeEach, afterEach, mock } = createTestApi({
+  test: (name, fn, { timeout, skip, only }) => {
+    if (skip) bun.test.skip(name, fn, timeout);
+    else if (only) bun.test.only(name, fn, timeout);
+    else bun.test(name, fn, timeout);
   },
-  {
-    skip: (name: string, fn: TestFn, options: TestOptions = {}) => bun.test.skip(name, fn, options.timeout),
-    only: (name: string, fn: TestFn, options: TestOptions = {}) => bun.test.only(name, fn, options.timeout),
-    todo: (name: string) => bun.test.todo(name, () => {}),
+  todo: (name) => bun.test.todo(name, () => {}),
+  describe: (name, fn, mode) =>
+    mode === "skip" ? bun.describe.skip(name, fn) : mode === "only" ? bun.describe.only(name, fn) : bun.describe(name, fn),
+  beforeAll: (fn) => bun.beforeAll(fn),
+  afterAll: (fn) => bun.afterAll(fn),
+  beforeEach: (fn) => bun.beforeEach(fn),
+  afterEach: (fn) => bun.afterEach(fn),
+  mockModule: (specifier, factory) => {
+    void bun.mock.module(specifier.startsWith("file:") ? fileURLToPath(specifier) : specifier, factory);
   },
-);
-
-export const describe: DescribeFunction = Object.assign(
-  (name: string, fn: () => void) => bun.describe(name, fn),
-  {
-    skip: (name: string, fn: () => void) => bun.describe.skip(name, fn),
-    only: (name: string, fn: () => void) => bun.describe.only(name, fn),
-  },
-);
-
-export const beforeAll: Hook = (fn) => bun.beforeAll(fn);
-export const afterAll: Hook = (fn) => bun.afterAll(fn);
-export const beforeEach: Hook = (fn) => bun.beforeEach(fn);
-export const afterEach: Hook = (fn) => bun.afterEach(fn);
+});
