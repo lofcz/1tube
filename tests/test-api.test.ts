@@ -416,3 +416,25 @@ test("b sees the real module", () => expect(flag()).toBe("real"));
   const leaky = run("--no-isolate", "./functions/a", "./functions/b");
   expect(leaky.stdout + leaky.stderr).toContain("1 fail");
 });
+
+test("hooks accept a timeout on both runners", async () => {
+  const BUN_BINDING = join(ROOT, "src", "test", "bun.ts");
+  const dir = await project({
+    "functions/import_map.json": JSON.stringify({ imports: { "1tube/test": BUN_BINDING } }),
+    "functions/h/h.test.ts": `import { afterAll, beforeAll, expect, test } from "1tube/test";
+let ready = false;
+beforeAll(async () => { await new Promise((r) => setTimeout(r, 30)); ready = true; }, 5_000);
+afterAll(() => {}, 5_000);
+test("setup ran", () => expect(ready).toBe(true));
+`,
+    "functions/h/slow.test.ts": `import { beforeAll, test } from "1tube/test";
+beforeAll(() => new Promise((r) => setTimeout(r, 2_000)), 50);
+test("after a hook that times out", () => {});
+`,
+  });
+  const ok = spawnSync(process.execPath, [LAUNCH, "test", "-f", "functions", "./functions/h/h.test.ts"], { cwd: dir, encoding: "utf8" });
+  expect(ok.stdout + ok.stderr).toContain("1 pass");
+  expect(ok.status).toBe(0);
+  const slow = spawnSync(process.execPath, [LAUNCH, "test", "-f", "functions", "./functions/h/slow.test.ts"], { cwd: dir, encoding: "utf8" });
+  expect(slow.status).not.toBe(0);
+});

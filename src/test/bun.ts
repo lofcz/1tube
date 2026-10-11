@@ -24,10 +24,10 @@ export const { test, it, describe, beforeAll, afterAll, beforeEach, afterEach, m
   todo: (name) => bun.test.todo(name, () => {}),
   describe: (name, fn, mode) =>
     mode === "skip" ? bun.describe.skip(name, fn) : mode === "only" ? bun.describe.only(name, fn) : bun.describe(name, fn),
-  beforeAll: (fn) => bun.beforeAll(fn),
-  afterAll: (fn) => bun.afterAll(fn),
-  beforeEach: (fn) => bun.beforeEach(fn),
-  afterEach: (fn) => bun.afterEach(fn),
+  beforeAll: (fn, timeout) => bun.beforeAll(fn, timeout),
+  afterAll: (fn, timeout) => bun.afterAll(fn, timeout),
+  beforeEach: (fn, timeout) => bun.beforeEach(fn, timeout),
+  afterEach: (fn, timeout) => bun.afterEach(fn, timeout),
   mockModule: (specifier, factory) => {
     void bun.mock.module(specifier.startsWith("file:") ? fileURLToPath(specifier) : specifier, factory);
   },

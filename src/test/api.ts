@@ -55,7 +55,8 @@ export interface DescribeFunction extends RegisterSuite {
   each<Row>(table: readonly Row[]): (name: string, fn: (...args: EachArgs<Row>) => void) => void;
 }
 
-export type Hook = (fn: HookFn) => void;
+/** A setup/teardown hook; `timeout` in milliseconds (runner default when omitted). */
+export type Hook = (fn: HookFn, timeout?: number) => void;
 
 // `any` is unavoidable for generic function shapes.
 type AnyFn = (...args: any[]) => any;

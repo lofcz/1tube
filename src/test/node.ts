@@ -25,10 +25,10 @@ export const { test, it, describe, beforeAll, afterAll, beforeEach, afterEach, m
   test: (name, fn, { timeout, skip, only }) => void node.test(name, { timeout, skip, only }, wrap(fn)),
   todo: (name) => void node.test(name, { todo: true }),
   describe: (name, fn, mode) => void node.describe(name, { skip: mode === "skip", only: mode === "only" }, fn),
-  beforeAll: (fn) => node.before(wrap(fn)),
-  afterAll: (fn) => node.after(wrap(fn)),
-  beforeEach: (fn) => node.beforeEach(wrap(fn)),
-  afterEach: (fn) => node.afterEach(wrap(fn)),
+  beforeAll: (fn, timeout) => node.before(wrap(fn), { timeout }),
+  afterAll: (fn, timeout) => node.after(wrap(fn), { timeout }),
+  beforeEach: (fn, timeout) => node.beforeEach(wrap(fn), { timeout }),
+  afterEach: (fn, timeout) => node.afterEach(wrap(fn), { timeout }),
   mockModule: (specifier, factory) => {
     const moduleMock = (node.mock as { module?: (s: string, o: object) => unknown }).module;
     if (typeof moduleMock !== "function") {

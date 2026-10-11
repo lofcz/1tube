@@ -67,8 +67,8 @@ export async function resolveDenoConfigPath(
     return { configPath: found };
   }
   onMessage?.(
-    `no import_map.json / deno.json[c] at ${cwd} or ${fnDirAbs} — bundling ` +
-      `without an import map. Pass --config <path> if you want one.`,
+    `no import map at ${cwd} or ${fnDirAbs}; bare imports resolve from ` +
+      `node_modules (package.json is the version source).`,
   );
   return {};
 }
