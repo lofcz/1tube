@@ -389,3 +389,30 @@ describe("node portable", () => {
   expect(run.stdout).toContain("pass 4");
   expect(run.status).toBe(0);
 });
+
+test("1tube test isolates files by default: mock.module cannot leak", async () => {
+  const BUN_BINDING = join(ROOT, "src", "test", "bun.ts");
+  const dir = await project({
+    "functions/import_map.json": JSON.stringify({ imports: { "1tube/test": BUN_BINDING } }),
+    "functions/_shared/flag.ts": `export const flag = () => "real";\n`,
+    "functions/a/a.test.ts": `import { expect, mock, test } from "1tube/test";
+mock.module(import.meta.resolve("../_shared/flag.ts"), () => ({ flag: () => "mocked" }));
+const { flag } = await import("../_shared/flag.ts");
+test("a sees the mock", () => expect(flag()).toBe("mocked"));
+`,
+    "functions/b/b.test.ts": `import { expect, test } from "1tube/test";
+import { flag } from "../_shared/flag.ts";
+test("b sees the real module", () => expect(flag()).toBe("real"));
+`,
+  });
+  const run = (...extra: string[]) =>
+    spawnSync(process.execPath, [LAUNCH, "test", "-f", "functions", ...extra], { cwd: dir, encoding: "utf8" });
+  for (const mode of [[], ["--no-parallel"]]) {
+    const r = run(...mode);
+    expect(r.stdout + r.stderr).toContain("2 pass");
+    expect(r.status).toBe(0);
+  }
+  // Opting out of isolation shows what the default prevents.
+  const leaky = run("--no-isolate", "./functions/a", "./functions/b");
+  expect(leaky.stdout + leaky.stderr).toContain("1 fail");
+});

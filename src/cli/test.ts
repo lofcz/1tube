@@ -9,6 +9,10 @@
  * the import map, `npm:` / `jsr:` specifiers and the managed dependency
  * store apply to function code under test. Without explicit paths it runs
  * every test under the functions dir.
+ *
+ * Each test file runs isolated (fresh globals and module registry), like
+ * each function on the gateway: by default in parallel worker processes,
+ * so `mock.module` and other module state cannot leak between files.
  */
 
 import { existsSync } from "node:fs";
@@ -34,6 +38,8 @@ const BUN_TEST_VALUE_FLAGS = new Set([
 
 export interface TestArgs {
   functionsDir: string;
+  /** `--no-parallel`: isolate files in one process instead of workers. */
+  parallel: boolean;
   config?: string;
   depsDir?: string;
   envFiles: string[];
@@ -42,7 +48,7 @@ export interface TestArgs {
 }
 
 export function parseTestArgs(argv: readonly string[]): TestArgs {
-  const out: TestArgs = { functionsDir: "", envFiles: [], forwarded: [], hasPaths: false };
+  const out: TestArgs = { functionsDir: "", parallel: true, envFiles: [], forwarded: [], hasPaths: false };
   let functionsDir: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
@@ -71,6 +77,9 @@ export function parseTestArgs(argv: readonly string[]): TestArgs {
       case "--env-file":
         out.envFiles.push(value());
         continue;
+      case "--no-parallel":
+        out.parallel = false;
+        continue;
     }
     out.forwarded.push(tok);
     if (BUN_TEST_VALUE_FLAGS.has(flag) && eq === -1 && i + 1 < argv.length) {
@@ -90,12 +99,14 @@ export async function runTest(argv: readonly string[]): Promise<number> {
 
 Runs edge function tests (files importing \`1tube/test\`) with the gateway's
 module resolution. Without paths, runs every test under the functions dir.
+Each file runs isolated, in parallel workers by default.
 
 Options:
   --functions, -f <dir>   Functions dir (default: supabase/functions, else functions)
   --config <path>         Import map (import_map.json, or a deno.json[c] with "imports")
   --deps-dir <path>       Managed npm:/jsr: store (default <cwd>/.1tube/deps)
   --env-file <path>       Env file loaded into the test process (repeatable)
+  --no-parallel           Run files one after another in one process (still isolated)
   --                      Pass everything after it to the runner verbatim
 `);
     return 0;
@@ -134,6 +145,10 @@ Options:
     "test",
     "--preload",
     preload,
+    // Isolation unless the caller chose a mode themselves.
+    ...(args.forwarded.some((a) => /^--(parallel|isolate|no-isolate)(=|$)/.test(a))
+      ? []
+      : [args.parallel ? "--parallel" : "--isolate"]),
     ...args.forwarded,
     ...(args.hasPaths ? [] : [defaultPath]),
   ];
