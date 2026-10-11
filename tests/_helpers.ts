@@ -73,6 +73,9 @@ export function devGatewayEnv(
 ): Record<string, string> {
   return {
     "1TUBE_DEV_SKIP_SUPABASE_STATUS": "1",
+    // The --dev default, pinned so a JWT_SECRET left on the shared test
+    // process env (or set in CI) can't change what spawned gateways verify.
+    JWT_SECRET: "super-secret-jwt-token-with-at-least-32-characters-long",
     SUPABASE_ANON_KEY: "test-anon-key",
     SUPABASE_SERVICE_ROLE_KEY: "test-service-role-key",
     ...extra,

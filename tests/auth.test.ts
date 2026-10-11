@@ -6,10 +6,20 @@
  * tests can swap secrets between assertions without re-importing the module.
  */
 
-import { test } from "bun:test";
+import { afterAll, afterEach, test } from "bun:test";
 import { assertEquals, assertExists } from "./_assert.ts";
 import { probeRequest, validateRequest } from "../src/gateway/auth.ts";
 import { resetTubeEnv, signJwt } from "./_helpers.ts";
+
+// These tests set JWT_SECRET on the shared process env; `bun test` runs every
+// file in one process, so restore it for whatever runs next.
+const ORIGINAL_JWT_SECRET = process.env["JWT_SECRET"];
+const restoreJwtSecret = () => {
+  if (ORIGINAL_JWT_SECRET === undefined) delete process.env["JWT_SECRET"];
+  else process.env["JWT_SECRET"] = ORIGINAL_JWT_SECRET;
+};
+afterEach(restoreJwtSecret);
+afterAll(restoreJwtSecret);
 
 const SECRET = "test-secret-which-is-long-enough-for-hmac-sha256";
 

@@ -6,7 +6,7 @@
  * honouring the token's `exp` and the JWT_SECRET rotation contract.
  */
 
-import { test } from "bun:test";
+import { afterAll, afterEach, test } from "bun:test";
 import { assert, assertEquals, assertNotEquals } from "./_assert.ts";
 import {
   _resetAuthForTests,
@@ -15,6 +15,16 @@ import {
   validateRequest,
 } from "../src/gateway/auth.ts";
 import { resetTubeEnv, signJwt } from "./_helpers.ts";
+
+// These tests set JWT_SECRET on the shared process env; `bun test` runs every
+// file in one process, so restore it for whatever runs next.
+const ORIGINAL_JWT_SECRET = process.env["JWT_SECRET"];
+const restoreJwtSecret = () => {
+  if (ORIGINAL_JWT_SECRET === undefined) delete process.env["JWT_SECRET"];
+  else process.env["JWT_SECRET"] = ORIGINAL_JWT_SECRET;
+};
+afterEach(restoreJwtSecret);
+afterAll(restoreJwtSecret);
 
 const SECRET_A = "test-secret-a-at-least-32-characters-please-ok";
 const SECRET_B = "test-secret-b-at-least-32-characters-please-ok";
