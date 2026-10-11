@@ -29,6 +29,12 @@
       "import": "./dist/warmup-client.js",
       "default": "./dist/warmup-client.js"
     },
+    "./test": {
+      "types": "./dist/test/node.d.ts",
+      "bun": "./src/test/bun.ts",
+      "import": "./dist/test/node.js",
+      "default": "./dist/test/node.js"
+    },
     "./eslint-plugin": "./eslint-plugin.js",
     "./package.json": "./package.json"
   },
@@ -56,7 +62,7 @@
     "play:workerd": "bun src/cli.ts --backend workerd --dev --hmr --functions ./playground --port 3199",
     "build": "bun src/cli.ts build",
     "test": "bun test --timeout 60000",
-    "build:edge": "bunx tsc --ignoreConfig --target ES2022 --module ESNext --moduleResolution Bundler --declaration --outDir dist src/edge.ts src/edge-caller.ts src/warmup-client.ts",
+    "build:edge": "bunx tsc --ignoreConfig --target ES2022 --module ESNext --moduleResolution Bundler --declaration --rewriteRelativeImportExtensions --types node --outDir dist src/edge.ts src/edge-caller.ts src/warmup-client.ts src/test/node.ts",
     "prepack": "bun run build:edge",
     "typecheck": "bun check",
     "smoke:bin": "node ./scripts/npm-cli.js --version",

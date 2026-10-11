@@ -10,6 +10,7 @@
  * ========
  *   build      → cli/build.ts   (bundle for workerd/vercel)
  *   package    → cli/package.ts (sign a firmware payload)
+ *   test       → cli/test.ts    (run function tests via `1tube/test`)
  *   --version  → print version
  *   --help     → usage
  *   <else>     → serve (the gateway)            ← default, may be spelled `serve`
@@ -35,6 +36,7 @@ import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { watchFs } from "./fs-watch.ts";
+import { IMPORT_MAP_FILES } from "./compat/import-map.ts";
 
 // ---------------------------------------------------------------------------
 // Top-level dispatch
@@ -45,6 +47,10 @@ export async function run(argv: readonly string[]): Promise<void> {
   if (arg0 === "build") {
     const { runBuild } = await import("./cli/build.ts");
     process.exit(await runBuild(argv.slice(1)));
+  }
+  if (arg0 === "test") {
+    const { runTest } = await import("./cli/test.ts");
+    process.exit(await runTest(argv.slice(1)));
   }
   if (arg0 === "package") {
     const { runPackage } = await import("./cli/package.ts");
@@ -71,13 +77,14 @@ Commands:
   serve       Run the gateway (default when no command given)
   build       Bundle functions for a target (--target workerd|vercel)
   package     Build and/or wrap dist/ into a signed .1tube firmware payload
+  test        Run function tests (files importing 1tube/test) with gateway resolution
   --version   Print version and exit
   --help      Print this help
 
 Serve options (everything else is forwarded to the gateway):
   --deps-dir <path>             Managed npm:/jsr: store (default <cwd>/.1tube/deps)
   --refresh-deps                Drop the managed store's lockfile for a clean re-resolve
-  --config <path>               Host deno.json[c] whose import map functions use
+  --config <path>               Import map functions use (import_map.json, or deno.json[c])
   --env-file[=<path>]           Env file loaded into the gateway (repeatable)
   --minimum-dependency-age <n>  Minimum release age for managed installs (s, or 30m/24h/7d)
   --no-pin                      Ignore host node_modules; resolve npm: only via the managed store
@@ -236,7 +243,7 @@ async function runServe(args: ServeArgs): Promise<never> {
     ...process.env,
     "1TUBE_DEPS_DIR": depsDir,
   };
-  if (configAbs) childEnv["1TUBE_DENO_CONFIG"] = configAbs;
+  if (configAbs) childEnv["1TUBE_IMPORT_MAP"] = configAbs;
   if (!args.pin) childEnv["1TUBE_DEPS_ISOLATED"] = "1";
   if (args.minimumDependencyAge !== undefined) {
     childEnv["1TUBE_MINIMUM_DEPENDENCY_AGE"] = args.minimumDependencyAge;
@@ -259,7 +266,7 @@ async function runServe(args: ServeArgs): Promise<never> {
   ];
 
   const watchPaths = [
-    ...(configAbs ? [configAbs] : ["deno.json", "deno.jsonc"].map(resolveToAbs)),
+    ...(configAbs ? [configAbs] : IMPORT_MAP_FILES.map(resolveToAbs)),
     ...PROJECT_DEP_FILES.map(resolveToAbs),
   ];
 

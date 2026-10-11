@@ -563,8 +563,8 @@ export async function runBuild(args: string[]): Promise<number> {
   // Resolve the deno.json import map. Three modes, in priority order:
   //   1. --config <path>          → explicit, must exist (we hard-fail if not)
   //   2. --no-config              → explicit "build with no import map"
-  //   3. <auto-detect>            → cwd/deno.json[c], then
-  //                                 <functions-dir>/deno.json[c] (Supabase
+  //   3. <auto-detect>            → cwd/{import_map,deno}.json[c], then
+  //                                 <functions-dir>/{import_map,deno}.json[c] (Supabase
   //                                 layout), otherwise omit.
   // Auto-detect is the important case: hosts like sciobot-next are Vite/Bun
   // projects with no root deno.json, and the bundler tolerates a missing
@@ -748,8 +748,8 @@ Options:
       --workerd-env A,B,C    Env vars baked into the manifest's allowlist
       --workerd-shared path  Shared module path (repeatable). Defaults include
                              _shared/profile-cache.ts when present.
-      --config <path>        Explicit deno.json path for the import map.
-                             Default: auto-detect cwd/deno.json[c] then
-                             <functions-dir>/deno.json[c] (Supabase layout).
+      --config <path>        Import map path (import_map.json, or deno.json[c]).
+                             Default: auto-detect cwd/{import_map,deno}.json[c] then
+                             <functions-dir>/{import_map,deno}.json[c] (Supabase layout).
       --no-config            Skip the import map entirely.
   -h, --help                 Show this help`;

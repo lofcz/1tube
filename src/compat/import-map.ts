@@ -1,8 +1,9 @@
 /**
- * Deno import-map support (`imports` + `scopes` from deno.json[c]).
+ * Import-map support (`imports` + `scopes` from an import_map.json, or a
+ * deno.json[c] carrying them).
  *
- * Supabase projects keep their aliases in `supabase/functions/deno.json`
- * (or a repo-root deno.json). Bun has no notion of that file, so the compat
+ * Supabase projects keep their aliases in `supabase/functions/import_map.json`
+ * or `supabase/functions/deno.json` (or at the repo root). Bun has no notion of that file, so the compat
  * plugin and the HMR dep-graph both resolve aliases through this module —
  * the Deno CLI's algorithm reduced to its essentials: exact match first,
  * otherwise the longest trailing-slash prefix, with the most specific
@@ -58,19 +59,21 @@ export function stripJsonc(text: string): string {
   return out.replace(/,\s*([}\]])/g, "$1");
 }
 
+/** File names searched for an import map, in priority order. */
+export const IMPORT_MAP_FILES = ["import_map.json", "deno.json", "deno.jsonc"] as const;
+
 /**
- * Conventional deno.json locations for a functions project, most specific
- * last-checked: cwd first (repo-root config), then the functions dir
- * (Supabase's `supabase/functions/deno.json`).
+ * Conventional import-map locations for a functions project: cwd first
+ * (repo-root config), then the functions dir (Supabase's
+ * `supabase/functions/import_map.json` or `deno.json`).
  */
 export function findDenoConfig(
   cwd: string,
   functionsDir?: string,
 ): string | undefined {
-  const candidates = [join(cwd, "deno.json"), join(cwd, "deno.jsonc")];
+  const candidates = IMPORT_MAP_FILES.map((f) => join(cwd, f));
   if (functionsDir) {
-    candidates.push(join(functionsDir, "deno.json"));
-    candidates.push(join(functionsDir, "deno.jsonc"));
+    candidates.push(...IMPORT_MAP_FILES.map((f) => join(functionsDir, f)));
   }
   for (const c of candidates) {
     try {

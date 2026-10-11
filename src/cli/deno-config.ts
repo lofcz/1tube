@@ -8,8 +8,8 @@
  *
  *   1. explicit `--config <path>`  → must exist (hard error otherwise)
  *   2. explicit `--no-config`      → skip the import map entirely
- *   3. auto-detect                 → cwd/deno.json[c] then
- *                                    <functions-dir>/deno.json[c]
+ *   3. auto-detect                 → cwd/{import_map,deno}.json[c] then
+ *                                    <functions-dir>/{import_map,deno}.json[c]
  *
  * The functions-dir fallback is what makes this work for hosts like
  * sciobot-next: a Vite/Bun project whose only `deno.json` lives next to the
@@ -63,11 +63,11 @@ export async function resolveDenoConfigPath(
     : resolvePath(cwd, functionsDir);
   const found = findDenoConfig(cwd, fnDirAbs);
   if (found) {
-    onMessage?.(`using deno config: ${found}`);
+    onMessage?.(`using import map: ${found}`);
     return { configPath: found };
   }
   onMessage?.(
-    `no deno.json / deno.jsonc at ${cwd} or ${fnDirAbs} — bundling ` +
+    `no import_map.json / deno.json[c] at ${cwd} or ${fnDirAbs} — bundling ` +
       `without an import map. Pass --config <path> if you want one.`,
   );
   return {};

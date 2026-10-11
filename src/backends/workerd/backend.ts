@@ -892,7 +892,7 @@ export function createWorkerdBackend(
     : resolvePath(cwd, opts.configPath);
   const configPath = existsSync(requestedConfigPath)
     ? requestedConfigPath
-    : process.env["1TUBE_DENO_CONFIG"] ??
+    : process.env["1TUBE_IMPORT_MAP"] ?? process.env["1TUBE_DENO_CONFIG"] ??
       findDenoConfig(cwd, functionsDir) ?? requestedConfigPath;
   const workerdBin = opts.workerdBin ?? process.env["1TUBE_WORKERD_BIN"] ??
     "workerd";

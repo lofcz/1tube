@@ -6,7 +6,7 @@
  * whether a function runs locally or ships in a bundle.
  *
  *   1TUBE_DEPS_DIR                 managed store (default <cwd>/.1tube/deps)
- *   1TUBE_DENO_CONFIG              explicit deno.json[c] for the import map
+ *   1TUBE_IMPORT_MAP               explicit import map (legacy name: 1TUBE_DENO_CONFIG)
  *   1TUBE_DEPS_ISOLATED=1          ignore host node_modules
  *   1TUBE_MINIMUM_DEPENDENCY_AGE   min release age for managed installs
  *   1TUBE_RELOAD_REMOTE=1          re-download cached https: modules
@@ -45,7 +45,8 @@ export function createCompatEnvironment(
     cwd,
     opts.depsDir ?? process.env["1TUBE_DEPS_DIR"] ?? join(".1tube", "deps"),
   );
-  const configPath = opts.configPath ?? process.env["1TUBE_DENO_CONFIG"] ??
+  const configPath = opts.configPath ?? process.env["1TUBE_IMPORT_MAP"] ??
+    process.env["1TUBE_DENO_CONFIG"] ??
     findDenoConfig(cwd, opts.functionsDir);
   return {
     deps: createDependencyManager({

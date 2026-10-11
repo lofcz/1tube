@@ -581,7 +581,7 @@ export async function buildVercel(
  *   --max-duration-cap <s> hard cap for maxDuration (default 800)
  *   --deployment-id <id>   custom Skew Protection deployment id written to
  *                          config.json (env: 1TUBE_VERCEL_DEPLOYMENT_ID)
- *   --config <path>        explicit deno.json path
+ *   --config <path>        import map path
  *   --no-config            skip the import map
  */
 export async function runVercelBuild(args: string[]): Promise<number> {
@@ -801,8 +801,8 @@ Options:
                              Bake the same id into the frontend and send it as
                              x-deployment-id / ?dpl= on fetch() calls.
                              Env fallback: 1TUBE_VERCEL_DEPLOYMENT_ID
-      --config <path>        Explicit deno.json path for the import map.
-                             Default: auto-detect cwd/deno.json[c] then
-                             <functions-dir>/deno.json[c] (Supabase layout).
+      --config <path>        Import map path (import_map.json, or deno.json[c]).
+                             Default: auto-detect cwd/{import_map,deno}.json[c] then
+                             <functions-dir>/{import_map,deno}.json[c] (Supabase layout).
       --no-config            Skip the import map entirely.
   -h, --help                 Show this help`;

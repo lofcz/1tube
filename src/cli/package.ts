@@ -588,7 +588,7 @@ Options:
       --compat-flag FLAG     Add a workerd compatibility flag (repeatable)
       --workerd-env A,B,C    Env vars baked into the manifest's allowlist
       --workerd-shared path  Shared module path (repeatable)
-      --config <path>        Explicit deno.json path for the build import map
+      --config <path>        Import map path for the build (import_map.json, or deno.json[c])
       --no-config            Skip the build import map entirely
   -h, --help                 Show this help`;
 
