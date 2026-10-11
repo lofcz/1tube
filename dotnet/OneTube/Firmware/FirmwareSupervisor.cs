@@ -71,7 +71,7 @@ public sealed class FirmwareSupervisor : IHostedService
     /// then falls back to <see cref="OneTubeOptions.PrebuiltDir"/>).
     ///
     /// Computed once at construction so DI's resolution of the active
-    /// <see cref="DenoHostService"/> can read it before any host starts.
+    /// <see cref="GatewayHostService"/> can read it before any host starts.
     /// Post-boot, the supervisor mutates state via promotions but the
     /// active host's slot stays pinned to whatever it was given on
     /// construction; the side-by-side swap moves traffic via the
@@ -85,7 +85,7 @@ public sealed class FirmwareSupervisor : IHostedService
     /// Tracked here so <see cref="StopAsync"/> can shut it down on
     /// app exit even if a promote was interrupted.
     /// </summary>
-    private DenoHostService? _liveCandidate;
+    private GatewayHostService? _liveCandidate;
 
     public FirmwareSupervisor(
         IOptions<OneTubeOptions> oneTubeOptions,
@@ -615,7 +615,7 @@ public sealed class FirmwareSupervisor : IHostedService
             }
 
             // ── Smoke test ──────────────────────────────────────────
-            DenoHostService? candidate = null;
+            GatewayHostService? candidate = null;
             try
             {
                 Update(job, FirmwareJobState.SmokeTesting, "booting candidate gateway");
@@ -702,7 +702,7 @@ public sealed class FirmwareSupervisor : IHostedService
         try
         {
             if (ct.IsCancellationRequested) { Cancelled(job); return; }
-            DenoHostService? candidate = null;
+            GatewayHostService? candidate = null;
             try
             {
                 var smokeSw = Stopwatch.StartNew();
@@ -810,7 +810,7 @@ public sealed class FirmwareSupervisor : IHostedService
         // Walk every per-bundle SHA-256 in the inner manifest (functions
         // and gateway-owned shared modules). The schema is shared with
         // the runtime prebuilt loader; we
-        // parse it ad-hoc here to avoid pulling Deno-specific types
+        // parse it ad-hoc here to avoid pulling gateway-specific types
         // into the C# package.
         VerifyBundleHashes(unpacked, manifestBytes);
         if (!string.IsNullOrWhiteSpace(envelope.ContentSha256))
@@ -1085,7 +1085,7 @@ public sealed class FirmwareSupervisor : IHostedService
         }
     }
 
-    private async Task<DenoHostService> SpawnCandidateAsync(string version)
+    private async Task<GatewayHostService> SpawnCandidateAsync(string version)
     {
         var active = (_services.GetService(typeof(IGatewayDestinationProvider)) as IGatewayDestinationProvider)
             ?.GetActive();
@@ -1098,7 +1098,7 @@ public sealed class FirmwareSupervisor : IHostedService
             candidatePort,
             _layout.VersionDistDir(version));
 
-        var logger = _loggerFactory.CreateLogger<DenoHostService>();
+        var logger = _loggerFactory.CreateLogger<GatewayHostService>();
 
         // Resolve the secrets store lazily — it's only registered
         // when AddOneTubeSecrets has been called. Without it the
@@ -1111,12 +1111,12 @@ public sealed class FirmwareSupervisor : IHostedService
             ? null
             : () => secretsStore.Snapshot();
 
-        var candidate = new DenoHostService(_oneTubeOptions, slot, logger, secretsProvider);
+        var candidate = new GatewayHostService(_oneTubeOptions, slot, logger, secretsProvider);
         await candidate.StartAsync(CancellationToken.None);
         return candidate;
     }
 
-    private async Task SmokeTestAsync(DenoHostService candidate, CancellationToken externalCt = default)
+    private async Task SmokeTestAsync(GatewayHostService candidate, CancellationToken externalCt = default)
     {
         // Smoke timeout AND the caller's pre-emption signal both
         // abort the probe loop. Linking the two avoids waiting up
@@ -1171,7 +1171,7 @@ public sealed class FirmwareSupervisor : IHostedService
             $"candidate did not become healthy within {_firmwareOptions.SmokeTimeoutMs}ms");
     }
 
-    private async Task PromoteAsync(FirmwareJob job, string version, DenoHostService candidate)
+    private async Task PromoteAsync(FirmwareJob job, string version, GatewayHostService candidate)
     {
         // Preserve a snapshot of the previous state so we can roll
         // back state.json if the post-write half explodes.
@@ -1220,7 +1220,7 @@ public sealed class FirmwareSupervisor : IHostedService
     /// because <c>MapOneTube</c> resolves the destination once at
     /// the top of the request, not per-hop.</para>
     /// </summary>
-    private async Task SwapDestinationAndDrainAsync(FirmwareJob job, DenoHostService candidate)
+    private async Task SwapDestinationAndDrainAsync(FirmwareJob job, GatewayHostService candidate)
     {
         var provider = _services.GetService(typeof(IGatewayDestinationProvider))
             as SwappableDestinationProvider
@@ -1320,7 +1320,7 @@ public sealed class FirmwareSupervisor : IHostedService
         {
             if (ct.IsCancellationRequested) { Cancelled(job); return; }
 
-            DenoHostService? candidate = null;
+            GatewayHostService? candidate = null;
             try
             {
                 var smokeSw = Stopwatch.StartNew();
@@ -1482,7 +1482,7 @@ public sealed class FirmwareSupervisor : IHostedService
         }
     }
 
-    private async Task TryStopCandidateAsync(DenoHostService candidate)
+    private async Task TryStopCandidateAsync(GatewayHostService candidate)
     {
         try { await candidate.StopAsync(CancellationToken.None); }
         catch (Exception ex)

@@ -1,18 +1,22 @@
 #!/usr/bin/env node
 
 /**
- * `1tube` npm bin — a tiny Node shim that locates Deno and runs the single
- * launcher (`src/launch.ts`). All argument handling, the managed lockfile,
- * dependency pinning, minimum-dependency-age, and live reload live in the
- * launcher itself, so this shim stays trivial: find deno, forward argv, wire
- * up signals + exit code.
+ * `1tube` npm bin — a tiny Node shim that locates Bun and runs the single
+ * launcher (`src/launch.ts`). All argument handling, the managed dependency
+ * store, dependency pinning, minimum-dependency-age, and live reload live in
+ * the launcher itself, so this shim stays trivial: find bun, forward argv,
+ * wire up signals + exit code.
  *
- * Machines using this need Deno on PATH (or set `DENO_BIN`). Arguments are
- * forwarded verbatim — the launcher recognizes its own flags (`--lock`,
- * `--config`, `--env-file`, `--node-modules-dir`, `--minimum-dependency-age`,
- * `--no-lock`, `--no-pin`, `--no-dep-watch`, …) and forwards everything else
- * to the gateway. `1TUBE_DENO_ARGS` (space-separated) is appended for projects
- * that prefer to keep flags out of the command line.
+ * Machines using this need Bun on PATH (or set `BUN_BIN`). Arguments are
+ * forwarded verbatim — the launcher recognizes its own flags (`--deps-dir`,
+ * `--refresh-deps`, `--config`, `--env-file`, `--minimum-dependency-age`,
+ * `--no-pin`, `--no-dep-watch`, …) and forwards everything else to the
+ * gateway. `1TUBE_BUN_ARGS` (space-separated) is appended for projects that
+ * prefer to keep flags out of the command line; the Deno-era
+ * `1TUBE_DENO_ARGS` is still honoured.
+ *
+ * The package's own dependencies (hono, esbuild, …) are installed next to it
+ * by the host's package manager, so Bun resolves them from node_modules.
  */
 
 import { spawn } from "node:child_process";
@@ -23,43 +27,40 @@ import { fileURLToPath } from "node:url";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const launcherEntrypoint = resolve(packageRoot, "src", "launch.ts");
-const denoBin = process.env.DENO_BIN || "deno";
+const bunBin = process.env.BUN_BIN || "bun";
 
-// The launcher needs no import map or lockfile of its own (it imports only
-// node: builtins + relative source), and it owns the gateway child's lock,
-// config and npm-config — so the outer `deno run` stays minimal and fast.
-const denoArgs = [
-  "run",
-  "--quiet",
-  "-A",
-  "--node-modules-dir=false",
+// The launcher imports only node: builtins + relative source, and it owns the
+// gateway child's dependency store and env — so the outer `bun` stays minimal.
+const bunArgs = [
   launcherEntrypoint,
   ...tokenizeArgs(
-    process.env.ONETUBE_DENO_ARGS ?? process.env["1TUBE_DENO_ARGS"] ?? "",
+    process.env.ONETUBE_BUN_ARGS ?? process.env["1TUBE_BUN_ARGS"] ??
+      process.env.ONETUBE_DENO_ARGS ?? process.env["1TUBE_DENO_ARGS"] ?? "",
   ),
   ...process.argv.slice(2),
 ];
 
-// Resolve the real deno binary up front. Node ≥18.20 refuses to spawn a
-// `.cmd`/`.bat` shim without a shell, but spawning a real `.exe` (or a bare
-// binary on POSIX) with `shell:false` lets Node escape arguments properly —
-// important since we forward arbitrary flags, some carrying paths with spaces.
-const resolvedDeno = resolveExecutable(denoBin);
-const needsShell = resolvedDeno
-  ? /\.(cmd|bat)$/i.test(resolvedDeno)
+// Resolve the real bun binary up front. Node ≥18.20 refuses to spawn a
+// `.cmd`/`.bat` shim (e.g. npm's global `bun.cmd`) without a shell, but
+// spawning a real `.exe` (or a bare binary on POSIX) with `shell:false` lets
+// Node escape arguments properly — important since we forward arbitrary
+// flags, some carrying paths with spaces.
+const resolvedBun = resolveExecutable(bunBin);
+const needsShell = resolvedBun
+  ? /\.(cmd|bat)$/i.test(resolvedBun)
   : process.platform === "win32";
-const spawnBin = resolvedDeno ?? denoBin;
+const spawnBin = resolvedBun ?? bunBin;
 
 let child;
 if (needsShell) {
-  const command = [spawnBin, ...denoArgs].map(quoteForCmd).join(" ");
+  const command = [spawnBin, ...bunArgs].map(quoteForCmd).join(" ");
   child = spawn(command, {
     stdio: "inherit",
     shell: true,
     windowsHide: false,
   });
 } else {
-  child = spawn(spawnBin, denoArgs, {
+  child = spawn(spawnBin, bunArgs, {
     stdio: "inherit",
     shell: false,
     windowsHide: false,
@@ -75,11 +76,11 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 child.on("error", (err) => {
   if (err && "code" in err && err.code === "ENOENT") {
     console.error(
-      "[1tube] Deno was not found on PATH. Install Deno or set DENO_BIN to the deno executable.",
+      "[1tube] Bun was not found on PATH. Install Bun (https://bun.sh) or set BUN_BIN",
     );
     process.exit(127);
   }
-  console.error(`[1tube] failed to start Deno: ${err.message}`);
+  console.error(`[1tube] failed to start Bun: ${err.message}`);
   process.exit(1);
 });
 

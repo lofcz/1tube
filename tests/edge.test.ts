@@ -1,4 +1,5 @@
-import { assert, assertEquals, assertObjectMatch } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals, assertObjectMatch } from "./_assert.ts";
 
 import {
   accepted,
@@ -36,7 +37,7 @@ const schemaAdapter = {
   },
 };
 
-Deno.test("edge: createFetchHandler dispatches, validates, and applies CORS", async () => {
+test("edge: createFetchHandler dispatches, validates, and applies CORS", async () => {
   const route = createRouteBuilder<{ requestId: string }>();
   const BodySchema = schema<{ name: string }>((value) => {
     if (
@@ -81,7 +82,7 @@ Deno.test("edge: createFetchHandler dispatches, validates, and applies CORS", as
   assertEquals(await response.json(), { id: "req-1:alpha" });
 });
 
-Deno.test("edge: createFetchHandler returns validation errors consistently", async () => {
+test("edge: createFetchHandler returns validation errors consistently", async () => {
   const route = createRouteBuilder<Record<string, never>>();
   const BodySchema = schema<{ name: string }>(() => new Error("Invalid body"), {
     type: "object",
@@ -112,7 +113,7 @@ Deno.test("edge: createFetchHandler returns validation errors consistently", asy
   assertObjectMatch(await response.json(), { error: "Invalid body" });
 });
 
-Deno.test("edge: pathPrefix supports non-Supabase hosts like ASP.NET Core", async () => {
+test("edge: pathPrefix supports non-Supabase hosts like ASP.NET Core", async () => {
   const route = createRouteBuilder<Record<string, never>>();
   const ParamsSchema = schema<{ id: string }>((value) => {
     if (
@@ -151,7 +152,7 @@ Deno.test("edge: pathPrefix supports non-Supabase hosts like ASP.NET Core", asyn
   assertEquals(await response.json(), { id: "w-123" });
 });
 
-Deno.test("edge: response helpers cover common API outcomes", async () => {
+test("edge: response helpers cover common API outcomes", async () => {
   assertEquals(await created({ ok: true }).json(), { ok: true });
   assertEquals(created({ ok: true }).status, HttpStatus.CREATED);
   assertEquals(noContent().status, HttpStatus.NO_CONTENT);
@@ -167,7 +168,7 @@ Deno.test("edge: response helpers cover common API outcomes", async () => {
   assertEquals((await limited.json()).retryAfterSeconds, 30);
 });
 
-Deno.test("edge: createOpenApiDocument emits path, query, body, and response metadata", () => {
+test("edge: createOpenApiDocument emits path, query, body, and response metadata", () => {
   const route = createRouteBuilder<Record<string, never>>();
   const ParamsSchema = schema((value) => value, {
     type: "object",
@@ -242,7 +243,7 @@ Deno.test("edge: createOpenApiDocument emits path, query, body, and response met
   });
 });
 
-Deno.test("edge-caller: builds Supabase-compatible requests by default", async () => {
+test("edge-caller: builds Supabase-compatible requests by default", async () => {
   let capturedUrl = "";
   let capturedInit: RequestInit | undefined;
   const caller = createEdgeCaller({
@@ -250,11 +251,11 @@ Deno.test("edge-caller: builds Supabase-compatible requests by default", async (
     getServiceRoleToken: () => "service-token",
     getUserToken: () => null,
     getAnonKey: () => "anon-key",
-    fetch: (url, init) => {
+    fetch: ((url: RequestInfo | URL, init?: RequestInit) => {
       capturedUrl = String(url);
       capturedInit = init;
       return Promise.resolve(new Response("ok"));
-    },
+    }) as typeof fetch,
   });
 
   const response = await caller.callEdgeFunction("widgets", {
@@ -276,7 +277,7 @@ Deno.test("edge-caller: builds Supabase-compatible requests by default", async (
   assertEquals(capturedInit?.body, JSON.stringify({ ok: true }));
 });
 
-Deno.test("edge-caller: supports custom host prefixes and user-token forwarding", async () => {
+test("edge-caller: supports custom host prefixes and user-token forwarding", async () => {
   let capturedUrl = "";
   let capturedAuthorization = "";
   const caller = createEdgeCaller({
@@ -284,13 +285,13 @@ Deno.test("edge-caller: supports custom host prefixes and user-token forwarding"
     pathPrefix: "/api/edge",
     getServiceRoleToken: () => "service-token",
     getUserToken: () => "user-token",
-    fetch: (url, init) => {
+    fetch: ((url: RequestInfo | URL, init?: RequestInit) => {
       capturedUrl = String(url);
       capturedAuthorization = new Headers(
         (init as { headers?: HeadersInit } | undefined)?.headers,
       ).get("Authorization") ?? "";
       return Promise.resolve(new Response("ok"));
-    },
+    }) as typeof fetch,
   });
 
   await caller.callEdgeFunction("widgets", {

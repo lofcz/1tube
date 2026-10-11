@@ -2,7 +2,7 @@
   "name": "1tube",
   "version": "0.1.54",
   "private": false,
-  "description": "Self-hosted Supabase Edge Functions gateway for Deno, plus an ESLint plugin for consumers",
+  "description": "Self-hosted Supabase Edge Functions gateway on Bun, plus an ESLint plugin for consumers",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -41,8 +41,7 @@
     "drizzle",
     "scripts/npm-cli.js",
     "src",
-    "deno.json",
-    "deno.lock",
+    "tsconfig.json",
     "README.md",
     "LICENSE",
     ".env.example"
@@ -51,20 +50,31 @@
     "access": "public"
   },
   "scripts": {
-    "dev": "deno task dev",
-    "serve": "deno task serve",
-    "build:edge": "deno run -A npm:typescript@latest/tsc --target ES2022 --module ESNext --moduleResolution Bundler --declaration --outDir dist src/edge.ts src/edge-caller.ts src/warmup-client.ts",
+    "dev": "bun --watch src/cli.ts",
+    "serve": "bun src/cli.ts",
+    "play": "bun src/cli.ts --dev --hmr --functions ./playground --port 3199",
+    "play:workerd": "bun src/cli.ts --backend workerd --dev --hmr --functions ./playground --port 3199",
+    "build": "bun src/cli.ts build",
+    "test": "bun test --timeout 60000",
+    "build:edge": "bunx tsc --ignoreConfig --target ES2022 --module ESNext --moduleResolution Bundler --declaration --outDir dist src/edge.ts src/edge-caller.ts src/warmup-client.ts",
     "prepack": "bun run build:edge",
-    "typecheck": "deno check src/server.ts src/cli.ts src/launch.ts src/edge.ts src/edge-caller.ts src/warmup-client.ts eslint-plugin.js",
-    "check": "deno cache --allow-scripts=npm:protobufjs src/server.ts",
+    "typecheck": "bun check",
     "smoke:bin": "node ./scripts/npm-cli.js --version",
-    "prepublishOnly": "bun run build:edge && bun run typecheck && bun run check && bun run smoke:bin"
+    "prepublishOnly": "bun run build:edge && bun run typecheck && bun run smoke:bin"
   },
   "dependencies": {
+    "@zip.js/zip.js": "^2.8.0",
     "drizzle-orm": "1.0.0-rc.4",
+    "es-module-lexer": "^2",
+    "esbuild": "^0.28.1",
     "hono": "^4.12.30"
   },
   "devDependencies": {
-    "drizzle-kit": "1.0.0-rc.4"
+    "drizzle-kit": "1.0.0-rc.4",
+    "@types/bun": "latest",
+    "typescript": "^6"
+  },
+  "engines": {
+    "bun": ">=1.4.3"
   }
 }

@@ -2,7 +2,7 @@
  * Tests for the workerd hot reloader.
  *
  * Two layers, both exercised here without ever touching the real
- * `Deno.watchFs` or spawning a workerd process:
+ * filesystem watcher (`src/fs-watch.ts`) or spawning a workerd process:
  *
  *   1. {@link createReloadDebouncer} — pure debounce + classify
  *      buffer. Tests drive a fake clock so flush timing is exact.
@@ -18,7 +18,8 @@
  * exercised.
  */
 
-import { assert, assertEquals } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals } from "./_assert.ts";
 import { join } from "node:path";
 import {
   classifyChangedPath,
@@ -37,7 +38,7 @@ import { defaultManifest } from "../src/manifest.ts";
 // classifyChangedPath
 // ---------------------------------------------------------------------------
 
-Deno.test("classifyChangedPath: returns the function dir name for a real edit", () => {
+test("classifyChangedPath: returns the function dir name for a real edit", () => {
   const root = join("/abs", "playground");
   // Test against both forward + back slashes so the helper works on
   // Windows. Path.relative() on Windows will produce backslashes;
@@ -52,7 +53,7 @@ Deno.test("classifyChangedPath: returns the function dir name for a real edit", 
   );
 });
 
-Deno.test("classifyChangedPath: underscored / shared dirs map to null (full reload)", () => {
+test("classifyChangedPath: underscored / shared dirs map to null (full reload)", () => {
   const root = join("/abs", "playground");
   // Anything starting with `_` is treated as cross-cutting code.
   assertEquals(
@@ -70,7 +71,7 @@ Deno.test("classifyChangedPath: underscored / shared dirs map to null (full relo
   );
 });
 
-Deno.test("classifyChangedPath: outside-tree paths map to null", () => {
+test("classifyChangedPath: outside-tree paths map to null", () => {
   const root = join("/abs", "playground");
   assertEquals(classifyChangedPath(root, join("/abs", "other", "x.ts")), null);
   // The dir itself isn't a change to a specific function.
@@ -120,7 +121,7 @@ function fakeClock() {
   };
 }
 
-Deno.test("debouncer: coalesces multiple pushes into a single flush", async () => {
+test("debouncer: coalesces multiple pushes into a single flush", async () => {
   const root = "/p";
   const calls: { sharedChange: boolean; functions: string[] }[] = [];
   const clock = fakeClock();
@@ -147,7 +148,7 @@ Deno.test("debouncer: coalesces multiple pushes into a single flush", async () =
   assertEquals(calls, [{ sharedChange: false, functions: ["hello"] }]);
 });
 
-Deno.test("debouncer: distinct function dirs surface as a sorted list", async () => {
+test("debouncer: distinct function dirs surface as a sorted list", async () => {
   const root = "/p";
   const calls: { sharedChange: boolean; functions: string[] }[] = [];
   const clock = fakeClock();
@@ -175,7 +176,7 @@ Deno.test("debouncer: distinct function dirs surface as a sorted list", async ()
   }]);
 });
 
-Deno.test("debouncer: shared change promotes to full reload (sharedChange=true, functions=[])", async () => {
+test("debouncer: shared change promotes to full reload (sharedChange=true, functions=[])", async () => {
   const root = "/p";
   const calls: { sharedChange: boolean; functions: string[] }[] = [];
   const clock = fakeClock();
@@ -201,7 +202,7 @@ Deno.test("debouncer: shared change promotes to full reload (sharedChange=true, 
   assertEquals(calls, [{ sharedChange: true, functions: [] }]);
 });
 
-Deno.test("debouncer: pushes during flush schedule a follow-up flush", async () => {
+test("debouncer: pushes during flush schedule a follow-up flush", async () => {
   const root = "/p";
   const calls: { sharedChange: boolean; functions: string[] }[] = [];
   const clock = fakeClock();
@@ -250,7 +251,7 @@ Deno.test("debouncer: pushes during flush schedule a follow-up flush", async () 
   assertEquals(calls[1], { sharedChange: false, functions: ["echo"] });
 });
 
-Deno.test("debouncer: cancel() drops the pending flush", async () => {
+test("debouncer: cancel() drops the pending flush", async () => {
   const root = "/p";
   const calls: unknown[] = [];
   const clock = fakeClock();
@@ -376,7 +377,7 @@ function fakeStream(): FsEventStream & {
   };
 }
 
-Deno.test("hot reloader: routes a single fs event to backend.reload", async () => {
+test("hot reloader: routes a single fs event to backend.reload", async () => {
   const root = "/p";
   const stream = fakeStream();
   const backend = stubBackend({
@@ -405,7 +406,7 @@ Deno.test("hot reloader: routes a single fs event to backend.reload", async () =
   await r.stop();
 });
 
-Deno.test("hot reloader: shared change reloads everything", async () => {
+test("hot reloader: shared change reloads everything", async () => {
   const root = "/p";
   const stream = fakeStream();
   const backend = stubBackend();
@@ -431,7 +432,7 @@ Deno.test("hot reloader: shared change reloads everything", async () => {
   await r.stop();
 });
 
-Deno.test("hot reloader: reload failure does not stop the watcher; next event still flushes", async () => {
+test("hot reloader: reload failure does not stop the watcher; next event still flushes", async () => {
   const root = "/p";
   const stream = fakeStream();
   const backend = stubBackend({ failNTimes: 1 });
@@ -479,7 +480,7 @@ Deno.test("hot reloader: reload failure does not stop the watcher; next event st
   await r.stop();
 });
 
-Deno.test("hot reloader: onManifestsUpdated fires after a successful reload", async () => {
+test("hot reloader: onManifestsUpdated fires after a successful reload", async () => {
   const root = "/p";
   const stream = fakeStream();
   const m = defaultManifest();
@@ -512,7 +513,7 @@ Deno.test("hot reloader: onManifestsUpdated fires after a successful reload", as
   await r.stop();
 });
 
-Deno.test("hot reloader: stop() cancels pending flushes and ignores subsequent events", async () => {
+test("hot reloader: stop() cancels pending flushes and ignores subsequent events", async () => {
   const root = "/p";
   const stream = fakeStream();
   const backend = stubBackend();

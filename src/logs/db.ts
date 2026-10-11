@@ -15,8 +15,8 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { drizzle } from "npm:drizzle-orm@1.0.0-rc.3/node-sqlite";
-import { migrate } from "npm:drizzle-orm@1.0.0-rc.3/node-sqlite/migrator";
+import { drizzle } from "drizzle-orm/node-sqlite";
+import { migrate } from "drizzle-orm/node-sqlite/migrator";
 
 /**
  * Shipped at the package root, two levels up from `src/logs/`. Works for

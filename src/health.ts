@@ -8,7 +8,7 @@
  * strings leak into access logs, browser history, and proxy buffers).
  */
 
-import type { Context } from "npm:hono@4";
+import type { Context } from "hono";
 import type { FunctionRegistry } from "./registry.ts";
 import type { FunctionSupervisor } from "./supervisor.ts";
 import {
@@ -101,7 +101,7 @@ export function createHealthHandler(
     }
 
     const metrics = getCollectedMetrics();
-    const mem = Deno.memoryUsage();
+    const mem = process.memoryUsage();
     const supervisorStats = supervisor?.allStats() ?? {};
     const limitBytes = readConstrainedMemoryBytes();
     const limitMb = limitBytes ? Math.round(limitBytes / 1024 / 1024) : null;

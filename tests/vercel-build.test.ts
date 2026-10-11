@@ -5,9 +5,10 @@
  * Like `build-cli.test.ts`, these are real integration tests: they run esbuild
  * against the playground fixtures, write `.vercel/output` function dirs, then
  * verify the Build Output API shape (`.vc-config.json`, `package.json`, handler
- * files). One test also imports an emitted entry module under Deno and invokes
- * its exported Node handler with a mock req/res to prove the `Deno.serve`
- * capture + Node<->Web bridge works end-to-end.
+ * files). One test also imports an emitted entry module under Bun (which, like
+ * Vercel's Node runtime, has no `Deno` global) and invokes its exported Node
+ * handler with a mock req/res to prove the `Deno.serve` capture + Node<->Web
+ * bridge works end-to-end.
  */
 
 import {
@@ -16,9 +17,12 @@ import {
   assertRejects,
   assertStringIncludes,
   assertThrows,
-} from "@std/assert";
+} from "./_assert.ts";
+import { setDefaultTimeout, test } from "bun:test";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { runBuild } from "../src/cli/build.ts";
 import {
   buildVercel,
@@ -26,41 +30,57 @@ import {
   validateDeploymentId,
 } from "../src/cli/vercel-build.ts";
 
-const PROJECT_ROOT = resolvePath(
-  new URL("..", import.meta.url).pathname.replace(/^\/(\w:)/, "$1"),
-);
-const PLAYGROUND = join(PROJECT_ROOT, "playground");
-const DENO_JSON = join(PROJECT_ROOT, "deno.json");
+// Real esbuild runs over the playground; cold dependency installs are slow.
+setDefaultTimeout(120_000);
 
-const TEST_OPTS = { sanitizeResources: false, sanitizeOps: false } as const;
+const PROJECT_ROOT = resolvePath(fileURLToPath(new URL("..", import.meta.url)));
+const PLAYGROUND = join(PROJECT_ROOT, "playground");
+
+/**
+ * Importing an emitted Vercel entry runs its banner, which installs a
+ * `globalThis.Deno` (env + capturing `serve`) and an `EdgeRuntime` shim when
+ * the host has none — as under Bun and on Vercel's Node runtime. Snapshot both
+ * globals so a test can put the realm back the way it found it.
+ */
+function snapshotRuntimeGlobals(): () => void {
+  const g = globalThis as { Deno?: unknown; EdgeRuntime?: unknown };
+  const hadDeno = "Deno" in g;
+  const origDeno = g.Deno;
+  const hadEdge = "EdgeRuntime" in g;
+  const origEdge = g.EdgeRuntime;
+  return () => {
+    if (hadDeno) g.Deno = origDeno;
+    else delete g.Deno;
+    if (hadEdge) g.EdgeRuntime = origEdge;
+    else delete g.EdgeRuntime;
+  };
+}
 
 async function tmpOutDir(label: string): Promise<string> {
-  return await Deno.makeTempDir({ prefix: `1tube-vercel-${label}-` });
+  return await mkdtemp(join(tmpdir(), `1tube-vercel-${label}-`));
 }
 
 async function readJson(path: string): Promise<Record<string, unknown>> {
-  return JSON.parse(await Deno.readTextFile(path));
+  return JSON.parse(await readFile(path, "utf8"));
 }
 
 async function exists(path: string): Promise<boolean> {
   try {
-    await Deno.stat(path);
+    await stat(path);
     return true;
   } catch {
     return false;
   }
 }
 
-Deno.test(
+test(
   "buildVercel emits Build Output API function dirs",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("boa");
     try {
       const result = await buildVercel({
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["hello", "echo"],
         sourcemap: false,
       });
@@ -99,14 +119,13 @@ Deno.test(
         assertEquals(pkg.type, "module");
       }
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel derives maxDuration from 1tube.json timeoutMs",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("maxdur");
     try {
@@ -115,7 +134,6 @@ Deno.test(
         // hello has timeoutMs 5000 (-> 5s); echo has no manifest (-> default).
         only: ["hello", "echo"],
         outDir: out,
-        configPath: DENO_JSON,
         sourcemap: false,
         defaultMaxDuration: 123,
       });
@@ -125,14 +143,13 @@ Deno.test(
       assertEquals(hello.maxDuration, 5);
       assertEquals(echo.maxDuration, 123);
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel derives maxDuration from a declared serve({ timeoutMs }) and overrides the manifest",
-  TEST_OPTS,
   async () => {
     // Faithful to `_shared/handler.ts`: register against the gateway registry
     // when present (the capture path), else fall back to Deno.serve (the
@@ -143,26 +160,26 @@ const handler = () => new Response("ok");
 if (reg) reg.register(handler, { public: true, timeoutMs: ${timeoutMs} });
 else Deno.serve(handler);
 `;
-    const dir = await Deno.makeTempDir({ prefix: "1tube-vercel-declared-" });
+    const dir = await mkdtemp(join(tmpdir(), "1tube-vercel-declared-"));
     const out = await tmpOutDir("declared");
     try {
-      await Deno.writeTextFile(
+      await writeFile(
         join(dir, "deno.json"),
         JSON.stringify({ imports: {} }),
       );
       // declared-only: serve() timeout, no manifest -> 45s.
-      await Deno.mkdir(join(dir, "declared-only"), { recursive: true });
-      await Deno.writeTextFile(
+      await mkdir(join(dir, "declared-only"), { recursive: true });
+      await writeFile(
         join(dir, "declared-only", "index.ts"),
         serveLike(45_000),
       );
       // override: serve() timeout (30s) wins over a 1tube.json timeout (300s).
-      await Deno.mkdir(join(dir, "override"), { recursive: true });
-      await Deno.writeTextFile(
+      await mkdir(join(dir, "override"), { recursive: true });
+      await writeFile(
         join(dir, "override", "index.ts"),
         serveLike(30_000),
       );
-      await Deno.writeTextFile(
+      await writeFile(
         join(dir, "override", "1tube.json"),
         JSON.stringify({ timeoutMs: 300_000 }),
       );
@@ -183,22 +200,20 @@ else Deno.serve(handler);
       assertEquals(declaredOnly.maxDuration, 45);
       assertEquals(override.maxDuration, 30);
     } finally {
-      await Deno.remove(dir, { recursive: true }).catch(() => {});
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel honours a custom path prefix and runtime",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("prefix");
     try {
       const result = await buildVercel({
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["hello"],
         sourcemap: false,
         pathPrefix: "/api/edge/",
@@ -221,21 +236,19 @@ Deno.test(
         "expected a custom-prefix sub-path route",
       );
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel writes per-function sub-path rewrite routes into config.json",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("routes");
     try {
       const result = await buildVercel({
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["hello", "echo"],
         sourcemap: false,
       });
@@ -259,20 +272,19 @@ Deno.test(
         "exact path must not be rewritten",
       );
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel merges sub-path routes before the filesystem handle and preserves existing routes",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("merge");
     try {
       // Seed a Build Output API config like `vercel build` emits: a continue
       // header route, the filesystem marker, then a SPA fallback rewrite.
-      await Deno.mkdir(out, { recursive: true });
+      await mkdir(out, { recursive: true });
       const seeded = {
         version: 3,
         routes: [
@@ -285,7 +297,7 @@ Deno.test(
           { src: "^/((?!functions/).*)$", dest: "/index.html" },
         ],
       };
-      await Deno.writeTextFile(
+      await writeFile(
         join(out, "config.json"),
         JSON.stringify(seeded),
       );
@@ -293,7 +305,6 @@ Deno.test(
       const result = await buildVercel({
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["hello", "echo"],
         sourcemap: false,
       });
@@ -319,21 +330,19 @@ Deno.test(
         "SPA fallback must be preserved",
       );
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel sub-path route merge is idempotent across re-runs",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("idem");
     try {
       const opts = {
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["hello", "echo"],
         sourcemap: false,
       } as const;
@@ -347,12 +356,12 @@ Deno.test(
       assertEquals(hello.length, 1);
       assertEquals(echo.length, 1);
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test("validateDeploymentId mirrors Vercel's custom deploymentId rules", () => {
+test("validateDeploymentId mirrors Vercel's custom deploymentId rules", () => {
   assertEquals(validateDeploymentId(" abc-123_XYZ "), "abc-123_XYZ");
   assertEquals(validateDeploymentId("a".repeat(32)), "a".repeat(32));
   assertThrows(() => validateDeploymentId(""), Error, "must not be empty");
@@ -374,16 +383,15 @@ Deno.test("validateDeploymentId mirrors Vercel's custom deploymentId rules", () 
   );
 });
 
-Deno.test(
+test(
   "buildVercel writes a custom deploymentId into config.json for Skew Protection",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("dpl");
     try {
       // Seed a frontend `vercel build` config so we prove the id is ADDED to
       // the merged file rather than replacing it.
-      await Deno.mkdir(out, { recursive: true });
-      await Deno.writeTextFile(
+      await mkdir(out, { recursive: true });
+      await writeFile(
         join(out, "config.json"),
         JSON.stringify({
           version: 3,
@@ -397,7 +405,6 @@ Deno.test(
       const result = await buildVercel({
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["hello"],
         sourcemap: false,
         deploymentId: "abc1234-m1k2j3",
@@ -419,7 +426,6 @@ Deno.test(
       const again = await buildVercel({
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["echo"],
         sourcemap: false,
       });
@@ -431,7 +437,6 @@ Deno.test(
       await buildVercel({
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["hello"],
         sourcemap: false,
         deploymentId: "next-2",
@@ -439,35 +444,32 @@ Deno.test(
       const replaced = await readJson(join(out, "config.json"));
       assertEquals(replaced.deploymentId, "next-2");
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel omits deploymentId from config.json when none is requested",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("nodpl");
     try {
       await buildVercel({
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["hello"],
         sourcemap: false,
       });
       const config = await readJson(join(out, "config.json"));
       assertEquals("deploymentId" in config, false);
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel rejects an invalid deploymentId before bundling",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("baddpl");
     try {
@@ -476,7 +478,6 @@ Deno.test(
           buildVercel({
             functionsDir: PLAYGROUND,
             outDir: out,
-            configPath: DENO_JSON,
             only: ["hello"],
             sourcemap: false,
             deploymentId: "dpl with spaces",
@@ -487,28 +488,26 @@ Deno.test(
       // Nothing was emitted — validation ran up front.
       assertEquals(await exists(join(out, "config.json")), false);
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "runVercelBuild accepts --deployment-id and the 1TUBE_VERCEL_DEPLOYMENT_ID env fallback",
-  TEST_OPTS,
   async () => {
     const outFlag = await tmpOutDir("cli-dpl-flag");
     const outEnv = await tmpOutDir("cli-dpl-env");
     const outBad = await tmpOutDir("cli-dpl-bad");
-    const prevEnv = Deno.env.get("1TUBE_VERCEL_DEPLOYMENT_ID");
-    Deno.env.delete("1TUBE_VERCEL_DEPLOYMENT_ID");
+    const prevEnv = process.env["1TUBE_VERCEL_DEPLOYMENT_ID"];
+    delete process.env["1TUBE_VERCEL_DEPLOYMENT_ID"];
     try {
       const codeFlag = await runVercelBuild([
         "--functions",
         PLAYGROUND,
         "--out",
         outFlag,
-        "--config",
-        DENO_JSON,
+        "--no-config",
         "--only",
         "hello",
         "--sourcemap",
@@ -521,14 +520,13 @@ Deno.test(
         "flag-id_1",
       );
 
-      Deno.env.set("1TUBE_VERCEL_DEPLOYMENT_ID", "env-id-2");
+      process.env["1TUBE_VERCEL_DEPLOYMENT_ID"] = "env-id-2";
       const codeEnv = await runVercelBuild([
         "--functions",
         PLAYGROUND,
         "--out",
         outEnv,
-        "--config",
-        DENO_JSON,
+        "--no-config",
         "--only",
         "hello",
         "--sourcemap",
@@ -547,8 +545,7 @@ Deno.test(
         PLAYGROUND,
         "--out",
         outBad,
-        "--config",
-        DENO_JSON,
+        "--no-config",
         "--only",
         "hello",
         "--sourcemap",
@@ -559,31 +556,27 @@ Deno.test(
       assertEquals(codeBad, 2);
       assertEquals(await exists(join(outBad, "config.json")), false);
     } finally {
-      if (prevEnv === undefined) Deno.env.delete("1TUBE_VERCEL_DEPLOYMENT_ID");
-      else Deno.env.set("1TUBE_VERCEL_DEPLOYMENT_ID", prevEnv);
+      if (prevEnv === undefined) delete process.env["1TUBE_VERCEL_DEPLOYMENT_ID"];
+      else process.env["1TUBE_VERCEL_DEPLOYMENT_ID"] = prevEnv;
       for (const d of [outFlag, outEnv, outBad]) {
-        await Deno.remove(d, { recursive: true }).catch(() => {});
+        await rm(d, { recursive: true, force: true }).catch(() => {});
       }
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel output runs as a Vercel Node handler (Deno.serve capture + req/res bridge)",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("exec");
-    // The Vercel banner overrides globalThis.Deno.serve to capture the handler
-    // and installs an EdgeRuntime shim. Snapshot + restore so other tests in
+    // The Vercel banner installs a Deno shim whose serve() captures the
+    // handler, plus an EdgeRuntime shim. Snapshot + restore so other tests in
     // the same realm aren't affected.
-    const origServe = (globalThis as { Deno: { serve: unknown } }).Deno.serve;
-    const hadEdge = "EdgeRuntime" in globalThis;
-    const origEdge = (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
+    const restoreGlobals = snapshotRuntimeGlobals();
     try {
       const result = await buildVercel({
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["hello"],
         sourcemap: false,
       });
@@ -640,13 +633,8 @@ Deno.test(
         "application/json",
       );
     } finally {
-      (globalThis as { Deno: { serve: unknown } }).Deno.serve = origServe;
-      if (hadEdge) {
-        (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime = origEdge;
-      } else {
-        delete (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
-      }
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      restoreGlobals();
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
@@ -675,29 +663,25 @@ function mockNodeRes() {
   return { res, headers, chunks };
 }
 
-Deno.test(
+test(
   "Vercel handler echoes VERCEL_DEPLOYMENT_ID as x-deployment-id unless the function set one",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("dpl-hdr");
     // A fixture that pins its own id; must not be overridden by the wrapper.
-    const fixtures = await Deno.makeTempDir({ prefix: "1tube-vercel-dplfx-" });
-    await Deno.mkdir(join(fixtures, "pinned"));
-    await Deno.writeTextFile(
+    const fixtures = await mkdtemp(join(tmpdir(), "1tube-vercel-dplfx-"));
+    await mkdir(join(fixtures, "pinned"));
+    await writeFile(
       join(fixtures, "pinned", "index.ts"),
       `Deno.serve(() =>
   new Response("pinned", { headers: { "x-deployment-id": "from-fn" } }));
 `,
     );
-    const origServe = (globalThis as { Deno: { serve: unknown } }).Deno.serve;
-    const hadEdge = "EdgeRuntime" in globalThis;
-    const origEdge = (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
-    const prevId = Deno.env.get("VERCEL_DEPLOYMENT_ID");
+    const restoreGlobals = snapshotRuntimeGlobals();
+    const prevId = process.env["VERCEL_DEPLOYMENT_ID"];
     try {
       const hello = await buildVercel({
         functionsDir: PLAYGROUND,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["hello"],
         sourcemap: false,
       });
@@ -714,13 +698,13 @@ Deno.test(
       const req = { method: "GET", url: "/", headers: { host: "localhost" } };
 
       // No deployment id in the environment → header absent (local / non-Vercel).
-      Deno.env.delete("VERCEL_DEPLOYMENT_ID");
+      delete process.env["VERCEL_DEPLOYMENT_ID"];
       const plain = mockNodeRes();
       await helloHandler(req, plain.res);
       assertEquals(plain.headers["x-deployment-id"], undefined);
 
       // Vercel-provided id → echoed on the response.
-      Deno.env.set("VERCEL_DEPLOYMENT_ID", "dpl_abc123");
+      process.env["VERCEL_DEPLOYMENT_ID"] = "dpl_abc123";
       const tagged = mockNodeRes();
       await helloHandler(req, tagged.res);
       assertEquals(tagged.headers["x-deployment-id"], "dpl_abc123");
@@ -733,7 +717,6 @@ Deno.test(
       const pinned = await buildVercel({
         functionsDir: fixtures,
         outDir: out,
-        configPath: DENO_JSON,
         only: ["pinned"],
         sourcemap: false,
       });
@@ -750,23 +733,17 @@ Deno.test(
       await pinnedHandler(req, own.res);
       assertEquals(own.headers["x-deployment-id"], "from-fn");
     } finally {
-      if (prevId === undefined) Deno.env.delete("VERCEL_DEPLOYMENT_ID");
-      else Deno.env.set("VERCEL_DEPLOYMENT_ID", prevId);
-      (globalThis as { Deno: { serve: unknown } }).Deno.serve = origServe;
-      if (hadEdge) {
-        (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime = origEdge;
-      } else {
-        delete (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
-      }
-      await Deno.remove(out, { recursive: true }).catch(() => {});
-      await Deno.remove(fixtures, { recursive: true }).catch(() => {});
+      if (prevId === undefined) delete process.env["VERCEL_DEPLOYMENT_ID"];
+      else process.env["VERCEL_DEPLOYMENT_ID"] = prevId;
+      restoreGlobals();
+      await rm(out, { recursive: true, force: true }).catch(() => {});
+      await rm(fixtures, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel throws on unknown function name in only",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("miss");
     try {
@@ -775,7 +752,6 @@ Deno.test(
           buildVercel({
             functionsDir: PLAYGROUND,
             outDir: out,
-            configPath: DENO_JSON,
             only: ["does-not-exist"],
             sourcemap: false,
           }),
@@ -783,30 +759,29 @@ Deno.test(
         "no functions matched",
       );
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel externalises an unresolvable optional dependency instead of failing",
-  TEST_OPTS,
   async () => {
     // Regression guard for the optional-dependency resolver: libraries
     // routinely require()/import() a native or peer package behind a
     // try/catch and degrade when it's absent (ws→bufferutil, debug→
-    // supports-color, …). Those are uninstalled optionalDependencies the Deno
-    // loader can't resolve, which used to abort the whole bundle unless the
+    // supports-color, …). Those are uninstalled optionalDependencies the
+    // bundler's resolver can't resolve, which used to abort the whole bundle unless the
     // exact package was on a hand-curated allowlist. The Vercel profile now
     // probes resolution and externalises ON FAILURE, so the build survives any
     // such package — not just a fixed three — and reports what it externalised.
     //
-    // The fixture imports a bare specifier with no import-map entry, which the
-    // Deno loader rejects at RESOLVE time (offline, deterministic — exactly the
+    // The fixture imports a bare specifier with no import-map entry, which
+    // esbuild rejects at RESOLVE time (offline, deterministic — exactly the
     // phase the `Could not find package …` optional-dep failure happens in).
     // A failure at LOAD time instead — e.g. an import-map alias pointing at a
     // missing file — is a real error and is intentionally NOT swallowed.
-    const dir = await Deno.makeTempDir({ prefix: "1tube-vercel-optdep-" });
+    const dir = await mkdtemp(join(tmpdir(), "1tube-vercel-optdep-"));
     const out = await tmpOutDir("optdep");
     const warnings: string[] = [];
     const originalWarn = console.warn;
@@ -814,12 +789,12 @@ Deno.test(
       warnings.push(args.map(String).join(" "));
     };
     try {
-      await Deno.writeTextFile(
+      await writeFile(
         join(dir, "deno.json"),
         JSON.stringify({ imports: {} }),
       );
-      await Deno.mkdir(join(dir, "opt"), { recursive: true });
-      await Deno.writeTextFile(
+      await mkdir(join(dir, "opt"), { recursive: true });
+      await writeFile(
         join(dir, "opt", "index.ts"),
         `let optional = null;
 try {
@@ -845,15 +820,14 @@ Deno.serve(() => Response.json({ ok: true, hadOptional: optional !== null }));
       assertStringIncludes(warned, "externalised");
     } finally {
       console.warn = originalWarn;
-      await Deno.remove(dir, { recursive: true }).catch(() => {});
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "buildVercel output survives a CJS dependency that require()s at module init",
-  TEST_OPTS,
   async () => {
     // Regression guard for the Node createRequire shim. CJS deps that
     // `require()` during module initialisation (e.g. google-auth-library →
@@ -863,26 +837,24 @@ Deno.test(
     // no `require` in scope and throws "Dynamic require of … is not supported"
     // at runtime. The fixture below forces exactly that code path with a local
     // CommonJS module (offline, deterministic — `node:os` is a builtin).
-    const dir = await Deno.makeTempDir({ prefix: "1tube-vercel-dynreq-" });
+    const dir = await mkdtemp(join(tmpdir(), "1tube-vercel-dynreq-"));
     const out = await tmpOutDir("dynreq");
-    const origServe = (globalThis as { Deno: { serve: unknown } }).Deno.serve;
-    const hadEdge = "EdgeRuntime" in globalThis;
-    const origEdge = (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
+    const restoreGlobals = snapshotRuntimeGlobals();
     try {
-      await Deno.writeTextFile(
+      await writeFile(
         join(dir, "deno.json"),
         JSON.stringify({ imports: {} }),
       );
-      await Deno.mkdir(join(dir, "dynreq"), { recursive: true });
+      await mkdir(join(dir, "dynreq"), { recursive: true });
       // CommonJS: esbuild wraps this in __commonJS and rewrites the require()
       // call to __require(...), evaluated lazily when the module is first used.
-      await Deno.writeTextFile(
+      await writeFile(
         join(dir, "dynreq", "dep.cjs"),
         `const os = require("node:os");
 module.exports = { platform: typeof os.platform === "function" ? os.platform() : "unknown" };
 `,
       );
-      await Deno.writeTextFile(
+      await writeFile(
         join(dir, "dynreq", "index.ts"),
         `import dep from "./dep.cjs";
 Deno.serve(() => Response.json({ ok: true, platform: dep.platform }));
@@ -904,21 +876,15 @@ Deno.serve(() => Response.json({ ok: true, platform: dep.platform }));
       const mod = await import(pathToFileURL(entryAbs).href);
       assertEquals(typeof mod.default, "function");
     } finally {
-      (globalThis as { Deno: { serve: unknown } }).Deno.serve = origServe;
-      if (hadEdge) {
-        (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime = origEdge;
-      } else {
-        delete (globalThis as { EdgeRuntime?: unknown }).EdgeRuntime;
-      }
-      await Deno.remove(dir, { recursive: true }).catch(() => {});
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      restoreGlobals();
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "build --target vercel happy path returns 0 and writes artifacts",
-  TEST_OPTS,
   async () => {
     const out = await tmpOutDir("cli");
     const logs: string[] = [];
@@ -939,8 +905,7 @@ Deno.test(
         "hello",
         "--sourcemap",
         "none",
-        "--config",
-        DENO_JSON,
+        "--no-config",
       ]);
     } finally {
       console.log = originalLog;
@@ -952,13 +917,12 @@ Deno.test(
     const output = logs.join("\n");
     assertStringIncludes(output, "bundling 1 function(s) for Vercel Node");
     assertStringIncludes(output, "/functions/v1/hello");
-    await Deno.remove(out, { recursive: true }).catch(() => {});
+    await rm(out, { recursive: true, force: true }).catch(() => {});
   },
 );
 
-Deno.test(
+test(
   "build --target vercel returns 2 on unknown flag",
-  TEST_OPTS,
   async () => {
     const code = await runBuild([
       "--target",
@@ -970,7 +934,7 @@ Deno.test(
   },
 );
 
-Deno.test("build rejects an unknown --target", TEST_OPTS, async () => {
+test("build rejects an unknown --target", async () => {
   const code = await runBuild(["--target", "bogus"]);
   assertEquals(code, 2);
 });

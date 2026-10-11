@@ -7,7 +7,8 @@
  * logging / rate-limit suites that share the same process.
  */
 
-import { assertEquals } from "@std/assert";
+import { test } from "bun:test";
+import { assertEquals } from "./_assert.ts";
 import { Hono } from "hono";
 import {
   DEFAULT_ROUTE_PREFIX,
@@ -31,7 +32,7 @@ function withPrefix(p: string, fn: () => void | Promise<void>) {
   };
 }
 
-Deno.test("normalizeRoutePrefix: defaults, slashes, trimming", () => {
+test("normalizeRoutePrefix: defaults, slashes, trimming", () => {
   assertEquals(normalizeRoutePrefix(undefined), "/functions/v1");
   assertEquals(normalizeRoutePrefix(""), "/functions/v1");
   assertEquals(normalizeRoutePrefix("   "), "/functions/v1");
@@ -45,7 +46,7 @@ Deno.test("normalizeRoutePrefix: defaults, slashes, trimming", () => {
   assertEquals(normalizeRoutePrefix("//edge///v2//"), "/edge/v2");
 });
 
-Deno.test(
+test(
   "routeRemainder + stripRoutePrefixFromPathname: default prefix",
   withPrefix("/functions/v1", () => {
     assertEquals(getRoutePrefix(), "/functions/v1");
@@ -59,7 +60,7 @@ Deno.test(
   }),
 );
 
-Deno.test(
+test(
   "routeRemainder + stripRoutePrefixFromPathname: custom prefix",
   withPrefix("/api/v2", () => {
     assertEquals(routeWildcard(), "/api/v2/*");
@@ -71,7 +72,7 @@ Deno.test(
   }),
 );
 
-Deno.test(
+test(
   "integration: a custom prefix routes dispatch and strips the path",
   withPrefix("/api", async () => {
     const app = new Hono();
@@ -95,7 +96,7 @@ Deno.test(
   }),
 );
 
-Deno.test("setRoutePrefix normalizes its input and is observable globally", () => {
+test("setRoutePrefix normalizes its input and is observable globally", () => {
   try {
     assertEquals(setRoutePrefix("edge/v3/"), "/edge/v3");
     assertEquals(getRoutePrefix(), "/edge/v3");

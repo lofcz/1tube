@@ -4,7 +4,7 @@
  *
  * Lives in its own module — instead of inside the build CLI — so the
  * backend can import the schema without dragging in esbuild and the
- * `@deno/esbuild-plugin` dependency tree at serve time. A `--prebuilt`
+ * compat dependency-store machinery at serve time. A `--prebuilt`
  * deploy is supposed to need *no* bundler on the box; pulling those
  * imports through `cli/build.ts` would defeat that property at the
  * type-level even if runtime bundling is skipped.

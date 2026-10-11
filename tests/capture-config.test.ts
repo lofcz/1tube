@@ -8,12 +8,13 @@
  * that only touch globals (no bare imports) so they run offline.
  */
 
-import { assert, assertEquals } from "@std/assert";
+import { test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { assert, assertEquals } from "./_assert.ts";
 import type { BundleInput } from "../src/bundler/core.ts";
 import { captureDeclaredServeConfigs } from "../src/backends/vercel/capture-config.ts";
-
-const TEST_OPTS = { sanitizeResources: false, sanitizeOps: false } as const;
 
 async function writeFixture(
   dir: string,
@@ -21,15 +22,14 @@ async function writeFixture(
   body: string,
 ): Promise<BundleInput> {
   const entrypoint = join(dir, `${name}.ts`);
-  await Deno.writeTextFile(entrypoint, body);
+  await writeFile(entrypoint, body);
   return { name, entrypoint };
 }
 
-Deno.test(
+test(
   "captureDeclaredServeConfigs reads a registry-declared timeoutMs",
-  TEST_OPTS,
   async () => {
-    const dir = await Deno.makeTempDir({ prefix: "1tube-capture-" });
+    const dir = await mkdtemp(join(tmpdir(), "1tube-capture-"));
     try {
       const input = await writeFixture(
         dir,
@@ -42,41 +42,50 @@ Deno.test(
       const map = await captureDeclaredServeConfigs([input]);
       assertEquals(map.get("declared"), { public: true, timeoutMs: 60000 });
     } finally {
-      await Deno.remove(dir, { recursive: true }).catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
-  "captureDeclaredServeConfigs does not bind a port for raw Deno.serve and restores it",
-  TEST_OPTS,
+test(
+  "captureDeclaredServeConfigs does not bind a port for raw Deno.serve and restores the Deno global",
   async () => {
-    const dir = await Deno.makeTempDir({ prefix: "1tube-capture-raw-" });
-    const origServe = Deno.serve;
+    const dir = await mkdtemp(join(tmpdir(), "1tube-capture-raw-"));
+    // Bun has no `Deno` global; the sweep installs a temporary one (with a
+    // neutralised `serve`) so raw `Deno.serve(...)` entrypoints still load.
+    const globalAny = globalThis as Record<string, unknown>;
+    const hadDeno = "Deno" in globalAny;
+    const origDeno = globalAny.Deno;
     try {
-      // If Deno.serve were NOT neutralised this would bind a real listener and
-      // leak a resource; the fixture also declares no timeout, so it must be
-      // absent from the result.
+      // If Deno.serve were NOT neutralised this would bind a real listener;
+      // the fixture also declares no timeout, so it must be absent from the
+      // result.
       const input = await writeFixture(
         dir,
         "raw",
         `Deno.serve(() => new Response("ok"));\n`,
       );
-      const map = await captureDeclaredServeConfigs([input]);
+      const warnings: string[] = [];
+      const map = await captureDeclaredServeConfigs(
+        [input],
+        (m) => warnings.push(m),
+      );
       assert(!map.has("raw"));
-      // Deno.serve must be the original reference again after the sweep.
-      assertEquals(Deno.serve, origServe);
+      // The fixture must have loaded (the shim made `Deno.serve` callable).
+      assertEquals(warnings, []);
+      // The global must be exactly what it was before the sweep.
+      assertEquals("Deno" in globalAny, hadDeno);
+      assert(globalAny.Deno === origDeno);
     } finally {
-      await Deno.remove(dir, { recursive: true }).catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "captureDeclaredServeConfigs skips an entry that throws at import and warns",
-  TEST_OPTS,
   async () => {
-    const dir = await Deno.makeTempDir({ prefix: "1tube-capture-throw-" });
+    const dir = await mkdtemp(join(tmpdir(), "1tube-capture-throw-"));
     try {
       const ok = await writeFixture(
         dir,
@@ -105,14 +114,13 @@ Deno.test(
         `expected a warning mentioning boom, got: ${warnings.join(" | ")}`,
       );
     } finally {
-      await Deno.remove(dir, { recursive: true }).catch(() => {});
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "captureDeclaredServeConfigs returns empty for no inputs",
-  TEST_OPTS,
   async () => {
     const map = await captureDeclaredServeConfigs([]);
     assertEquals(map.size, 0);

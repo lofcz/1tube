@@ -8,36 +8,40 @@
  *   - prioritize() works for pending HMR respawns, not just deferred boot
  */
 
-import { assert, assertEquals } from "@std/assert";
-import { join } from "@std/path";
-import { pathToFileURL } from "node:url";
+import { afterEach, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { assert, assertEquals } from "./_assert.ts";
 import { FunctionRegistry } from "../src/registry.ts";
 import { FunctionSupervisor } from "../src/supervisor.ts";
-import { createDenoWorkerHost } from "../src/backends/deno/worker-host.ts";
 import {
-  createDenoHotReloader,
-  createDenoReloadDebouncer,
+  createFunctionHost,
+  type FunctionHost,
+  type ReloadSummary,
+} from "../src/backends/bun/function-host.ts";
+import {
+  createHotReloader,
+  createReloadDebouncer,
   type FsEventStream,
-} from "../src/backends/deno/hot-reloader.ts";
-import { createDepGraph } from "../src/backends/deno/dep-graph.ts";
-import type {
-  DenoWorkerHost,
-  ReloadSummary,
-} from "../src/backends/deno/worker-host.ts";
+} from "../src/backends/bun/hot-reloader.ts";
+import { createDepGraph } from "../src/backends/bun/dep-graph.ts";
 
-// Re-run the suite against the colocated host with `1TUBE_FORCE_COLOCATE=1`.
-// The debounce + content-hash + fake-host cases are mode-agnostic and must
-// pass under both. The MRU-ordering / prioritize-mid-reload cases assert a
-// per-function respawn *queue* (`bootState(...) === "queued"`); colocated
-// re-imports the touched set serially in a single isolate with no such queue,
-// so those two are skipped (not deleted) under the flag.
-const FORCE_COLO = Deno.env.get("1TUBE_FORCE_COLOCATE") === "1";
+const dirs: string[] = [];
+async function tempDir(prefix: string): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), prefix));
+  dirs.push(dir);
+  return dir;
+}
+afterEach(async () => {
+  while (dirs.length > 0) await rm(dirs.pop()!, { recursive: true, force: true });
+});
 
 // ---------------------------------------------------------------------
 // Leading-edge debounce
 // ---------------------------------------------------------------------
 
-Deno.test("debouncer: leading mode arms once with leadingMs and doesn't push the flush out", async () => {
+test("debouncer: leading mode arms once with leadingMs and doesn't push the flush out", async () => {
   const armed: number[] = [];
   const timers = new Map<number, () => void>();
   let nextId = 1;
@@ -51,7 +55,7 @@ Deno.test("debouncer: leading mode arms once with leadingMs and doesn't push the
     timers.delete(id);
   };
   const flushes: string[][] = [];
-  const d = createDenoReloadDebouncer({
+  const d = createReloadDebouncer({
     debounceMs: 200,
     leadingMs: 40,
     setTimer,
@@ -77,7 +81,7 @@ Deno.test("debouncer: leading mode arms once with leadingMs and doesn't push the
   assertEquals(armed, [40, 40]);
 });
 
-Deno.test("debouncer: leading mode re-arms stragglers with the trailing debounce", async () => {
+test("debouncer: leading mode re-arms stragglers with the trailing debounce", async () => {
   const armed: number[] = [];
   const timers = new Map<number, () => void>();
   let nextId = 1;
@@ -92,7 +96,7 @@ Deno.test("debouncer: leading mode re-arms stragglers with the trailing debounce
   };
   const flushes: string[][] = [];
   let blockFlush: (() => void) | null = null;
-  const d = createDenoReloadDebouncer({
+  const d = createReloadDebouncer({
     debounceMs: 200,
     leadingMs: 40,
     setTimer,
@@ -176,11 +180,11 @@ function makeFakeStream(): FsEventStream & { emit(paths: string[]): void } {
 }
 
 function fakeHost(): {
-  host: DenoWorkerHost;
+  host: FunctionHost;
   reloads: Array<ReadonlySet<string> | "all">;
 } {
   const reloads: Array<ReadonlySet<string> | "all"> = [];
-  const host: DenoWorkerHost = {
+  const host: FunctionHost = {
     start: () => Promise.resolve({ loaded: [], errors: [] }),
     startDeferred: () =>
       Promise.resolve({
@@ -216,49 +220,52 @@ function fakeHost(): {
   return { host, reloads };
 }
 
-Deno.test("hot-reloader: identical re-save is a no-op, real change reloads", async () => {
-  const tmp = await Deno.makeTempDir({ prefix: "1tube-noop-save-" });
+test("hot-reloader: identical re-save is a no-op, real change reloads", async () => {
+  const tmp = await tempDir("1tube-noop-save-");
+  const idx = join(tmp, "alpha", "index.ts");
+  const dep = join(tmp, "alpha", "dep.ts");
+  await mkdir(join(tmp, "alpha"), { recursive: true });
+  await writeFile(dep, `export const d = 1;\n`);
+  await writeFile(idx, `import { d } from "./dep.ts";\nexport default d;\n`);
+
+  const { host, reloads } = fakeHost();
+  await host.depGraph.refresh("alpha", idx);
+  const stream = makeFakeStream();
+  const reloader = createHotReloader({
+    host,
+    functionsDir: tmp,
+    debounceMs: 5,
+    leadingMs: 5,
+    watch: () => stream,
+    log: () => {},
+  });
+  await reloader.start();
   try {
-    const idx = join(tmp, "alpha", "index.ts");
-    await Deno.mkdir(join(tmp, "alpha"), { recursive: true });
-    await Deno.writeTextFile(idx, `export default 1;\n`);
-    await fakeHost().host.depGraph.refresh("alpha", pathToFileURL(idx).href);
+    const flushSettle = () => new Promise((r) => setTimeout(r, 100));
 
-    const { host, reloads } = fakeHost();
-    await host.depGraph.refresh("alpha", pathToFileURL(idx).href);
-    const stream = makeFakeStream();
-    const reloader = createDenoHotReloader({
-      host,
-      functionsDir: tmp,
-      debounceMs: 5,
-      leadingMs: 5,
-      watch: () => stream,
-      log: () => {},
-    });
-    await reloader.start();
-    try {
-      const flushSettle = () => new Promise((r) => setTimeout(r, 100));
+    // First sighting: no baseline digest → reload happens.
+    stream.emit([idx, dep]);
+    await flushSettle();
+    assertEquals(reloads.length, 1);
 
-      // First sighting: no baseline digest → reload happens.
-      stream.emit([idx]);
-      await flushSettle();
-      assertEquals(reloads.length, 1);
+    // Identical re-save (same bytes): must be dropped before reload.
+    stream.emit([idx]);
+    await flushSettle();
+    assertEquals(reloads.length, 1, "no-op save must not respawn");
 
-      // Identical re-save (same bytes): must be dropped before reload.
-      stream.emit([idx]);
-      await flushSettle();
-      assertEquals(reloads.length, 1, "no-op save must not respawn");
+    // Real edit: reloads again.
+    await writeFile(idx, `import { d } from "./dep.ts";\nexport default d + 1;\n`);
+    stream.emit([idx]);
+    await flushSettle();
+    assertEquals(reloads.length, 2);
 
-      // Real edit: reloads again.
-      await Deno.writeTextFile(idx, `export default 2;\n`);
-      stream.emit([idx]);
-      await flushSettle();
-      assertEquals(reloads.length, 2);
-    } finally {
-      await reloader.stop();
-    }
+    // A burst where only one of two paths really changed still reloads.
+    await writeFile(dep, `export const d = 2;\n`);
+    stream.emit([idx, dep]);
+    await flushSettle();
+    assertEquals(reloads.length, 3);
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await reloader.stop();
   }
 });
 
@@ -273,11 +280,11 @@ async function writeSlowFn(
   delayMs: number,
 ): Promise<void> {
   const fnDir = join(dir, name);
-  await Deno.mkdir(fnDir, { recursive: true });
+  await mkdir(fnDir, { recursive: true });
   const delay = delayMs > 0
     ? `await new Promise((r) => setTimeout(r, ${delayMs}));\n`
     : "";
-  await Deno.writeTextFile(
+  await writeFile(
     join(fnDir, "index.ts"),
     `${delay}const reg = (globalThis as any).__edgeFunctionRegistry;
 reg.register(() => new Response(${JSON.stringify(body)}), { public: true });
@@ -298,109 +305,81 @@ async function pollUntil(
   }
 }
 
-Deno.test({
-  name: "reload: most-recently-dispatched function respawns first",
-  // MRU respawn ordering is an isolate-per-function lane concept (the test
-  // polls for a "queued" boot state). Colocated re-imports the touched set
-  // serially in one isolate; there is no per-function respawn queue.
-  ignore: FORCE_COLO,
-  fn: async () => {
-    const tmp = await Deno.makeTempDir({ prefix: "1tube-mru-" });
-    try {
-      // Alphabetical order would be aa, bb, zz. We dispatch to zz, so MRU
-      // ordering must respawn zz FIRST despite sorting last by name.
-      await writeSlowFn(tmp, "aa", "aa", 400);
-      await writeSlowFn(tmp, "bb", "bb", 400);
-      await writeSlowFn(tmp, "zz", "zz", 400);
+function slowHost(dir: string): { registry: FunctionRegistry; host: FunctionHost } {
+  const registry = new FunctionRegistry();
+  const host = createFunctionHost({
+    functionsDir: dir,
+    registry,
+    supervisor: new FunctionSupervisor(),
+    concurrency: 1,
+    reloadDrainMs: 0,
+  });
+  return { registry, host };
+}
 
-      const registry = new FunctionRegistry();
-      const supervisor = new FunctionSupervisor();
-      const host = createDenoWorkerHost({
-        functionsDir: tmp,
-        registry,
-        supervisor,
-        concurrency: 1,
-      });
-      await host.start();
-      try {
-        // Make zz the most recently used function.
-        const resp = await registry.workerHandle("zz")!.dispatch(
-          new Request("http://localhost/"),
-          null,
-          new AbortController().signal,
-        );
-        assertEquals(await resp.text(), "zz");
+test("reload: most-recently-dispatched function respawns first", async () => {
+  const tmp = await tempDir("1tube-mru-");
+  // Alphabetical order would be aa, bb, zz. We dispatch to zz, so MRU
+  // ordering must respawn zz FIRST despite sorting last by name.
+  await writeSlowFn(tmp, "aa", "aa", 400);
+  await writeSlowFn(tmp, "bb", "bb", 400);
+  await writeSlowFn(tmp, "zz", "zz", 400);
 
-        const reloadDone = host.reload(new Set(["aa", "bb", "zz"]), "test-mru");
-        // Wait until the reload has re-queued the targets (bb can only be
-        // "queued" once the reload enqueued it — boot left it "ready").
-        await pollUntil(() => host.bootState("bb") === "queued");
-        // With one lane, zz (MRU) is picked first; when it's ready, the
-        // alphabetically-earlier functions must still be waiting.
-        const outcome = await host.whenReady("zz", 30_000);
-        assertEquals(outcome, "ready");
-        assert(
-          host.bootState("aa") !== "ready" || host.bootState("bb") !== "ready",
-          "zz must not respawn last despite its name sorting last",
-        );
+  const { registry, host } = slowHost(tmp);
+  await host.start();
+  try {
+    // Make zz the most recently used function.
+    const resp = await registry.workerHandle("zz")!.dispatch(
+      new Request("http://localhost/"),
+      null,
+      new AbortController().signal,
+    );
+    assertEquals(await resp.text(), "zz");
 
-        const summary = await reloadDone;
-        assertEquals(summary.errors, []);
-        assertEquals(summary.reloaded, ["aa", "bb", "zz"]);
-      } finally {
-        await host.stop();
-      }
-    } finally {
-      await Deno.remove(tmp, { recursive: true });
-    }
-  },
-});
+    const reloadDone = host.reload(new Set(["aa", "bb", "zz"]), "test-mru");
+    // Wait until the reload has re-queued the targets (bb can only be
+    // "queued" once the reload enqueued it — boot left it "ready").
+    await pollUntil(() => host.bootState("bb") === "queued");
+    // With one lane, zz (MRU) is picked first; when it's ready, the
+    // alphabetically-earlier functions must still be waiting.
+    assertEquals(await host.whenReady("zz", 30_000), "ready");
+    assert(
+      host.bootState("aa") !== "ready" || host.bootState("bb") !== "ready",
+      "zz must not respawn last despite its name sorting last",
+    );
 
-Deno.test({
-  name: "reload: prioritize() pulls a queued respawn forward mid-reload",
-  // prioritize() reorders a per-function respawn lane (polls for "queued").
-  // Colocated has no such lane, so this case is isolate-per-function only.
-  ignore: FORCE_COLO,
-  fn: async () => {
-    const tmp = await Deno.makeTempDir({ prefix: "1tube-prio-reload-" });
-    try {
-      await writeSlowFn(tmp, "aa", "aa", 600);
-      await writeSlowFn(tmp, "bb", "bb", 600);
-      await writeSlowFn(tmp, "mm", "mm", 0);
+    const summary = await reloadDone;
+    assertEquals(summary.errors, []);
+    assertEquals(summary.reloaded, ["aa", "bb", "zz"]);
+  } finally {
+    await host.stop();
+  }
+}, 30_000);
 
-      const registry = new FunctionRegistry();
-      const supervisor = new FunctionSupervisor();
-      const host = createDenoWorkerHost({
-        functionsDir: tmp,
-        registry,
-        supervisor,
-        concurrency: 1,
-      });
-      await host.start();
-      try {
-        const reloadDone = host.reload(
-          new Set(["aa", "bb", "mm"]),
-          "test-prioritize",
-        );
-        // Wait for the reload to enqueue, then simulate "a request hit mm"
-        // while the single lane is stuck on the slow aa.
-        await pollUntil(() => host.bootState("mm") === "queued");
-        host.prioritize("mm");
-        const outcome = await host.whenReady("mm", 30_000);
-        assertEquals(outcome, "ready");
-        assert(
-          host.bootState("bb") !== "ready",
-          "bb (queued behind the slow lane) must still be pending when prioritized mm is ready",
-        );
+test("reload: prioritize() pulls a queued respawn forward mid-reload", async () => {
+  const tmp = await tempDir("1tube-prio-reload-");
+  await writeSlowFn(tmp, "aa", "aa", 600);
+  await writeSlowFn(tmp, "bb", "bb", 600);
+  await writeSlowFn(tmp, "mm", "mm", 0);
 
-        const summary = await reloadDone;
-        assertEquals(summary.errors, []);
-        assertEquals(summary.reloaded, ["aa", "bb", "mm"]);
-      } finally {
-        await host.stop();
-      }
-    } finally {
-      await Deno.remove(tmp, { recursive: true });
-    }
-  },
-});
+  const { host } = slowHost(tmp);
+  await host.start();
+  try {
+    const reloadDone = host.reload(new Set(["aa", "bb", "mm"]), "test-prioritize");
+    // Wait for the reload to enqueue, then simulate "a request hit mm"
+    // while the single lane is stuck on the slow aa.
+    await pollUntil(() => host.bootState("mm") === "queued");
+    host.prioritize("mm");
+    assertEquals(await host.whenReady("mm", 30_000), "ready");
+    assert(
+      host.bootState("bb") !== "ready",
+      "bb (queued behind the slow lane) must still be pending when prioritized mm is ready",
+    );
+
+    const summary = await reloadDone;
+    assertEquals(summary.errors, []);
+    assertEquals(summary.reloaded, ["aa", "bb", "mm"]);
+  } finally {
+    await host.stop();
+  }
+}, 30_000);

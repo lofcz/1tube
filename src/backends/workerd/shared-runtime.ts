@@ -1,4 +1,4 @@
-import { pathToFileURL } from "node:url";
+import { createDenoNamespace, createEdgeRuntime } from "../../compat/deno-shim.ts";
 
 export const SHARED_RUNTIME_URL_ENV = "__1TUBE_SHARED_RUNTIME_URL";
 export const SHARED_RUNTIME_TOKEN_ENV = "__1TUBE_SHARED_RUNTIME_TOKEN";
@@ -35,70 +35,113 @@ async function readJson(req: Request): Promise<Record<string, unknown>> {
     : {};
 }
 
+function processEnv() {
+  return {
+    get: (k: string) => process.env[k],
+    set: (k: string, v: string) => {
+      process.env[k] = v;
+    },
+    delete: (k: string) => {
+      delete process.env[k];
+    },
+    has: (k: string) => k in process.env,
+    toObject: () => ({ ...process.env }) as Record<string, string>,
+  };
+}
+
 /**
- * Gateway-owned singleton runtime for modules that rely on Deno's
- * process-wide semantics. Workerd function isolates call this over a
- * private loopback RPC instead of evaluating those modules per isolate.
+ * Gateway-owned singleton runtime for modules that rely on process-wide
+ * semantics. Workerd function isolates call this over a private loopback
+ * RPC instead of evaluating those modules per isolate.
+ *
+ * The bundles are evaluated in one dedicated `Bun.ModuleGraph` whose
+ * globals carry the same `Deno` / `EdgeRuntime` shims the Bun backend gives
+ * its shared modules, so Supabase-style code (`Deno.env.get(...)`) runs
+ * unchanged without a `Deno` global leaking into the gateway process.
  */
 export async function startWorkerdSharedRuntime(
   modules: readonly SharedRuntimeModule[],
 ): Promise<WorkerdSharedRuntime | null> {
   if (modules.length === 0) return null;
 
+  const graph = new Bun.ModuleGraph({
+    globals: {
+      Deno: createDenoNamespace({
+        functionName: "<shared>",
+        env: processEnv(),
+        onServe: () => {
+          throw new Error("shared modules cannot call serve()");
+        },
+      }),
+      EdgeRuntime: createEdgeRuntime({}),
+    },
+    onError: (err, kind) => {
+      console.error(`[1tube] workerd shared module ${kind}:`, err);
+    },
+  });
   const loaded = new Map<string, Record<string, unknown>>();
-  for (const module of modules) {
-    const exports = await import(
-      pathToFileURL(module.bundlePath).href
-    ) as Record<string, unknown>;
-    for (const name of module.exportNames) {
-      if (typeof exports[name] !== "function") {
-        throw new Error(
-          `shared module ${module.bundlePath} does not export function ${name}()`,
-        );
+  try {
+    for (const module of modules) {
+      const exports = await graph.import(module.bundlePath) as Record<
+        string,
+        unknown
+      >;
+      for (const name of module.exportNames) {
+        if (typeof exports[name] !== "function") {
+          throw new Error(
+            `shared module ${module.bundlePath} does not export function ${name}()`,
+          );
+        }
       }
+      loaded.set(module.id, exports);
     }
-    loaded.set(module.id, exports);
+  } catch (err) {
+    graph.dispose();
+    throw err;
   }
 
   const token = randomToken();
-  const server = Deno.serve({
+  const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    onListen: () => {},
-  }, async (req) => {
-    if (req.headers.get("authorization") !== `Bearer ${token}`) {
-      return json({ error: "unauthorized" }, 401);
-    }
-
-    const url = new URL(req.url);
-    try {
-      const match = /^\/modules\/([^/]+)\/call\/([^/]+)$/.exec(url.pathname);
-      if (req.method === "POST" && match) {
-        const [, moduleId, exportName] = match;
-        const exports = loaded.get(decodeURIComponent(moduleId));
-        if (!exports) return json({ error: "unknown shared module" }, 404);
-        const fn = exports[decodeURIComponent(exportName)];
-        if (typeof fn !== "function") {
-          return json({ error: "unknown shared export" }, 404);
-        }
-        const body = await readJson(req);
-        const args = Array.isArray(body.args) ? body.args : [];
-        return json({ value: await fn(...args) });
+    // Shared calls may legitimately run long (cache refreshes, remote I/O);
+    // the isolate's own deadline bounds them, not Bun's idle timer.
+    idleTimeout: 0,
+    fetch: async (req) => {
+      if (req.headers.get("authorization") !== `Bearer ${token}`) {
+        return json({ error: "unauthorized" }, 401);
       }
 
-      return json({ error: "not found" }, 404);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return json({ error: message }, 500);
-    }
+      const url = new URL(req.url);
+      try {
+        const match = /^\/modules\/([^/]+)\/call\/([^/]+)$/.exec(url.pathname);
+        if (req.method === "POST" && match) {
+          const [, moduleId, exportName] = match;
+          const exports = loaded.get(decodeURIComponent(moduleId));
+          if (!exports) return json({ error: "unknown shared module" }, 404);
+          const fn = exports[decodeURIComponent(exportName)];
+          if (typeof fn !== "function") {
+            return json({ error: "unknown shared export" }, 404);
+          }
+          const body = await readJson(req);
+          const args = Array.isArray(body.args) ? body.args : [];
+          return json({ value: await fn(...args) });
+        }
+
+        return json({ error: "not found" }, 404);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return json({ error: message }, 500);
+      }
+    },
   });
 
-  const addr = server.addr as Deno.NetAddr;
   return {
-    url: `http://127.0.0.1:${addr.port}`,
+    url: `http://127.0.0.1:${server.port}`,
     token,
     async stop() {
-      await server.shutdown();
+      await server.stop();
+      graph.dispose();
     },
   };
 }

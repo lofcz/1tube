@@ -8,7 +8,7 @@
  *  - `node` platform + conditions, so packages resolve their Node build and the
  *    host runtime supplies the builtins;
  *  - a resolver plugin that externalises Node builtins (the Node runtime owns
- *    them — don't bundle Deno's polyfills);
+ *    them — don't bundle polyfills);
  *  - the small set of optional native deps libraries `require()` behind a
  *    try/catch, kept external so esbuild's `__require` shim throws at the call
  *    site and the library falls back to its pure-JS path.
@@ -17,7 +17,7 @@
  * and the workerd backend never reference Vercel.
  */
 
-import * as esbuild from "npm:esbuild@^0.28.1";
+import * as esbuild from "esbuild";
 import type { BundleProfile } from "../../bundler/profile.ts";
 import {
   NODE_BUILTIN_MODULES,
@@ -35,11 +35,11 @@ function isNodeBuiltinBare(spec: string): boolean {
 }
 
 /**
- * Leave Node builtins to the host runtime instead of bundling Deno's polyfills.
+ * Leave Node builtins to the host runtime instead of bundling polyfills.
  * `node:`-prefixed specifiers are always external; bare builtins (`crypto`,
  * `stream`, `stream/web`, …) are rewritten to their `node:` form and
- * externalised. Non-builtins fall through to the Deno loader for npm/jsr
- * resolution. Registered before the Deno loader so it wins for these specifiers.
+ * externalised. Non-builtins fall through to the compat plugin for npm/jsr
+ * resolution. Registered before the compat plugin so it wins for these specifiers.
  */
 function nodeBuiltinsExternalPlugin(): esbuild.Plugin {
   return {
@@ -67,14 +67,15 @@ function nodeBuiltinsExternalPlugin(): esbuild.Plugin {
  * native/peer package behind a `try/catch` as an opt-in speedup, degrading to
  * a pure-JS path when it's absent (`ws` → `bufferutil`/`utf-8-validate`,
  * `debug` → `supports-color`, `chokidar` → `fsevents`, and so on). Those are
- * uninstalled `optionalDependencies`, so the Deno loader can't resolve them
+ * uninstalled `optionalDependencies`, so nothing can resolve them
  * when the `node` build is selected and esbuild aborts the entire bundle.
  *
  * A hand-curated allowlist of such packages can never be exhaustive — the next
  * dependency that optionally `require()`s a native addon breaks the build. So
  * rather than enumerate them, we let esbuild attempt resolution and act ONLY on
  * failure: re-probe the specifier with `build.resolve()` and, if every
- * resolver (node-builtins plugin + Deno loader) gives up, mark it external.
+ * resolver (node-builtins plugin, compat plugin, esbuild's own node_modules
+ * walk) gives up, mark it external.
  * esbuild then emits its `__require` shim, which throws at the call site —
  * exactly what the library's `catch` expects.
  *
@@ -85,7 +86,7 @@ function nodeBuiltinsExternalPlugin(): esbuild.Plugin {
  *    entry stand-in, and Windows drive paths). Only colon-free bare package
  *    specifiers (`debug`, `@scope/pkg`, `ws/lib/x.js`) are probed.
  *  - A `pluginData` flag breaks the recursion when our own `build.resolve()`
- *    re-enters this callback, so the Deno loader does the real resolution.
+ *    re-enters this callback, so the other resolvers do the real resolution.
  *
  * Every externalised specifier is reported once at build end. A genuinely
  * REQUIRED-but-missing dependency therefore surfaces in the build log (and
@@ -105,9 +106,11 @@ function optionalDependencyExternalPlugin(): esbuild.Plugin {
         // which carry a colon). Leaves only bare npm package specifiers.
         if (args.path.startsWith("/") || args.path.includes(":")) return null;
         // Re-entrant hit from the build.resolve() probe below — defer to the
-        // node-builtins resolver and the Deno loader.
-        const data = args.pluginData as { probe?: boolean } | undefined;
-        if (data?.probe) return null;
+        // node-builtins resolver, the compat plugin and esbuild itself.
+        // Probes from the node-builtins resolver count too: answering them
+        // with a probe of our own would bounce the specifier forever.
+        const data = args.pluginData as { probe?: boolean; builtinProbe?: boolean } | undefined;
+        if (data?.probe || data?.builtinProbe) return null;
 
         const probe = await build.resolve(args.path, {
           importer: args.importer,

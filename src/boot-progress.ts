@@ -21,6 +21,8 @@
  * so a wedged import won't spam the log either.
  */
 
+import { stdout } from "./stdio.ts";
+
 const DEFAULT_PULSE_MS = 2000;
 /** Cap inflight names rendered inline so a long list doesn't wrap. */
 const MAX_INFLIGHT_RENDERED = 4;
@@ -48,7 +50,7 @@ export interface BootProgressOptions {
 }
 
 export function createBootProgress(
-  sink: Sink = Deno.stdout,
+  sink: Sink = stdout,
   opts: BootProgressOptions = {},
 ): BootProgress {
   const enc = new TextEncoder();
@@ -148,7 +150,7 @@ export interface ScanProgress {
   /** Update the discovered-function count (scan phase). */
   setFound(found: number): void;
   /** Switch the phase label (e.g. "scan" → "graph"). */
-  setPhase(phase: "scan" | "graph"): void;
+  setPhase(phase: "scan" | "graph" | "install"): void;
   /** Clear the line and stop ticking. Idempotent. */
   stop(): void;
 }
@@ -159,7 +161,7 @@ export interface ScanProgressOptions {
 }
 
 export function createScanProgress(
-  sink: Sink = Deno.stdout,
+  sink: Sink = stdout,
   opts: ScanProgressOptions = {},
 ): ScanProgress {
   const enc = new TextEncoder();
@@ -173,9 +175,9 @@ export function createScanProgress(
   })();
 
   let found = 0;
-  let phase: "scan" | "graph" = "scan";
+  let phase: "scan" | "graph" | "install" = "scan";
   let startedAt = 0;
-  let timer: number | undefined;
+  let timer: ReturnType<typeof setInterval> | undefined;
   let active = false;
 
   const write = (s: string) => {
@@ -189,7 +191,9 @@ export function createScanProgress(
   const render = () => {
     if (!isTty || !active) return;
     const elapsed = ((performance.now() - startedAt) / 1000).toFixed(1);
-    const body = phase === "graph"
+    const body = phase === "install"
+      ? `Installing npm:/jsr: dependencies… `
+      : phase === "graph"
       ? `Building dependency graph… ${
         found > 0 ? `${found} function${found === 1 ? "" : "s"} ` : ""
       }`
@@ -205,7 +209,7 @@ export function createScanProgress(
       startedAt = performance.now();
       render();
       if (isTty && tickMs > 0) {
-        timer = setInterval(render, tickMs) as unknown as number;
+        timer = setInterval(render, tickMs);
       }
     },
     setFound(n) {

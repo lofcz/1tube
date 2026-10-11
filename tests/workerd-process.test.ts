@@ -2,30 +2,28 @@
  * Tests for the workerd process manager.
  *
  * The real workerd binary is *not* required for the lifecycle tests —
- * a tiny Deno script stands in for it via the `globalArgs` seam:
+ * a tiny Bun script stands in for it via the `globalArgs` seam:
  *
- *     deno run --allow-net --allow-read fake.ts -- serve <capnp>
+ *     bun fake.ts serve <capnp>
  *
- * That spawn shape gives the script the same `Deno.args ===
+ * That spawn shape gives the script the same `process.argv.slice(2) ===
  * ["serve", capnp]` view that real workerd would see, so the
  * orchestration logic is exercised end-to-end without depending on
  * which workerd build the developer happens to have installed. A
  * separate opportunistic test calls `probeVersion` against the real
  * binary if one is on PATH; it's silently skipped otherwise.
- *
- * Per-test sanitizer suppression is needed because spawning child
- * processes from a test trips Deno's resource sanitizer in ways that
- * are noise here — every spawned child is reaped before the test
- * returns, but Deno's sanitizer audits internal scheduling that we
- * cannot influence from userland.
  */
 
+import { test } from "bun:test";
 import {
   assert,
   assertEquals,
   assertRejects,
   assertStringIncludes,
-} from "@std/assert";
+} from "./_assert.ts";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { connect } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createWorkerdProcess,
@@ -36,24 +34,42 @@ import {
   waitForPorts,
 } from "../src/backends/workerd/process.ts";
 
-const PROC_TEST = { sanitizeOps: false, sanitizeResources: false } as const;
-
 /** Bind ephemeral port(s), capture them, release. There's a tiny race
  *  with re-binding but it's negligible inside a single test process. */
 async function freePorts(count: number): Promise<number[]> {
   const ports: number[] = [];
-  const listeners: Deno.Listener[] = [];
+  const listeners: Listener[] = [];
   for (let i = 0; i < count; i++) {
-    const l = Deno.listen({ hostname: "127.0.0.1", port: 0 });
+    const l = listen(0);
     listeners.push(l);
-    ports.push((l.addr as Deno.NetAddr).port);
+    ports.push(l.port);
   }
   for (const l of listeners) l.close();
   return ports;
 }
 
+interface Listener {
+  port: number;
+  close(): void;
+}
+
+/** Bind a TCP listener on loopback that closes every accepted socket. */
+function listen(port: number): Listener {
+  const l = Bun.listen({
+    hostname: "127.0.0.1",
+    port,
+    socket: {
+      open(socket) {
+        socket.end();
+      },
+      data() {},
+    },
+  });
+  return { port: l.port, close: () => l.stop(true) };
+}
+
 /**
- * Source of a fake-workerd Deno script. Recognises:
+ * Source of a fake-workerd Bun script. Recognises:
  *
  *   `<bin> --version`                — prints workerd-shaped version
  *   `<bin> serve <capnpPath> [...]`  — listens on every `address = "..."`
@@ -64,53 +80,52 @@ async function freePorts(count: number): Promise<number[]> {
  * SIGKILL escalation path is exercised on `stop()`.
  */
 const FAKE_WORKERD = String.raw`
-const a = Deno.args;
+const a = process.argv.slice(2);
 if (a.includes("--version")) {
   console.log("workerd 1.2026.04.25 (fake)");
-  Deno.exit(0);
+  process.exit(0);
 }
 const i = a.indexOf("serve");
 if (i === -1) {
   console.error("fake-workerd: expected 'serve'");
-  Deno.exit(64);
+  process.exit(64);
 }
 const capnpPath = a[i + 1];
-const text = await Deno.readTextFile(capnpPath);
+const text = await Bun.file(capnpPath).text();
 const rx = /address = "([^"]+)"/g;
 let m;
 const listeners = [];
 while ((m = rx.exec(text)) !== null) {
   const [host, port] = m[1].split(":");
-  const l = Deno.listen({ hostname: host, port: Number(port) });
+  const l = Bun.listen({
+    hostname: host,
+    port: Number(port),
+    socket: { open(s) { s.end(); }, data() {} },
+  });
   listeners.push(l);
   console.error("info: Listening on " + host + ":" + port);
-  (async () => {
-    for await (const conn of l) { try { conn.close(); } catch {} }
-  })();
 }
 console.log("fake workerd ready");
-if (Deno.build.os !== "windows") {
-  Deno.addSignalListener("SIGTERM", () => { /* swallow so we test escalation */ });
+if (process.platform !== "win32") {
+  process.on("SIGTERM", () => { /* swallow so we test escalation */ });
 }
-await new Promise(() => {});
+setInterval(() => {}, 1 << 30);
 `;
 
 async function withFakeWorkerd<T>(
   fn: (scriptPath: string) => Promise<T>,
 ): Promise<T> {
-  const dir = await Deno.makeTempDir({ prefix: "1tube-fake-wd-" });
+  const dir = await mkdtemp(join(tmpdir(), "1tube-fake-wd-"));
   const path = join(dir, "fake-workerd.ts");
-  await Deno.writeTextFile(path, FAKE_WORKERD);
+  await writeFile(path, FAKE_WORKERD);
   try {
     return await fn(path);
   } finally {
-    try {
-      await Deno.remove(dir, { recursive: true });
-    } catch { /* */ }
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
-Deno.test("workerd-process: parseVersionOutput accepts the canonical shape", () => {
+test("workerd-process: parseVersionOutput accepts the canonical shape", () => {
   const a = parseVersionOutput("workerd 1.2025.04.10\n");
   assertEquals(a.version, "1.2025.04.10");
   assertEquals(a.raw, "workerd 1.2025.04.10");
@@ -119,7 +134,7 @@ Deno.test("workerd-process: parseVersionOutput accepts the canonical shape", () 
   assertEquals(b.version, "1.2025.04.10");
 });
 
-Deno.test("workerd-process: maxCompatDateFromVersion derives the build date", () => {
+test("workerd-process: maxCompatDateFromVersion derives the build date", () => {
   // Canonical workerd version → reliable ceiling.
   assertEquals(maxCompatDateFromVersion("1.20260415.0"), "2026-04-15");
   assertEquals(maxCompatDateFromVersion("1.20240923.5"), "2024-09-23");
@@ -135,14 +150,14 @@ Deno.test("workerd-process: maxCompatDateFromVersion derives the build date", ()
   assertEquals(maxCompatDateFromVersion("1.20261332.0"), null);
 });
 
-Deno.test("workerd-process: isCompatDateAtMost compares lexicographically", () => {
+test("workerd-process: isCompatDateAtMost compares lexicographically", () => {
   assert(isCompatDateAtMost("2024-09-23", "2026-04-25"));
   assert(isCompatDateAtMost("2026-04-25", "2026-04-25"));
   assert(!isCompatDateAtMost("2026-04-26", "2026-04-25"));
   assert(!isCompatDateAtMost("2099-01-01", "2026-04-25"));
 });
 
-Deno.test("workerd-process: parseVersionOutput rejects garbage", () => {
+test("workerd-process: parseVersionOutput rejects garbage", () => {
   for (const bad of ["", "not-workerd\nfoo", "node v22.0.0"]) {
     let threw = false;
     try {
@@ -154,9 +169,9 @@ Deno.test("workerd-process: parseVersionOutput rejects garbage", () => {
   }
 });
 
-Deno.test("workerd-process: waitForPorts succeeds when a listener is up", async () => {
+test("workerd-process: waitForPorts succeeds when a listener is up", async () => {
   const [port] = await freePorts(1);
-  const listener = Deno.listen({ hostname: "127.0.0.1", port });
+  const listener = listen(port);
   try {
     await waitForPorts([{ host: "127.0.0.1", port }], { timeoutMs: 1_000 });
   } finally {
@@ -164,7 +179,7 @@ Deno.test("workerd-process: waitForPorts succeeds when a listener is up", async 
   }
 });
 
-Deno.test("workerd-process: waitForPorts times out when nothing listens", async () => {
+test("workerd-process: waitForPorts times out when nothing listens", async () => {
   const [port] = await freePorts(1);
   await assertRejects(
     () =>
@@ -177,7 +192,7 @@ Deno.test("workerd-process: waitForPorts times out when nothing listens", async 
   );
 });
 
-Deno.test("workerd-process: waitForPorts honours abortSignal", async () => {
+test("workerd-process: waitForPorts honours abortSignal", async () => {
   const [port] = await freePorts(1);
   const ctrl = new AbortController();
   setTimeout(() => ctrl.abort(), 50);
@@ -192,12 +207,12 @@ Deno.test("workerd-process: waitForPorts honours abortSignal", async () => {
   );
 });
 
-Deno.test("workerd-process: waitForPorts returns once *all* ports are up", async () => {
+test("workerd-process: waitForPorts returns once *all* ports are up", async () => {
   const [pa, pb] = await freePorts(2);
-  const la = Deno.listen({ hostname: "127.0.0.1", port: pa });
-  let lb: Deno.Listener | null = null;
+  const la = listen(pa);
+  let lb: Listener | null = null;
   const delay = setTimeout(() => {
-    lb = Deno.listen({ hostname: "127.0.0.1", port: pb });
+    lb = listen(pb);
   }, 200);
   try {
     const start = performance.now();
@@ -213,38 +228,29 @@ Deno.test("workerd-process: waitForPorts returns once *all* ports are up", async
   } finally {
     clearTimeout(delay);
     la.close();
-    if (lb) (lb as Deno.Listener).close();
+    if (lb) (lb as Listener).close();
   }
 });
 
-Deno.test(
+test(
   "workerd-process: lifecycle waits for sockets, then stops cleanly",
-  PROC_TEST,
   async () => {
     await withFakeWorkerd(async (fakeScript) => {
       const [port] = await freePorts(1);
-      const tmpDir = await Deno.makeTempDir({ prefix: "1tube-proc-life-" });
+      const tmpDir = await mkdtemp(join(tmpdir(), "1tube-proc-life-"));
       try {
         const capnpPath = join(tmpDir, "config.capnp");
         // Fake-workerd only inspects `address = "..."` patterns.
-        await Deno.writeTextFile(capnpPath, `address = "127.0.0.1:${port}"\n`);
+        await writeFile(capnpPath, `address = "127.0.0.1:${port}"\n`);
 
         const lines: string[] = [];
         const proc = createWorkerdProcess({
-          binary: Deno.execPath(),
+          binary: process.execPath,
           capnpPath,
-          // deno run ... fake.ts -- serve <capnp>
-          // Manager appends `serve <capnp>` after globalArgs, so the `--`
-          // sentinel correctly marks where deno's CLI args end and the
-          // script's argv begins.
-          globalArgs: [
-            "run",
-            "--quiet",
-            "--allow-net",
-            "--allow-read",
-            fakeScript,
-            "--",
-          ],
+          // bun fake.ts serve <capnp>
+          // Manager appends `serve <capnp>` after globalArgs; everything
+          // after the script path is the script's own argv.
+          globalArgs: [fakeScript],
           routes: [{
             name: "x",
             service: "x",
@@ -271,8 +277,13 @@ Deno.test(
         // Listener was inspected via TCP probe, but verify we can still
         // open and close a fresh connection — the fake's accept loop
         // immediately closes, which is exactly the readiness contract.
-        const probe = await Deno.connect({ hostname: "127.0.0.1", port });
-        probe.close();
+        await new Promise<void>((resolve, reject) => {
+          const probe = connect({ host: "127.0.0.1", port }, () => {
+            probe.destroy();
+            resolve();
+          });
+          probe.once("error", reject);
+        });
 
         // The fake printed both stderr ("info: Listening on ...") and
         // stdout ("fake workerd ready") lines; both must arrive at the
@@ -296,32 +307,30 @@ Deno.test(
         // Idempotency: second stop is a no-op, never throws.
         await proc.stop();
       } finally {
-        try {
-          await Deno.remove(tmpDir, { recursive: true });
-        } catch { /* */ }
+        await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
       }
     });
   },
 );
 
-Deno.test(
+test(
   "workerd-process: start() throws when child exits before ready",
-  PROC_TEST,
   async () => {
-    // Use deno itself with no script — exits immediately with code 1
-    // because no subcommand. The manager's exit-watch must abort the
-    // readiness probe and surface a useful error.
+    // Use bun itself with an inline script that exits immediately with a
+    // non-zero code. The manager's exit-watch must abort the readiness
+    // probe and surface a useful error.
     const [port] = await freePorts(1);
-    const tmpDir = await Deno.makeTempDir({ prefix: "1tube-proc-crash-" });
+    const tmpDir = await mkdtemp(join(tmpdir(), "1tube-proc-crash-"));
     try {
       const capnpPath = join(tmpDir, "config.capnp");
-      await Deno.writeTextFile(capnpPath, `address = "127.0.0.1:${port}"\n`);
+      await writeFile(capnpPath, `address = "127.0.0.1:${port}"\n`);
 
       const proc = createWorkerdProcess({
-        binary: Deno.execPath(),
+        binary: process.execPath,
         capnpPath,
-        // `--no-such-flag` makes deno exit immediately with non-zero.
-        globalArgs: ["--no-such-flag"],
+        // `bun -e "process.exit(3)" serve <capnp>` exits immediately with
+        // a non-zero code (the trailing args are ignored by the eval).
+        globalArgs: ["-e", "process.exit(3)"],
         routes: [{
           name: "x",
           service: "x",
@@ -355,20 +364,17 @@ Deno.test(
         "exit listener should have fired with the early-exit code",
       );
     } finally {
-      try {
-        await Deno.remove(tmpDir, { recursive: true });
-      } catch { /* */ }
+      await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "workerd-process: probeVersion against real workerd if available",
-  PROC_TEST,
   async () => {
     // Opportunistic — confirms the host's installed workerd's --version
     // output parses through our regex unchanged.
-    const candidate = Deno.env.get("1TUBE_WORKERD_BIN") ?? "workerd";
+    const candidate = process.env["1TUBE_WORKERD_BIN"] ?? "workerd";
     try {
       const info = await probeVersion(candidate);
       assert(info.version.length > 0);

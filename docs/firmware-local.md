@@ -9,10 +9,14 @@ where the curl call originates.
 
 | Tool                                                                                                                                   | Reason                                                         |
 | -------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| Deno on PATH (or absolute path in `OneTube.DenoBinary`)                                                                                | Builds the bundles + runs the gateway.                         |
+| Bun ≥ 1.4.3 on PATH (or absolute path in `OneTube.BunBinary`)                                                                          | Builds the bundles + runs the gateway.                         |
 | `workerd` binary on PATH (or absolute path in `OneTube.WorkerdBinary`)                                                                 | Runs the bundled functions when `OneTube.Backend = "Workerd"`. |
 | `priprava` configured with `OneTube.Enabled = true`, `OneTube.Firmware.Enabled = true`, and `OneTube.Firmware.SharedSecret` populated. | Hosts the firmware endpoints.                                  |
 | `sciobot-next` checked out at `C:/Users/lordo/Documents/GitHub/sciobot-next` (or wherever `OneTube.FunctionsPath` points).             | Source for the bundled functions.                              |
+
+On first start the host runs `bun install --frozen-lockfile --production` in
+the bundled `OneTubeGateway/` folder to fetch the gateway's own dependencies, so
+it needs npm registry access (or run that command there at deploy time).
 
 The shared secret can be any random hex/base64 string. A 32-byte key is fine; 16
 bytes is the minimum we accept. Generate one with:
@@ -31,25 +35,25 @@ $env:ONETUBE_FIRMWARE_KEY = "<the-hex-from-above>"
 
 ```powershell
 cd C:/Users/lordo/Documents/GitHub/sciobot-next
-deno run -A ../1tube/src/cli.ts build `
+bun ../1tube/src/cli.ts build `
   --functions supabase/functions `
   --out dist/
 ```
 
 Result: `dist/manifest.json` + `dist/functions/<fn>.js`.
 
-> **Deno config resolution.** The build auto-detects an import map from (in
+> **Import map resolution.** The build auto-detects an import map from (in
 > order): `cwd/deno.json[c]`, then `<functions-dir>/deno.json[c]` — the second
 > covers the standard Supabase layout where the `deno.json` lives next to the
 > edge functions, not at repo root. If neither exists the build still proceeds
-> but with no import map (npm: / jsr: / bare specifiers must already be
-> installed). Override with `--config <path>` or skip entirely with
+> but with no import map (bare specifiers must then resolve from
+> `node_modules`). Override with `--config <path>` or skip entirely with
 > `--no-config`.
 
 ## 2. Package into a signed `.1tube` payload
 
 ```powershell
-deno run -A ../1tube/src/cli.ts package `
+bun ../1tube/src/cli.ts package `
   --in dist `
   --out fw.1tube `
   --sign-key=$env:ONETUBE_FIRMWARE_KEY

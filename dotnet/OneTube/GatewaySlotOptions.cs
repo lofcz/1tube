@@ -1,14 +1,14 @@
 namespace OneTube;
 
 /// <summary>
-/// Per-slot tuple injected into <see cref="DenoHostService"/> so a
+/// Per-slot tuple injected into <see cref="GatewayHostService"/> so a
 /// single concrete class can drive multiple gateway lifecycles in
 /// the same process.
 ///
 /// <para>
 /// All other configuration (binaries, project paths, env vars, etc.)
 /// still comes from <see cref="OneTubeOptions"/> — those fields are
-/// process-global by design, since every slot uses the same Deno
+/// process-global by design, since every slot uses the same Bun
 /// binary, the same workerd binary, and runs over the same source
 /// tree. The slot is responsible only for the things that genuinely
 /// differ between gateway processes: which TCP port to bind, what role

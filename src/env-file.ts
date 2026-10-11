@@ -2,17 +2,29 @@
  * Dotenv parse + apply helpers for HMR secret reloads.
  *
  * Deno's `--env-file` only loads once at process start. When `--hmr` is
- * on we re-read the same files on change, push values into `Deno.env`,
+ * on we re-read the same files on change, push values into `process.env`,
  * and ask the hot-reloader to respawn workers / workerd so top-level
- * `const KEY = Deno.env.get(...)` captures pick up the new secrets.
+ * `const KEY = process.env[...]` captures pick up the new secrets.
  */
 
+import { readFileSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 
 export type EnvSource = {
   get(key: string): string | undefined;
   set(key: string, value: string): void;
   delete(key: string): void;
+};
+
+/** The process environment as an {@link EnvSource}. */
+export const processEnv: EnvSource = {
+  get: (key) => process.env[key],
+  set: (key, value) => {
+    process.env[key] = value;
+  },
+  delete: (key) => {
+    delete process.env[key];
+  },
 };
 
 export interface EnvApplyDiff {
@@ -97,14 +109,14 @@ export function resolveWatchedEnvFiles(opts: {
   explicit?: readonly string[];
   envFilesEnv?: string | null;
 } = {}): string[] {
-  const cwd = opts.cwd ?? Deno.cwd();
+  const cwd = opts.cwd ?? process.cwd();
   const collected: string[] = [];
   if (opts.explicit) {
     for (const p of opts.explicit) collected.push(p);
   }
   const fromEnv = opts.envFilesEnv === null
     ? ""
-    : (opts.envFilesEnv ?? Deno.env.get("1TUBE_ENV_FILES") ?? "");
+    : (opts.envFilesEnv ?? process.env["1TUBE_ENV_FILES"] ?? "");
   for (const part of fromEnv.split(",")) {
     const t = part.trim();
     if (t) collected.push(t);
@@ -113,7 +125,7 @@ export function resolveWatchedEnvFiles(opts: {
     for (const name of [".env", ".env.local", ".env.development"]) {
       const candidate = resolve(cwd, name);
       try {
-        if (Deno.statSync(candidate).isFile) collected.push(candidate);
+        if (statSync(candidate).isFile()) collected.push(candidate);
       } catch {
         // absent — skip
       }
@@ -137,14 +149,14 @@ export function resolveWatchedEnvFiles(opts: {
  */
 export function applyEnvFiles(
   files: readonly string[],
-  env: EnvSource = Deno.env,
+  env: EnvSource = processEnv,
 ): EnvApplyDiff {
   const merged = new Map<string, string>();
   const readFiles: string[] = [];
   for (const file of files) {
     let text: string;
     try {
-      text = Deno.readTextFileSync(file);
+      text = readFileSync(file, "utf8");
     } catch {
       // Missing mid-edit (atomic save) — skip this file for now; the
       // next fs event will retry. Don't wipe owned keys on a transient
@@ -206,7 +218,7 @@ export function applyEnvFiles(
   };
 }
 
-/** Parent directories to feed `Deno.watchFs` (atomic renames land here). */
+/** Parent directories to feed the fs watcher (atomic renames land here). */
 export function envFileWatchDirs(files: readonly string[]): string[] {
   const dirs = new Set<string>();
   for (const f of files) {
@@ -243,7 +255,7 @@ export function isEnvFileEvent(
     if (names.has(basename(p))) return true;
     // Directory-level events (Windows) — treat as "maybe our file".
     try {
-      if (Deno.statSync(p).isDirectory && byDir.has(p)) return true;
+      if (statSync(p).isDirectory() && byDir.has(p)) return true;
     } catch {
       // deleted path — if its basename matched we'd already returned;
       // a missing temp file still warrants a re-read of that dir's targets.

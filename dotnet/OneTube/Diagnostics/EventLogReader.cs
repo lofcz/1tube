@@ -158,7 +158,7 @@ public sealed class WindowsEventLogReader
     private static readonly string[] DefaultMatchTokens =
     [
         "workerd",
-        "deno",
+        "bun",
         "OneTube",
         ".NET Runtime",
         "Application Error",

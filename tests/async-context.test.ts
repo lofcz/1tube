@@ -1,34 +1,46 @@
 /**
- * Verifies the AsyncLocalStorage wiring that makes per-function attribution
- * possible inside the `unhandledrejection` global handler (Deno 2.7+).
+ * Verifies the AsyncLocalStorage wiring that per-function / per-request
+ * attribution relies on.
  *
- * We don't spawn server.ts here — we exercise the same `currentRequestStorage`
- * + dispatch shape that src/server.ts uses, then assert:
- *   1. The store survives `await`.
- *   2. The store survives a `setTimeout` hop.
- *   3. The store survives a fire-and-forget Promise rejection observed by an
- *      `unhandledrejection` listener (the production attribution path).
- *   4. Two concurrent dispatches don't bleed contexts into each other.
+ *   1. The gateway's `currentRequestStorage` survives `await`, `setTimeout`
+ *      hops, and concurrent dispatches don't bleed into each other.
+ *   2. A store entered on the host side propagates INTO `Bun.ModuleGraph`
+ *      code run via `graph.run()` — timers and promise chains included —
+ *      which is what the function host's console attribution builds on.
+ *   3. Orphan rejections / uncaught errors from function code are attributed
+ *      through the graph's `onError` (by closure), not through the process
+ *      handlers: Bun's process-level `unhandledRejection` handler runs
+ *      without the originating async context, so it cannot attribute.
  */
 
-import { assert, assertEquals } from "@std/assert";
-import { currentRequestStorage } from "../src/registry.ts";
+import { afterEach, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { assert, assertEquals } from "./_assert.ts";
+import { currentRequestStorage, FunctionRegistry } from "../src/registry.ts";
+import { FunctionSupervisor } from "../src/supervisor.ts";
+import { createFunctionHost, type FunctionConsoleEvent } from "../src/backends/bun/function-host.ts";
 
 function dispatch<T>(fnName: string, fn: () => T | Promise<T>): Promise<T> {
   // Mirrors the wrap in src/server.ts: every handler runs inside a
   // `currentRequestStorage.run({ functionName }, ...)` scope.
-  return Promise.resolve(
-    currentRequestStorage.run({ functionName: fnName }, fn),
-  );
+  return Promise.resolve(currentRequestStorage.run({ functionName: fnName }, fn));
 }
 
-Deno.test("async-context: store visible synchronously inside the handler", async () => {
+const cleanups: Array<() => Promise<void> | void> = [];
+afterEach(async () => {
+  while (cleanups.length > 0) await cleanups.pop()!();
+});
+
+test("async-context: store visible synchronously inside the handler", async () => {
   await dispatch("alpha", () => {
     assertEquals(currentRequestStorage.getStore()?.functionName, "alpha");
   });
 });
 
-Deno.test("async-context: store survives an await boundary", async () => {
+test("async-context: store survives an await boundary", async () => {
   await dispatch("beta", async () => {
     await Promise.resolve();
     await new Promise((r) => setTimeout(r, 1));
@@ -36,7 +48,7 @@ Deno.test("async-context: store survives an await boundary", async () => {
   });
 });
 
-Deno.test("async-context: setTimeout callback inherits the store", async () => {
+test("async-context: setTimeout callback inherits the store", async () => {
   await new Promise<void>((resolve, reject) => {
     dispatch("gamma", () => {
       setTimeout(() => {
@@ -51,10 +63,9 @@ Deno.test("async-context: setTimeout callback inherits the store", async () => {
   });
 });
 
-Deno.test("async-context: concurrent dispatches keep their own store (no bleed)", async () => {
+test("async-context: concurrent dispatches keep their own store (no bleed)", async () => {
   const seenA: (string | undefined)[] = [];
   const seenB: (string | undefined)[] = [];
-
   const a = dispatch("fn-a", async () => {
     for (let i = 0; i < 5; i++) {
       await new Promise((r) => setTimeout(r, 1));
@@ -68,55 +79,92 @@ Deno.test("async-context: concurrent dispatches keep their own store (no bleed)"
     }
   });
   await Promise.all([a, b]);
-
   assertEquals(new Set(seenA), new Set(["fn-a"]));
   assertEquals(new Set(seenB), new Set(["fn-b"]));
 });
 
-Deno.test("async-context: unhandledrejection sees the originating function", async () => {
-  // Install a one-shot listener that captures whatever function the dispatch
-  // was running when the orphan rejection fired. This exactly mirrors what
-  // src/server.ts does — except here we resolve a promise instead of feeding
-  // the supervisor.
-  const seen: (string | undefined)[] = [];
-  const captured = new Promise<void>((resolve) => {
-    const handler = (e: PromiseRejectionEvent) => {
-      // Only swallow OUR sentinel rejection — leave anyone else's alone.
-      if (String(e.reason) === "Error: rejection-from-delta") {
-        e.preventDefault();
-        seen.push(currentRequestStorage.getStore()?.functionName);
-        globalThis.removeEventListener("unhandledrejection", handler);
-        resolve();
-      }
-    };
-    globalThis.addEventListener("unhandledrejection", handler);
+test("async-context: a host-side store propagates into module-graph code", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "1tube-als-graph-"));
+  cleanups.push(() => rm(dir, { recursive: true, force: true }));
+  const modPath = join(dir, "mod.ts");
+  await writeFile(
+    modPath,
+    `export async function probe(read: () => string | undefined) {
+  const seen = [read()];
+  await Promise.resolve();
+  seen.push(read());
+  await new Promise((r) => setTimeout(r, 2));
+  seen.push(read());
+  await new Promise<void>((r) => queueMicrotask(() => { seen.push(read()); r(); }));
+  return seen;
+}
+`,
+  );
+  const als = new AsyncLocalStorage<string>();
+  const graph = new Bun.ModuleGraph({ globals: {} });
+  cleanups.push(() => graph.dispose());
+  const mod = await graph.import(modPath) as {
+    probe: (read: () => string | undefined) => Promise<Array<string | undefined>>;
+  };
+  const read = () => als.getStore();
+  const [a, b] = await Promise.all([
+    als.run("inv-a", () => graph.run(() => mod.probe(read))),
+    als.run("inv-b", () => graph.run(() => mod.probe(read))),
+  ]);
+  assertEquals(a, ["inv-a", "inv-a", "inv-a", "inv-a"]);
+  assertEquals(b, ["inv-b", "inv-b", "inv-b", "inv-b"]);
+});
+
+test("async-context: orphan rejections from function code are attributed to the function", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "1tube-als-reject-"));
+  cleanups.push(() => rm(dir, { recursive: true, force: true }));
+  await mkdir(join(dir, "delta"), { recursive: true });
+  await writeFile(
+    join(dir, "delta", "index.ts"),
+    `(globalThis as any).__edgeFunctionRegistry.register(() => {
+  // Fire and forget — no .catch, no await.
+  void Promise.resolve().then(() => { throw new Error("rejection-from-delta"); });
+  return new Response("ok");
+}, { public: true });
+`,
+  );
+  const processSeen: unknown[] = [];
+  const onProcess = (reason: unknown) => processSeen.push(reason);
+  process.on("unhandledRejection", onProcess);
+  cleanups.push(() => {
+    process.off("unhandledRejection", onProcess);
   });
 
-  await dispatch("delta", () => {
-    // Fire and forget — no `.catch`, no `await`. The rejection should fire
-    // unhandledrejection while our async context is still active.
-    void Promise.resolve().then(() => {
-      throw new Error("rejection-from-delta");
-    });
+  const events: FunctionConsoleEvent[] = [];
+  const supervisor = new FunctionSupervisor();
+  const registry = new FunctionRegistry();
+  const host = createFunctionHost({
+    functionsDir: dir,
+    registry,
+    supervisor,
+    onConsole: (e) => events.push(e),
   });
+  cleanups.push(() => host.stop());
+  assertEquals((await host.start()).errors, []);
 
-  // Wait for the listener to fire; bail loudly (but cleanly) if it never
-  // does so the test fails fast rather than hanging the test runner. Note
-  // we keep the timer id so we can clear it after `captured` wins the race —
-  // otherwise Deno's leak detector flags the dangling setTimeout.
-  let timerId: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<void>((_, reject) => {
-    timerId = setTimeout(
-      () => reject(new Error("unhandledrejection never fired")),
-      1000,
-    );
-  });
-  try {
-    await Promise.race([captured, timeout]);
-  } finally {
-    if (timerId !== undefined) clearTimeout(timerId);
+  const resp = await registry.workerHandle("delta")!.dispatch(
+    new Request("http://localhost/"),
+    null,
+    new AbortController().signal,
+    "inv-delta",
+  );
+  assertEquals(await resp.text(), "ok");
+
+  const deadline = performance.now() + 1000;
+  let hit: FunctionConsoleEvent | undefined;
+  while (!hit && performance.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10));
+    hit = events.find((e) => e.message.includes("rejection-from-delta"));
   }
-
-  assert(seen.length >= 1, "expected at least one rejection capture");
-  assertEquals(seen[0], "delta");
+  assert(hit, "the rejection should surface through the graph's onError");
+  assertEquals(hit.functionName, "delta");
+  assertEquals(hit.level, "error");
+  assertEquals(supervisor.stats("delta").errors, 1);
+  // It never reaches the gateway's process-level handler.
+  assertEquals(processSeen, []);
 });

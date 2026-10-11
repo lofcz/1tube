@@ -4,12 +4,13 @@
  * scanner traffic from exhausting the rate-limit table.
  *
  * The middleware is co-located with server.ts. Since server.ts has top-level
- * Deno.serve() side effects, we re-implement the same wiring against a fresh
+ * Bun.serve() side effects, we re-implement the same wiring against a fresh
  * Hono instance + a real FunctionRegistry — the middleware itself is a few
  * lines of pure logic, easy to reproduce verbatim.
  */
 
-import { assert, assertEquals } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals } from "./_assert.ts";
 import { Hono } from "hono";
 import { FunctionRegistry } from "../src/registry.ts";
 import { defaultManifest } from "../src/manifest.ts";
@@ -71,7 +72,7 @@ function reqFor(name: string): Request {
   return new Request(`http://x/functions/v1/${name}`);
 }
 
-Deno.test("fast-fail: unknown name returns 404 without running auth/rate-limit/dispatch", async () => {
+test("fast-fail: unknown name returns 404 without running auth/rate-limit/dispatch", async () => {
   resetTubeEnv();
   const reg = new FunctionRegistry();
   const { app, counts } = buildApp(reg);
@@ -87,7 +88,7 @@ Deno.test("fast-fail: unknown name returns 404 without running auth/rate-limit/d
   assertEquals(c.dispatch, 0, "dispatch must be skipped");
 });
 
-Deno.test("fast-fail: known candidate (lazy, not loaded) is allowed through", async () => {
+test("fast-fail: known candidate (lazy, not loaded) is allowed through", async () => {
   resetTubeEnv();
   const reg = new FunctionRegistry();
   reg.registerCandidate({
@@ -107,7 +108,7 @@ Deno.test("fast-fail: known candidate (lazy, not loaded) is allowed through", as
   assertEquals(c.dispatch, 1);
 });
 
-Deno.test("fast-fail: scanner hammering does not pollute the rate-limit table", async () => {
+test("fast-fail: scanner hammering does not pollute the rate-limit table", async () => {
   resetTubeEnv();
   const reg = new FunctionRegistry();
   // No registered fns → every name is unknown.
@@ -125,7 +126,7 @@ Deno.test("fast-fail: scanner hammering does not pollute the rate-limit table", 
   assertEquals(c.dispatch, 0);
 });
 
-Deno.test("fast-fail: requests to /functions/v1/ (no name) fall through (no early 404)", async () => {
+test("fast-fail: requests to /functions/v1/ (no name) fall through (no early 404)", async () => {
   resetTubeEnv();
   const reg = new FunctionRegistry();
   const { app, counts } = buildApp(reg);
@@ -140,7 +141,7 @@ Deno.test("fast-fail: requests to /functions/v1/ (no name) fall through (no earl
   assertEquals(c.dispatch, 0);
 });
 
-Deno.test("fast-fail: name with trailing path is parsed correctly (only first segment)", async () => {
+test("fast-fail: name with trailing path is parsed correctly (only first segment)", async () => {
   resetTubeEnv();
   const reg = new FunctionRegistry();
   reg.registerCandidate({

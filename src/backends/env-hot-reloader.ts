@@ -1,9 +1,9 @@
 /**
  * Watches `--env-file` / `.env` paths and hot-applies secret changes.
  *
- * Deno only loads `--env-file` once at process start. With `--hmr`, a
+ * `--env-file` only loads once at process start. With `--hmr`, a
  * save to `.env` must:
- *   1. Re-parse the file(s) into `Deno.env`
+ *   1. Re-parse the file(s) into `process.env`
  *   2. Respawn function workers / workerd so top-level env captures
  *      and workerd `fromEnvironment` bindings see the new values
  *
@@ -11,14 +11,16 @@
  * project root), so this watcher runs alongside it.
  */
 
+import { statSync } from "node:fs";
 import {
   applyEnvFiles,
   type EnvApplyDiff,
   type EnvSource,
   envFileWatchDirs,
   isEnvFileEvent,
+  processEnv,
 } from "../env-file.ts";
-import type { FsEventStream } from "./deno/hot-reloader.ts";
+import { type FsEventStream, watchFs } from "../fs-watch.ts";
 
 export interface EnvHotReloaderOptions {
   /** Absolute paths of env files to watch (order = precedence). */
@@ -32,7 +34,7 @@ export interface EnvHotReloaderOptions {
   setTimer?: (cb: () => void, ms: number) => number;
   clearTimer?: (id: number) => void;
   log?: (line: string) => void;
-  /** Test seam: alternate env target (defaults to Deno.env). */
+  /** Test seam: alternate env target (defaults to process.env). */
   env?: EnvSource;
   /** Test seam: override apply. */
   apply?: (files: readonly string[], env: EnvSource) => EnvApplyDiff;
@@ -48,7 +50,7 @@ export function createEnvHotReloader(
 ): EnvHotReloader {
   const log = opts.log ?? ((line) => console.log(line));
   const envFiles = [...opts.envFiles];
-  const env = opts.env ?? Deno.env;
+  const env = opts.env ?? processEnv;
   const apply = opts.apply ?? applyEnvFiles;
   const setTimer = opts.setTimer ??
     ((cb, ms) => setTimeout(cb, ms) as unknown as number);
@@ -59,8 +61,7 @@ export function createEnvHotReloader(
     : 40;
 
   const watcherFactory = opts.watch ??
-    ((dirs: readonly string[]) =>
-      Deno.watchFs([...dirs], { recursive: false }) as unknown as FsEventStream);
+    ((dirs: readonly string[]) => watchFs(dirs, { recursive: false }));
 
   let stream: FsEventStream | null = null;
   let stopped = false;
@@ -117,7 +118,7 @@ export function createEnvHotReloader(
       if (stream || envFiles.length === 0) return Promise.resolve();
       const dirs = envFileWatchDirs(envFiles).filter((d) => {
         try {
-          return Deno.statSync(d).isDirectory;
+          return statSync(d).isDirectory();
         } catch {
           return false;
         }
@@ -125,7 +126,7 @@ export function createEnvHotReloader(
       if (dirs.length === 0) return Promise.resolve();
 
       // Seed ownership from the current files so a subsequent delete of
-      // a key from `.env` can be removed from Deno.env on the next save.
+      // a key from `.env` can be removed from process.env on the next save.
       apply(envFiles, env);
 
       stream = watcherFactory(dirs);

@@ -6,7 +6,7 @@
  * OneTube package reads straight from the SQLite file.
  */
 
-import type { Context, Hono } from "npm:hono@4";
+import type { Context, Hono } from "hono";
 import type { InvocationErrorKind, LogLevel, LogSource } from "./writer.ts";
 import type { InvocationFilter, LogQuery, LogSearchFilter } from "./query.ts";
 

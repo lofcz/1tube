@@ -24,5 +24,5 @@ Downstream projects can then use the published CLI:
 npx 1tube package --functions supabase/functions --out fw.1tube --sign-key "$1TUBE_PACKAGE_SIGN_KEY"
 ```
 
-The npm binary is a Node shim that invokes Deno, so downstream CI must install
-Deno before running `npx 1tube`.
+The npm binary is a Node shim that invokes Bun, so downstream CI must install
+Bun (e.g. `oven-sh/setup-bun@v2`) before running `npx 1tube`.

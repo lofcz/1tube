@@ -10,13 +10,13 @@ namespace OneTube;
 public sealed class OneTubeOptions
 {
     /// <summary>
-    /// Backend that runs bundled functions. <c>"deno"</c> imports each
-    /// function as a module inside the gateway process (lower memory,
-    /// shared global state). <c>"workerd"</c> bundles each function and
-    /// serves it from a Cloudflare-style workerd subprocess for hard
-    /// V8-level isolation.
+    /// Backend that runs bundled functions. <c>"bun"</c> (default)
+    /// imports each function into the Bun gateway process with
+    /// Deno/Supabase compatibility shims (lower memory, fastest reload).
+    /// <c>"workerd"</c> bundles each function and serves it from a
+    /// Cloudflare-style workerd subprocess for hard V8-level isolation.
     /// </summary>
-    public OneTubeBackend Backend { get; set; } = OneTubeBackend.Deno;
+    public OneTubeBackend Backend { get; set; } = OneTubeBackend.Bun;
 
     // ── Required paths ────────────────────────────────────────────────
 
@@ -44,26 +44,36 @@ public sealed class OneTubeOptions
     // ── Binary paths ──────────────────────────────────────────────────
 
     /// <summary>
-    /// Path to the <c>deno</c> binary. Resolution rules:
+    /// Path to the <c>bun</c> binary (Bun ≥ 1.4.3) that runs the
+    /// gateway. Resolution rules:
     /// <list type="bullet">
     ///   <item><description>Absolute path: used verbatim.</description></item>
     ///   <item><description>Relative path: resolved against
     ///   <see cref="AppContext.BaseDirectory"/>. Example: shipping
-    ///   <c>deno/deno.exe</c> next to the host binary and configuring
-    ///   <c>"DenoBinary": "deno/deno.exe"</c> works the same in dev
+    ///   <c>bun/bun.exe</c> next to the host binary and configuring
+    ///   <c>"BunBinary": "bun/bun.exe"</c> works the same in dev
     ///   and prod regardless of the launching shell's cwd.</description></item>
     ///   <item><description>Bare name (no separator, no extension):
     ///   <c>where</c>/<c>which</c> lookup on PATH.</description></item>
     ///   <item><description>Null/empty: PATH lookup for
-    ///   <c>deno</c>.</description></item>
+    ///   <c>bun</c>.</description></item>
     /// </list>
     /// </summary>
+    public string? BunBinary { get; set; }
+
+    /// <summary>
+    /// Obsolete: the gateway no longer runs on Deno. Only honoured when
+    /// <see cref="BunBinary"/> is unset and this value obviously points
+    /// at bun (file name <c>bun</c> / <c>bun.exe</c>); any other value
+    /// is ignored with a warning and <c>bun</c> is looked up on PATH.
+    /// </summary>
+    [Obsolete("The gateway runs on Bun now. Use BunBinary; DenoBinary is only honoured when it points at a bun executable.")]
     public string? DenoBinary { get; set; }
 
     /// <summary>
     /// Path to the <c>workerd</c> binary. Only consulted when
     /// <see cref="Backend"/> is <see cref="OneTubeBackend.Workerd"/>.
-    /// Same resolution semantics as <see cref="DenoBinary"/>:
+    /// Same resolution semantics as <see cref="BunBinary"/>:
     /// absolute → verbatim, relative → relative to
     /// <see cref="AppContext.BaseDirectory"/>, bare name → PATH.
     /// </summary>
@@ -88,8 +98,15 @@ public sealed class OneTubeOptions
     /// Root directory for OneTube's persistent state. The firmware
     /// supervisor writes <c>state.json</c>, <c>versions/&lt;ver&gt;/</c>,
     /// and <c>incoming/&lt;jobId&gt;/</c> trees under
-    /// <c>{DataRoot}/onetube/</c>. Required when the firmware
-    /// supervisor is enabled; otherwise unused.
+    /// <c>{DataRoot}/onetube/</c>. The gateway's managed dependency
+    /// store (<c>onetube/deps/</c>, passed as <c>--deps-dir</c>), its
+    /// remote-module cache (<c>onetube/remote/</c>) and Bun's install +
+    /// transpiler caches (<c>onetube/bun-cache/</c>,
+    /// <c>onetube/bun-transpiler-cache/</c>) live here too, so the
+    /// host identity only needs write access to this one tree (plus
+    /// <c>OneTubeGateway/</c> once, for the first dependency install).
+    /// Required when the firmware supervisor is enabled; when unset the
+    /// host's base directory is used.
     /// </summary>
     public string? DataRoot { get; set; }
 
@@ -313,6 +330,16 @@ public sealed class OneTubeOptions
 /// </summary>
 public enum OneTubeBackend
 {
-    Deno,
-    Workerd,
+    /// <summary>Functions run inside the Bun gateway process (<c>--backend bun</c>).</summary>
+    Bun = 0,
+
+    /// <summary>
+    /// Pre-Bun name of <see cref="Bun"/>; same value, so configs that
+    /// still say <c>"Backend": "Deno"</c> keep binding.
+    /// </summary>
+    [Obsolete("The in-process backend runs on Bun now. Use OneTubeBackend.Bun (same value).")]
+    Deno = Bun,
+
+    /// <summary>Functions are bundled and served by a workerd subprocess (<c>--backend workerd</c>).</summary>
+    Workerd = 1,
 }

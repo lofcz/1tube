@@ -22,7 +22,7 @@ jobs:
           - name: C# build
             target: dotnet
           - name: TypeScript tests
-            target: deno
+            target: bun
 
     steps:
       - name: Checkout
@@ -42,12 +42,24 @@ jobs:
         if: matrix.target == 'dotnet'
         run: dotnet build dotnet/OneTube/OneTube.csproj --configuration Release --no-restore
 
-      - name: Setup Deno
-        if: matrix.target == 'deno'
-        uses: denoland/setup-deno@v2
+      - name: Test OneTube.cs
+        if: matrix.target == 'dotnet'
+        run: dotnet test dotnet/OneTube.Tests --configuration Release
+
+      - name: Setup Bun
+        if: matrix.target == 'bun'
+        uses: oven-sh/setup-bun@v2
         with:
-          deno-version: "2.7.13"
+          bun-version: "1.4.3"
+
+      - name: Install dependencies
+        if: matrix.target == 'bun'
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        if: matrix.target == 'bun'
+        run: bun run typecheck
 
       - name: Run TypeScript tests
-        if: matrix.target == 'deno'
-        run: deno test --allow-all tests/
+        if: matrix.target == 'bun'
+        run: bun test

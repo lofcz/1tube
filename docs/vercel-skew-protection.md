@@ -15,7 +15,7 @@ to wire two things yourself; 1tube covers the function side.
 | `x-deployment-id` response header                     | Vercel bundle wrapper (runtime) | Every response carries `VERCEL_DEPLOYMENT_ID` (when Vercel provides it) unless the function already set the header. Clients compare it with their own id to detect skew — e.g. the pinned deployment aged out and the request fell through to the latest one.                                                                            |
 | CORS defaults                                         | gateway `cors.ts`               | `x-deployment-id` is in the default `Access-Control-Allow-Headers` (so a cross-origin pin survives preflight) and in `Access-Control-Expose-Headers` (so JS can read the echo).                                                                                                                                                          |
 
-Nothing changes for the Deno / workerd targets.
+Nothing changes when serving locally (Bun or workerd backend).
 
 ## Consumer checklist
 

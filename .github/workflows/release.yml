@@ -58,13 +58,7 @@ jobs:
         if: inputs.publish_npm
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
-
-      - name: Setup Deno
-        if: inputs.publish_npm
-        uses: denoland/setup-deno@v2
-        with:
-          deno-version: "2.7.13"
+          bun-version: "1.4.3"
 
       - name: Setup .NET
         if: inputs.publish_onetube_cs
@@ -80,10 +74,13 @@ jobs:
         if: inputs.publish_npm
         run: bun run typecheck
 
+      - name: Test npm package
+        if: inputs.publish_npm
+        run: bun test
+
       - name: Smoke test npm package
         if: inputs.publish_npm
         run: |
-          bun run check
           bun run smoke:bin
           npm pack --dry-run
 

@@ -120,10 +120,10 @@ public static class FirmwareEndpoints
 
         group.MapGet("/diagnostics", async (
             IGatewayDestinationProvider destinationProvider,
-            DenoHostService activeHost,
+            GatewayHostService activeHost,
             CancellationToken ct) =>
         {
-            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var host = ResolveActiveGatewayHost(destinationProvider, activeHost);
             var snapshot = host.GetProcessSnapshot();
             return Results.Ok(new
             {
@@ -145,11 +145,11 @@ public static class FirmwareEndpoints
         // doesn't require restarting the host.
         group.MapGet("/diagnostics/experiments", (
             IGatewayDestinationProvider destinationProvider,
-            DenoHostService activeHost,
+            GatewayHostService activeHost,
             ExperimentRunner runner,
             FirmwareSupervisor? supervisor) =>
         {
-            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var host = ResolveActiveGatewayHost(destinationProvider, activeHost);
             var ctx = host.BuildExperimentContext(ResolveActiveCapnp(host, supervisor));
             runner.EnsureStarterFiles(ctx);
             return Results.Ok(new
@@ -162,12 +162,12 @@ public static class FirmwareEndpoints
         group.MapPost("/diagnostics/experiments/{id}/run", async (
             string id,
             IGatewayDestinationProvider destinationProvider,
-            DenoHostService activeHost,
+            GatewayHostService activeHost,
             ExperimentRunner runner,
             FirmwareSupervisor? supervisor,
             CancellationToken ct) =>
         {
-            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var host = ResolveActiveGatewayHost(destinationProvider, activeHost);
             var ctx = host.BuildExperimentContext(ResolveActiveCapnp(host, supervisor));
             var spec = runner.Discover(ctx).FirstOrDefault(x => string.Equals(x.Id, id, StringComparison.OrdinalIgnoreCase));
             if (spec is null)
@@ -199,10 +199,10 @@ public static class FirmwareEndpoints
         group.MapPost("/diagnostics/workerd-probe", async (
             HttpContext ctx,
             IGatewayDestinationProvider destinationProvider,
-            DenoHostService activeHost,
+            GatewayHostService activeHost,
             CancellationToken ct) =>
         {
-            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var host = ResolveActiveGatewayHost(destinationProvider, activeHost);
             var capnp = ctx.Request.Query["capnp"].ToString();
             var timeoutSec = int.TryParse(ctx.Request.Query["timeoutSec"].ToString(), out var t) && t is > 0 and <= 30
                 ? t
@@ -216,10 +216,10 @@ public static class FirmwareEndpoints
 
         group.MapPost("/gateway/start", async (
             IGatewayDestinationProvider destinationProvider,
-            DenoHostService activeHost,
+            GatewayHostService activeHost,
             CancellationToken ct) =>
         {
-            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var host = ResolveActiveGatewayHost(destinationProvider, activeHost);
             await host.StartAsync(ct);
             return Results.Ok(new
             {
@@ -229,10 +229,10 @@ public static class FirmwareEndpoints
 
         group.MapPost("/gateway/stop", async (
             IGatewayDestinationProvider destinationProvider,
-            DenoHostService activeHost,
+            GatewayHostService activeHost,
             CancellationToken ct) =>
         {
-            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var host = ResolveActiveGatewayHost(destinationProvider, activeHost);
             await host.StopAsync(ct);
             return Results.Ok(new
             {
@@ -242,10 +242,10 @@ public static class FirmwareEndpoints
 
         group.MapPost("/gateway/recycle", async (
             IGatewayDestinationProvider destinationProvider,
-            DenoHostService activeHost,
+            GatewayHostService activeHost,
             CancellationToken ct) =>
         {
-            var host = ResolveActiveDenoHost(destinationProvider, activeHost);
+            var host = ResolveActiveGatewayHost(destinationProvider, activeHost);
             if (!host.IsRunning)
             {
                 return Results.Conflict(new { error = "gateway is not running" });
@@ -296,12 +296,12 @@ public static class FirmwareEndpoints
            string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
            string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
 
-    private static DenoHostService ResolveActiveDenoHost(
+    private static GatewayHostService ResolveActiveGatewayHost(
         IGatewayDestinationProvider destinationProvider,
-        DenoHostService fallback)
-        => destinationProvider.GetActive() as DenoHostService ?? fallback;
+        GatewayHostService fallback)
+        => destinationProvider.GetActive() as GatewayHostService ?? fallback;
 
-    private static string? ResolveActiveCapnp(DenoHostService host, FirmwareSupervisor? supervisor)
+    private static string? ResolveActiveCapnp(GatewayHostService host, FirmwareSupervisor? supervisor)
     {
         // Mirrors the page's helper but lives here so HTTP callers
         // (curl, the deploy CI, etc.) get the same default. Picks the
@@ -325,7 +325,7 @@ public static class FirmwareEndpoints
         }
     }
 
-    private static object GatewaySnapshot(DenoHostService host, GatewayProcessSnapshot? snapshot)
+    private static object GatewaySnapshot(GatewayHostService host, GatewayProcessSnapshot? snapshot)
         => new
         {
             label = host.Label,

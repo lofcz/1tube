@@ -2,8 +2,11 @@
  * Tests for src/manifest.ts.
  */
 
-import { assert, assertEquals } from "@std/assert";
-import { join } from "@std/path";
+import { test } from "bun:test";
+import { assert, assertEquals } from "./_assert.ts";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   defaultManifest,
   loadManifest,
@@ -11,7 +14,7 @@ import {
   parseManifest,
 } from "../src/manifest.ts";
 
-Deno.test("manifest: defaults are conservative (deny-everything)", () => {
+test("manifest: defaults are conservative (deny-everything)", () => {
   const m = defaultManifest();
   assertEquals(m.permissions, { net: [], env: [], read: [], write: [] });
   assertEquals(m.timeoutMs, undefined);
@@ -22,7 +25,7 @@ Deno.test("manifest: defaults are conservative (deny-everything)", () => {
   assert(m.recycle.cooldownMs > 0);
 });
 
-Deno.test("manifest: parses a fully-populated object", () => {
+test("manifest: parses a fully-populated object", () => {
   const m = parseManifest({
     permissions: {
       net: ["api.example.com"],
@@ -53,7 +56,7 @@ Deno.test("manifest: parses a fully-populated object", () => {
   assertEquals(m.recycle.errorRate, 0.25);
 });
 
-Deno.test("manifest: clamps invalid numeric inputs", () => {
+test("manifest: clamps invalid numeric inputs", () => {
   const m = parseManifest({
     timeoutMs: -10,
     // Negative rpm is invalid and drops to undefined. (rpm: 0 is NOT invalid —
@@ -71,7 +74,7 @@ Deno.test("manifest: clamps invalid numeric inputs", () => {
   assert(m.recycle.errorWindow > 0);
 });
 
-Deno.test("manifest: rpm 0 is unlimited; parses rateLimitBy", () => {
+test("manifest: rpm 0 is unlimited; parses rateLimitBy", () => {
   // 0 is preserved (exempt / unlimited), distinct from undefined (use default).
   assertEquals(parseManifest({ rpm: 0 }).rpm, 0);
   assertEquals(parseManifest({ rpm: 30 }).rpm, 30);
@@ -86,7 +89,7 @@ Deno.test("manifest: rpm 0 is unlimited; parses rateLimitBy", () => {
   assertEquals(parseManifest({}).rateLimitBy, undefined);
 });
 
-Deno.test("manifest: ignores non-string entries in permission arrays", () => {
+test("manifest: ignores non-string entries in permission arrays", () => {
   const m = parseManifest({
     permissions: { net: ["ok", 123, null, ""], env: "not-an-array" },
   });
@@ -94,28 +97,28 @@ Deno.test("manifest: ignores non-string entries in permission arrays", () => {
   assertEquals(m.permissions.env, []);
 });
 
-Deno.test("manifest: parses non-object input as defaults", () => {
+test("manifest: parses non-object input as defaults", () => {
   const m = parseManifest("nope");
   assertEquals(m, { ...defaultManifest(), fromFile: true });
 });
 
-Deno.test("manifest: loadManifest returns defaults when file is missing", async () => {
-  const dir = await Deno.makeTempDir();
+test("manifest: loadManifest returns defaults when file is missing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "1tube-manifest-"));
   try {
-    await Deno.mkdir(join(dir, "fn"));
+    await mkdir(join(dir, "fn"));
     const m = await loadManifest(dir, "fn");
     assertEquals(m.fromFile, false);
     assertEquals(m.permissions.net, []);
   } finally {
-    await Deno.remove(dir, { recursive: true });
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
-Deno.test("manifest: loadManifest reads + parses a real file", async () => {
-  const dir = await Deno.makeTempDir();
+test("manifest: loadManifest reads + parses a real file", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "1tube-manifest-"));
   try {
-    await Deno.mkdir(join(dir, "fn"));
-    await Deno.writeTextFile(
+    await mkdir(join(dir, "fn"));
+    await writeFile(
       join(dir, "fn", MANIFEST_FILENAME),
       JSON.stringify({
         timeoutMs: 1234,
@@ -129,15 +132,15 @@ Deno.test("manifest: loadManifest reads + parses a real file", async () => {
     assertEquals(m.rpm, 7);
     assertEquals(m.permissions.net, ["x.com"]);
   } finally {
-    await Deno.remove(dir, { recursive: true });
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
-Deno.test("manifest: loadManifest tolerates malformed JSON without throwing", async () => {
-  const dir = await Deno.makeTempDir();
+test("manifest: loadManifest tolerates malformed JSON without throwing", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "1tube-manifest-"));
   try {
-    await Deno.mkdir(join(dir, "fn"));
-    await Deno.writeTextFile(join(dir, "fn", MANIFEST_FILENAME), "{not-json");
+    await mkdir(join(dir, "fn"));
+    await writeFile(join(dir, "fn", MANIFEST_FILENAME), "{not-json");
     // Silence the warning the loader will emit.
     const orig = console.warn;
     console.warn = () => {};
@@ -148,6 +151,6 @@ Deno.test("manifest: loadManifest tolerates malformed JSON without throwing", as
       console.warn = orig;
     }
   } finally {
-    await Deno.remove(dir, { recursive: true });
+    await rm(dir, { recursive: true, force: true });
   }
 });

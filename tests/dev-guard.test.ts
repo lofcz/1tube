@@ -2,25 +2,45 @@
  * Tests for the prod-mode bootstrap guard in src/server.ts.
  *
  * We can't import server.ts directly (it would bind a port), so each case
- * spawns `deno run` against a tiny driver script that re-uses the gateway's
+ * spawns `bun` against a tiny driver script that re-uses the gateway's
  * `enforceProdSecrets` / `applyDevDefaults` logic by importing only the
  * bootstrap-affecting bits. Since those helpers are inlined inside server.ts
  * we instead spawn the real server with a deliberately-bad secret + an
  * unused port and assert the process exits with code 1 before binding.
  *
- * The server prints to stderr and calls Deno.exit(1) before reaching the
- * Deno.serve() call, so we never actually open a socket.
+ * The server prints to stderr and calls process.exit(1) before reaching the
+ * Bun.serve() call, so we never actually open a socket.
  */
 
-import { assert, assertEquals } from "@std/assert";
-import { fromFileUrl, join } from "@std/path";
+import { test } from "bun:test";
+import { assert, assertEquals } from "./_assert.ts";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const SERVER = join(
-  fromFileUrl(new URL(".", import.meta.url)),
+  fileURLToPath(new URL(".", import.meta.url)),
   "..",
   "src",
   "server.ts",
 );
+
+/**
+ * `bun <server.ts>` argv prefix. `--no-env-file` keeps Bun from auto-loading
+ * a `.env` in the cwd, so only the env we pass reaches the guard (Deno never
+ * auto-loaded one either).
+ */
+const BUN_ARGS = [process.execPath, "--no-env-file", SERVER];
+
+/** Parent env + overrides, like Deno.Command's default (non-clearEnv) merge. */
+function childEnv(overrides: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined) env[k] = v;
+  }
+  return { ...env, ...overrides };
+}
 const LEAKED_JWT = "super-secret-jwt-token-with-at-least-32-characters-long";
 const LEAKED_SR =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImV4cCI6MTk4MzgxMjk5Nn0.EGIM96RAZx35lJzdJsyH-qQwv8Hdp7fsn3W0YpN81IU";
@@ -33,9 +53,13 @@ async function runServer(
   // guard runs before either is touched in the failure cases. For the
   // "should run" sanity check, we still time out within a few hundred ms so
   // the test doesn't hang.
-  const cmd = new Deno.Command(Deno.execPath(), {
-    args: ["run", "--allow-all", SERVER, ...args],
-    env: {
+  // Once past the secret guard the gateway opens its invocation-log DB
+  // (default `<cwd>/.1tube/logs.db`) before failing on the functions dir;
+  // point it at a throwaway dir so test runs don't litter the cwd.
+  const logDir = await mkdtemp(join(tmpdir(), "1tube-dev-guard-logs-"));
+  const child = Bun.spawn([...BUN_ARGS, ...args], {
+    env: childEnv({
+      "1TUBE_LOG_DB": join(logDir, "logs.db"),
       // Strip inherited 1TUBE_* / SUPABASE_* so the parent env doesn't bleed
       // through. Setting to "" still counts as "set" in some shells, so we
       // explicitly override the keys the guard inspects.
@@ -44,11 +68,10 @@ async function runServer(
       SUPABASE_SERVICE_ROLE_KEY: "",
       SUPABASE_URL: "",
       ...env,
-    },
-    stdout: "piped",
-    stderr: "piped",
+    }),
+    stdout: "pipe",
+    stderr: "pipe",
   });
-  const child = cmd.spawn();
   const timer = setTimeout(() => {
     try {
       child.kill("SIGKILL");
@@ -56,21 +79,17 @@ async function runServer(
       /* already dead */
     }
   }, 5000);
-  const output = await child.output();
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
   clearTimeout(timer);
-  return {
-    code: output.code,
-    stdout: new TextDecoder().decode(output.stdout),
-    stderr: new TextDecoder().decode(output.stderr),
-  };
+  await rm(logDir, { recursive: true, force: true });
+  return { code, stdout, stderr };
 }
 
-Deno.test({
-  name: "dev-guard: prod start without JWT_SECRET exits 1 before binding",
-  // We need subprocess + net + read; --allow-all on the spawned process is
-  // fine, but the test itself only needs run+read.
-  permissions: { run: true, read: true, env: true },
-}, async () => {
+test("dev-guard: prod start without JWT_SECRET exits 1 before binding", async () => {
   const { code, stderr } = await runServer({});
   assert(code !== 0, `expected non-zero exit, got ${code}\n${stderr}`);
   assert(
@@ -79,10 +98,7 @@ Deno.test({
   );
 });
 
-Deno.test({
-  name: "dev-guard: prod start allows local default JWT_SECRET",
-  permissions: { run: true, read: true, env: true },
-}, async () => {
+test("dev-guard: prod start allows local default JWT_SECRET", async () => {
   const { code, stderr } = await runServer({
     JWT_SECRET: LEAKED_JWT,
     SUPABASE_SERVICE_ROLE_KEY: "anything-not-the-leaked-one-here-please",
@@ -98,10 +114,7 @@ Deno.test({
   );
 });
 
-Deno.test({
-  name: "dev-guard: prod start ignores local default SUPABASE_SERVICE_ROLE_KEY",
-  permissions: { run: true, read: true, env: true },
-}, async () => {
+test("dev-guard: prod start ignores local default SUPABASE_SERVICE_ROLE_KEY", async () => {
   const { code, stderr } = await runServer({
     JWT_SECRET: "a-fresh-and-long-enough-jwt-secret-not-the-default",
     SUPABASE_SERVICE_ROLE_KEY: LEAKED_SR,
@@ -117,23 +130,17 @@ Deno.test({
   );
 });
 
-Deno.test({
-  name:
-    "dev-guard: --dev mode boots even without secrets (applies dev defaults)",
-  permissions: { run: true, read: true, write: true, env: true },
-}, async () => {
+test("dev-guard: --dev mode boots even without secrets (applies dev defaults)", async () => {
   // Use a bogus functions dir + ephemeral port; the boot still proceeds past
-  // the guard, and we kill it after 1.5s. We assert the dev-defaults log
+  // the guard, and we kill it once it starts serving. We assert the dev-defaults log
   // appeared and the process did NOT exit with the guard's code 1.
   // Provide anon/service keys so this case does not depend on a live local
   // Supabase stack (or wait on status retries).
-  const tmp = await Deno.makeTempDir();
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-dev-guard-"));
   try {
-    const cmd = new Deno.Command(Deno.execPath(), {
-      args: [
-        "run",
-        "--allow-all",
-        SERVER,
+    const child = Bun.spawn(
+      [
+        ...BUN_ARGS,
         "--dev",
         "--port",
         "0",
@@ -142,29 +149,54 @@ Deno.test({
         "--host",
         "127.0.0.1",
       ],
-      env: {
-        "1TUBE_DEV": "",
-        "1TUBE_DEV_SKIP_SUPABASE_STATUS": "1",
-        JWT_SECRET: "",
-        SUPABASE_ANON_KEY: "test-anon-key",
-        SUPABASE_SERVICE_ROLE_KEY: "test-service-role-key",
+      {
+        env: childEnv({
+          "1TUBE_DEV": "",
+          "1TUBE_DEV_SKIP_SUPABASE_STATUS": "1",
+          // Keep the invocation-log DB in the temp dir instead of
+          // `<cwd>/.1tube/logs.db`.
+          "1TUBE_LOG_DB": join(tmp, "logs.db"),
+          JWT_SECRET: "",
+          SUPABASE_ANON_KEY: "test-anon-key",
+          SUPABASE_SERVICE_ROLE_KEY: "test-service-role-key",
+        }),
+        stdout: "pipe",
+        stderr: "pipe",
       },
-      stdout: "piped",
-      stderr: "piped",
-    });
-    const child = cmd.spawn();
-    // Give cold Deno runs enough time to type-check imports (incl. the
-    // deno_graph WASM module), apply dev defaults, and start serving
-    // before we terminate the child.
-    await new Promise((r) => setTimeout(r, 10000));
+    );
+    let stdout = "";
+    let stderr = "";
+    const drain = async (
+      stream: ReadableStream<Uint8Array>,
+      append: (s: string) => void,
+    ) => {
+      const dec = new TextDecoder();
+      for await (const chunk of stream) append(dec.decode(chunk, { stream: true }));
+    };
+    const drained = Promise.all([
+      drain(child.stdout, (s) => (stdout += s)),
+      drain(child.stderr, (s) => (stderr += s)),
+    ]);
+    // Give the gateway time to apply dev defaults and start serving before we
+    // terminate it: wait until it reports it is starting (i.e. it got past
+    // the guard), it exits on its own, or 10s elapse.
+    const deadline = Date.now() + 10000;
+    while (
+      Date.now() < deadline &&
+      child.exitCode === null &&
+      !(stdout + stderr).includes("Starting on")
+    ) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    // Small grace window so a late FATAL after binding would still be seen.
+    await new Promise((r) => setTimeout(r, 500));
     try {
       child.kill("SIGKILL");
     } catch {
       /* already dead */
     }
-    const out = await child.output();
-    const stdout = new TextDecoder().decode(out.stdout);
-    const stderr = new TextDecoder().decode(out.stderr);
+    await child.exited;
+    await drained;
     const combined = stdout + "\n" + stderr;
     assert(
       combined.includes("Applied") && combined.includes("dev default"),
@@ -176,16 +208,12 @@ Deno.test({
       `dev mode should not emit FATAL, got:\n${combined}`,
     );
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
-Deno.test({
-  name:
-    "dev-guard: --dev mode fatals cleanly when anon/service keys stay unresolved",
-  permissions: { run: true, read: true, write: true, env: true },
-}, async () => {
-  const tmp = await Deno.makeTempDir();
+test("dev-guard: --dev mode fatals cleanly when anon/service keys stay unresolved", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-dev-guard-"));
   try {
     const { code, stderr, stdout } = await runServer(
       {
@@ -218,6 +246,6 @@ Deno.test({
       `expected clean missing-key FATAL, got:\n${combined}`,
     );
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });

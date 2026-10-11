@@ -5,7 +5,7 @@ namespace OneTube;
 
 /// <summary>
 /// A single OneTube gateway slot. One <see cref="IGatewayHost"/> owns
-/// exactly one Deno child process listening on exactly one port.
+/// exactly one Bun gateway child process listening on exactly one port.
 ///
 /// The interface exists so the side-by-side firmware swap can address
 /// two hosts simultaneously: <c>active</c> serves live traffic while
@@ -39,7 +39,7 @@ public interface IGatewayHost
     string DestinationBaseUrl { get; }
 
     /// <summary>
-    /// Start the underlying Deno process and the health-probe loop.
+    /// Start the underlying Bun gateway process and the health-probe loop.
     /// Idempotent — calling twice on a running host is a no-op. Returns
     /// only after the spawn has been initiated; the host is not
     /// guaranteed to be Healthy on return (use <see cref="ProbeHealthAsync"/>
@@ -48,7 +48,7 @@ public interface IGatewayHost
     Task StartAsync(CancellationToken cancellationToken);
 
     /// <summary>
-    /// Stop the underlying Deno process. Honours
+    /// Stop the underlying Bun gateway process. Honours
     /// <see cref="OneTubeOptions.ShutdownGraceMs"/> if set so in-flight
     /// requests can drain.
     /// </summary>

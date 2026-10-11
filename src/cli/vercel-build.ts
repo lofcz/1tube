@@ -47,7 +47,15 @@
  * `docs/vercel-skew-protection.md`.
  */
 
-import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import {
   bundleAllChunked,
@@ -79,7 +87,7 @@ export interface VercelBuildOptions {
   functionsDir: string;
   /** Build Output API root, typically `.vercel/output`. */
   outDir: string;
-  /** Path to host project's deno.json (for esbuild's Deno loader import map). */
+  /** Path to host project's deno.json (its import map applies to the bundle). */
   configPath?: string;
   /** Restrict the build to a subset of function names. */
   only?: readonly string[];
@@ -215,12 +223,16 @@ interface VcConfig {
   maxDuration: number;
 }
 
+async function ensureDir(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
+}
+
+function isNotFound(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === "ENOENT";
+}
+
 async function removeDirIfExists(path: string): Promise<void> {
-  try {
-    await Deno.remove(path, { recursive: true });
-  } catch (err) {
-    if (!(err instanceof Deno.errors.NotFound)) throw err;
-  }
+  await rm(path, { recursive: true, force: true });
 }
 
 /**
@@ -305,10 +317,10 @@ async function mergeSubpathRoutes(
   let config: VercelOutputConfig | null = null;
   try {
     config = JSON.parse(
-      await Deno.readTextFile(configPath),
+      await readFile(configPath, "utf8"),
     ) as VercelOutputConfig;
   } catch (err) {
-    if (!(err instanceof Deno.errors.NotFound)) throw err;
+    if (!isNotFound(err)) throw err;
   }
   const created = config === null;
   if (config === null) config = { version: 3, routes: [] };
@@ -357,7 +369,7 @@ async function mergeSubpathRoutes(
   if (deploymentId !== undefined) config.deploymentId = deploymentId;
 
   await ensureDir(outDir);
-  await Deno.writeTextFile(
+  await writeFile(
     configPath,
     JSON.stringify(config, null, 2) + "\n",
   );
@@ -368,7 +380,7 @@ async function buildVercelOnce(
   opts: VercelBuildOptions,
 ): Promise<VercelBuildResult> {
   const startedAt = performance.now();
-  const cwd = Deno.cwd();
+  const cwd = process.cwd();
   const functionsDir = isAbsolute(opts.functionsDir)
     ? opts.functionsDir
     : resolvePath(cwd, opts.functionsDir);
@@ -401,7 +413,7 @@ async function buildVercelOnce(
   // module files into its own `.func` directory. Staging keeps the chunk
   // graph intact (shared chunks are emitted once) while letting us copy the
   // reachable set per function so each `.func` is self-contained.
-  const stageDir = await Deno.makeTempDir({ prefix: "1tube-vercel-" });
+  const stageDir = await mkdtemp(join(tmpdir(), "1tube-vercel-"));
   try {
     opts.onProgress?.({ phase: "bundle-start", functions: inputs.length });
     const bundleStart = performance.now();
@@ -422,12 +434,16 @@ async function buildVercelOnce(
     });
 
     // Read each function's declared `serve({ timeoutMs })` so it can drive
-    // `maxDuration` without a side-car manifest. Done after bundling so the
-    // entrypoints' module graph is already warm in Deno's cache; the deployed
-    // function is unaffected (see capture-config.ts).
+    // `maxDuration` without a side-car manifest. Done after bundling so every
+    // npm:/jsr: package the entrypoints reach is already in the managed store;
+    // the deployed function is unaffected (see capture-config.ts).
     const declaredConfigs = await captureDeclaredServeConfigs(
       inputs,
       (m) => opts.onProgress?.({ phase: "capture-warning", message: m }),
+      {
+        ...(opts.configPath ? { configPath: opts.configPath } : {}),
+        functionsDir,
+      },
     );
 
     const functionsRoot = join(outDir, "functions", ...pathPrefix.split("/"));
@@ -442,12 +458,12 @@ async function buildVercelOnce(
         const src = join(stageDir, moduleFile);
         const dest = join(funcDir, moduleFile);
         await ensureDir(dirname(dest));
-        await Deno.copyFile(src, dest);
+        await copyFile(src, dest);
         if (sourcemap === "linked") {
           try {
-            await Deno.copyFile(`${src}.map`, `${dest}.map`);
+            await copyFile(`${src}.map`, `${dest}.map`);
           } catch (err) {
-            if (!(err instanceof Deno.errors.NotFound)) throw err;
+            if (!isNotFound(err)) throw err;
           }
         }
       }
@@ -472,13 +488,13 @@ async function buildVercelOnce(
         supportsResponseStreaming: true,
         maxDuration,
       };
-      await Deno.writeTextFile(
+      await writeFile(
         join(funcDir, ".vc-config.json"),
         JSON.stringify(vcConfig, null, 2) + "\n",
       );
       // package.json with type:module so Vercel's Node launcher loads the
       // emitted `.js` files as ESM (esbuild output uses import/export).
-      await Deno.writeTextFile(
+      await writeFile(
         join(funcDir, "package.json"),
         JSON.stringify({ type: "module" }, null, 2) + "\n",
       );
@@ -551,7 +567,7 @@ export async function buildVercel(
 }
 
 /**
- * CLI entry point. Returns a process exit code (does not call `Deno.exit`).
+ * CLI entry point. Returns a process exit code (does not call `process.exit`).
  *
  * Recognised flags (all optional):
  *   --functions <path>     function source dirs (default ./supabase/functions)
@@ -569,7 +585,7 @@ export async function buildVercel(
  *   --no-config            skip the import map
  */
 export async function runVercelBuild(args: string[]): Promise<number> {
-  let functionsDir = Deno.env.get("FUNCTIONS_PATH") || "./supabase/functions";
+  let functionsDir = process.env.FUNCTIONS_PATH || "./supabase/functions";
   let outDir = "./.vercel/output";
   let only: string[] | undefined;
   let sourcemap: boolean | "linked" | "inline" = "linked";
@@ -582,9 +598,8 @@ export async function runVercelBuild(args: string[]): Promise<number> {
   let configPathArg: string | undefined;
   // Env fallback lets CI export the id once for both the frontend build and
   // this command without threading it through every script.
-  let deploymentId: string | undefined = Deno.env.get(
-    "1TUBE_VERCEL_DEPLOYMENT_ID",
-  )?.trim() || undefined;
+  let deploymentId: string | undefined =
+    process.env["1TUBE_VERCEL_DEPLOYMENT_ID"]?.trim() || undefined;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];

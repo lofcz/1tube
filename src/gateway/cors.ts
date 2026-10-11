@@ -25,7 +25,7 @@
  *     the historical behaviour (on for an explicit allowlist, off for `*`).
  */
 
-import type { Context, Next } from "npm:hono@4";
+import type { Context, Next } from "hono";
 
 // `x-deployment-id` is Vercel's Skew Protection request pin; a cross-origin
 // client that sends it needs the preflight to allow it, otherwise the browser
@@ -77,7 +77,7 @@ function mergeHeaderList(base: string, extra: string): string {
 }
 
 function readBoolEnv(name: string): boolean | null {
-  const v = Deno.env.get(name);
+  const v = process.env[name];
   if (v === undefined) return null;
   const t = v.trim().toLowerCase();
   if (t === "1" || t === "true") return true;
@@ -95,16 +95,16 @@ function loadResponseShape(): Pick<
   | "allowCredentials"
 > {
   const allowHeaders =
-    (Deno.env.get("1TUBE_CORS_ALLOW_HEADERS") || DEFAULT_ALLOWED_HEADERS)
+    (process.env["1TUBE_CORS_ALLOW_HEADERS"] || DEFAULT_ALLOWED_HEADERS)
       .trim();
   const allowMethods =
-    (Deno.env.get("1TUBE_CORS_ALLOW_METHODS") || DEFAULT_ALLOWED_METHODS)
+    (process.env["1TUBE_CORS_ALLOW_METHODS"] || DEFAULT_ALLOWED_METHODS)
       .trim();
   const exposeHeaders = mergeHeaderList(
     INTERNAL_EXPOSED_HEADERS,
-    (Deno.env.get("1TUBE_CORS_EXPOSE_HEADERS") || "").trim(),
+    (process.env["1TUBE_CORS_EXPOSE_HEADERS"] || "").trim(),
   );
-  const maxAgeRaw = (Deno.env.get("1TUBE_CORS_MAX_AGE") || "").trim();
+  const maxAgeRaw = (process.env["1TUBE_CORS_MAX_AGE"] || "").trim();
   const maxAgeNum = parseInt(maxAgeRaw, 10);
   const maxAge =
     maxAgeRaw !== "" && Number.isFinite(maxAgeNum) && maxAgeNum >= 0
@@ -121,8 +121,8 @@ function loadResponseShape(): Pick<
 
 function loadConfig(): CorsConfig {
   if (_config) return _config;
-  const raw = (Deno.env.get("1TUBE_CORS_ORIGIN") || "").trim();
-  const isDev = Deno.env.get("1TUBE_DEV") === "1";
+  const raw = (process.env["1TUBE_CORS_ORIGIN"] || "").trim();
+  const isDev = process.env["1TUBE_DEV"] === "1";
   const shape = loadResponseShape();
 
   if (!raw) {

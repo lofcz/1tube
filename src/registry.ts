@@ -3,10 +3,12 @@
  *
  * When a function module calls `serve(handler, opts)` from `_shared/handler.ts`,
  * the shim checks for `globalThis.__edgeFunctionRegistry`. If present, the handler
- * is stored here instead of starting a Deno.serve() per function.
+ * is stored here instead of starting a server per function.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { fileURLToPath } from "node:url";
+import { createGlobalProxy } from "./compat/globals.ts";
 import {
   defaultManifest,
   type FunctionManifest,
@@ -142,6 +144,8 @@ export class FunctionRegistry {
   private workerHandles = new Map<string, WorkerFunctionHandle>();
   /** In-flight import dedupe: many concurrent first-requests await the same Promise. */
   private loading = new Map<string, Promise<RegisteredFunction | null>>();
+  /** Module graph per in-process function (see {@link importFunction}). */
+  private graphs = new Map<string, Bun.ModuleGraph>();
 
   /**
    * Loader hook: stash a manifest for a function before its module is
@@ -166,6 +170,37 @@ export class FunctionRegistry {
     fn: () => Promise<T> | T,
   ): Promise<T> | T {
     return currentNameStorage.run(name, fn);
+  }
+
+  /**
+   * Import a function module with `name` bound as the registering function.
+   *
+   * Bun does not carry AsyncLocalStorage context into the top level of a
+   * dynamically imported module, so `runWithCurrentFunction(name, () =>
+   * import(url))` cannot attribute the module's `serve()` call. Instead the
+   * module loads into its own `Bun.ModuleGraph` whose registry global binds
+   * `register()` to `name` — which also gives every (re)import fresh module
+   * state, no `?v=` cache-busting needed.
+   */
+  async importFunction(name: string, moduleUrl: string): Promise<void> {
+    const register = (
+      handler: AuthenticatedHandler | PublicHandler,
+      opts: Parameters<FunctionRegistry["register"]>[1],
+    ) => this.runWithCurrentFunction(name, () => this.register(handler, opts));
+    const globals: Record<string, unknown> = { __edgeFunctionRegistry: { register } };
+    const scope = createGlobalProxy(globals);
+    globals.globalThis = scope;
+    globals.self = scope;
+    const graph = new Bun.ModuleGraph({ globals });
+    const path = moduleUrl.startsWith("file:") ? fileURLToPath(moduleUrl) : moduleUrl;
+    try {
+      await graph.run(() => graph.import(path));
+    } catch (err) {
+      graph.dispose();
+      throw err;
+    }
+    this.graphs.get(name)?.dispose();
+    this.graphs.set(name, graph);
   }
 
   /**
@@ -312,9 +347,7 @@ export class FunctionRegistry {
       pending = (async () => {
         this.attachManifest(name, cand.manifest);
         try {
-          await this.runWithCurrentFunction(name, async () => {
-            await import(cand.moduleUrl);
-          });
+          await this.importFunction(name, cand.moduleUrl);
         } catch (err) {
           // On failure, drop the candidate so subsequent calls 404 (or the
           // operator can re-add via reload). Surface the error to the caller.
@@ -335,6 +368,8 @@ export class FunctionRegistry {
   }
 
   delete(name: string): boolean {
+    this.graphs.get(name)?.dispose();
+    this.graphs.delete(name);
     this.pendingManifests.delete(name);
     this.candidates.delete(name);
     this.loading.delete(name);
@@ -343,6 +378,8 @@ export class FunctionRegistry {
   }
 
   clear(): void {
+    for (const g of this.graphs.values()) g.dispose();
+    this.graphs.clear();
     this.handlers.clear();
     this.pendingManifests.clear();
     this.candidates.clear();

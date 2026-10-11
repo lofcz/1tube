@@ -569,11 +569,20 @@ export interface StandaloneServe {
 }
 
 export function getStandaloneServe(): StandaloneServe | null {
-  const runtime = globalThis as { Deno?: { serve?: StandaloneServe } };
+  const runtime = globalThis as {
+    Deno?: { serve?: StandaloneServe };
+    Bun?: { serve?: (opts: { fetch: (req: Request) => Response | Promise<Response> }) => unknown };
+  };
   const standaloneServe = runtime.Deno?.serve;
-  return typeof standaloneServe === "function"
-    ? standaloneServe.bind(runtime.Deno)
-    : null;
+  if (typeof standaloneServe === "function") return standaloneServe.bind(runtime.Deno);
+  // `bun supabase/functions/<name>/index.ts` outside the gateway.
+  const bunServe = runtime.Bun?.serve;
+  if (typeof bunServe === "function") {
+    return (handler) => {
+      bunServe.call(runtime.Bun, { fetch: handler });
+    };
+  }
+  return null;
 }
 
 export function normalizeRoutePath(path: string): string {

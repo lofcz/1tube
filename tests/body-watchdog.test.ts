@@ -8,7 +8,8 @@
  * after the source has cleanly closed.
  */
 
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals, assertRejects } from "./_assert.ts";
 import { watchdogBody } from "../src/gateway/body-watchdog.ts";
 
 const enc = new TextEncoder();
@@ -34,7 +35,7 @@ function makeChunkedStream(opts: {
     }
     // If we're cancelled mid-pull (endless: true case especially), the
     // pending pull's resolver must run or the stream's internal queue stays
-    // pinned and Deno's leak detector trips on the dangling timer.
+    // pinned and the dangling timer outlives the test.
     if (resolveLast) {
       resolveLast();
       resolveLast = undefined;
@@ -91,7 +92,7 @@ async function drainToString(
   return new TextDecoder().decode(out);
 }
 
-Deno.test("body-watchdog: idleMs <= 0 is a pass-through (returns the same stream)", async () => {
+test("body-watchdog: idleMs <= 0 is a pass-through (returns the same stream)", async () => {
   const src = makeChunkedStream({ chunks: [enc.encode("hi")], gapMs: 0 });
   const abort = new AbortController();
   const w = watchdogBody(src, 0, abort);
@@ -102,11 +103,11 @@ Deno.test("body-watchdog: idleMs <= 0 is a pass-through (returns the same stream
   );
   assertEquals(w.stalled(), false);
   // Drain so the source's internal pull-queue doesn't leak its setTimeout
-  // past the test boundary (Deno default highWaterMark eagerly pulls one).
+  // past the test boundary (default highWaterMark eagerly pulls one).
   await src.cancel();
 });
 
-Deno.test("body-watchdog: a fast normal body passes through unmodified", async () => {
+test("body-watchdog: a fast normal body passes through unmodified", async () => {
   const src = makeChunkedStream({
     chunks: [enc.encode("hello "), enc.encode("world")],
     gapMs: 5,
@@ -120,7 +121,7 @@ Deno.test("body-watchdog: a fast normal body passes through unmodified", async (
   assertEquals(abort.signal.aborted, false);
 });
 
-Deno.test("body-watchdog: slow-but-progressing body (gap < idle) is allowed", async () => {
+test("body-watchdog: slow-but-progressing body (gap < idle) is allowed", async () => {
   // Each chunk takes 30ms; idle threshold is 100ms — well under.
   const src = makeChunkedStream({
     chunks: [
@@ -140,7 +141,7 @@ Deno.test("body-watchdog: slow-but-progressing body (gap < idle) is allowed", as
   assertEquals(abort.signal.aborted, false);
 });
 
-Deno.test("body-watchdog: fully stalled body trips the watchdog and aborts", async () => {
+test("body-watchdog: fully stalled body trips the watchdog and aborts", async () => {
   const src = makeChunkedStream({
     chunks: [enc.encode("first ")],
     gapMs: 5,
@@ -167,7 +168,7 @@ Deno.test("body-watchdog: fully stalled body trips the watchdog and aborts", asy
   assertEquals((abort.signal.reason as DOMException).name, "AbortError");
 });
 
-Deno.test("body-watchdog: stall propagates as AbortError into req.text() consumers", async () => {
+test("body-watchdog: stall propagates as AbortError into req.text() consumers", async () => {
   const src = makeChunkedStream({
     chunks: [enc.encode("partial")],
     gapMs: 0,
@@ -183,7 +184,7 @@ Deno.test("body-watchdog: stall propagates as AbortError into req.text() consume
     method: "POST",
     body: w.body,
     signal: abort.signal,
-    // @ts-ignore -- Deno supports `duplex` on Request
+    // @ts-ignore -- Bun supports `duplex` on Request
     duplex: "half",
   });
 
@@ -194,7 +195,7 @@ Deno.test("body-watchdog: stall propagates as AbortError into req.text() consume
   assertEquals(w.stalled(), true);
 });
 
-Deno.test("body-watchdog: consumer cancel cancels the source and never trips", async () => {
+test("body-watchdog: consumer cancel cancels the source and never trips", async () => {
   let sourceCancelled = false;
   // Hanging source: never enqueues, never closes — pull returns a Promise
   // that resolves only when the source is cancelled. No setTimeout needed,
@@ -236,7 +237,7 @@ Deno.test("body-watchdog: consumer cancel cancels the source and never trips", a
   assertEquals(w.stalled(), false);
 });
 
-Deno.test("body-watchdog: clean source close does not arm a stale timer", async () => {
+test("body-watchdog: clean source close does not arm a stale timer", async () => {
   const src = makeChunkedStream({
     chunks: [enc.encode("ok")],
     gapMs: 5,
@@ -253,7 +254,7 @@ Deno.test("body-watchdog: clean source close does not arm a stale timer", async 
   assertEquals(abort.signal.aborted, false);
 });
 
-Deno.test("body-watchdog: idle timer resets on every chunk (delivery cadence ≈ 2× idle)", async () => {
+test("body-watchdog: idle timer resets on every chunk (delivery cadence ≈ 2× idle)", async () => {
   // Source delivers 5 chunks, each 40ms apart. Idle threshold is 60ms — never
   // exceeded between chunks, so the watchdog must NOT fire even though the
   // total body-read time (200ms) is more than 3× the idle threshold.
@@ -269,7 +270,7 @@ Deno.test("body-watchdog: idle timer resets on every chunk (delivery cadence ≈
   assertEquals(w.stalled(), false);
 });
 
-Deno.test("body-watchdog: aborting via the external controller short-circuits the next read", async () => {
+test("body-watchdog: aborting via the external controller short-circuits the next read", async () => {
   const src = makeChunkedStream({
     chunks: [enc.encode("x")],
     gapMs: 0,

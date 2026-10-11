@@ -15,8 +15,8 @@
  * mint fresh buckets.
  */
 
-import type { Context, Next } from "npm:hono@4";
-import { getConnInfo } from "npm:hono@4/deno";
+import type { Context, Next } from "hono";
+import { getConnInfo } from "hono/bun";
 import type { FunctionRegistry } from "../registry.ts";
 import type { RateLimitBy } from "../manifest.ts";
 import { routeRemainder } from "./route-prefix.ts";
@@ -58,7 +58,7 @@ let _trustedProxies: Set<string> | null = null;
 
 function loadTrustedProxies(): Set<string> {
   if (_trustedProxies) return _trustedProxies;
-  const raw = (Deno.env.get("1TUBE_TRUSTED_PROXIES") || "").trim();
+  const raw = (process.env["1TUBE_TRUSTED_PROXIES"] || "").trim();
   _trustedProxies = new Set(
     raw.split(",").map((s) => s.trim()).filter(Boolean),
   );
@@ -134,7 +134,7 @@ export function createRateLimiter(config: Partial<RateLimitConfig> = {}) {
   // to a no-op middleware for the lifetime of the process. This is
   // BENCHMARK / DEV ONLY — production deployments must keep limits
   // enabled or set per-function caps via manifests.
-  const disabled = (Deno.env.get("1TUBE_DISABLE_RATE_LIMIT") || "").trim();
+  const disabled = (process.env["1TUBE_DISABLE_RATE_LIMIT"] || "").trim();
   if (disabled === "1" || disabled.toLowerCase() === "true") {
     console.log(
       `[1tube] rate limiter DISABLED via 1TUBE_DISABLE_RATE_LIMIT — load-test mode only, do not run in prod.`,

@@ -5,7 +5,8 @@
  * warming 503 contract and asserts retry behaviour + overlay callbacks.
  */
 
-import { assert, assertEquals } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals } from "./_assert.ts";
 import {
   createWarmupFetch,
   fetchWarmupStatus,
@@ -26,7 +27,7 @@ function warmingResponse(): Response {
   );
 }
 
-Deno.test("warmup-client: isWarmingResponse only matches the gateway contract", () => {
+test("warmup-client: isWarmingResponse only matches the gateway contract", () => {
   assert(isWarmingResponse(warmingResponse()));
   assertEquals(isWarmingResponse(new Response("ok")), false);
   assertEquals(
@@ -36,7 +37,7 @@ Deno.test("warmup-client: isWarmingResponse only matches the gateway contract", 
   );
 });
 
-Deno.test("warmup-client: retries through warming and reports overlay transitions", async () => {
+test("warmup-client: retries through warming and reports overlay transitions", async () => {
   let calls = 0;
   const fakeFetch = ((_input: RequestInfo | URL, _init?: RequestInit) => {
     calls++;
@@ -62,7 +63,7 @@ Deno.test("warmup-client: retries through warming and reports overlay transition
   assertEquals(transitions, [true, false]);
 });
 
-Deno.test("warmup-client: no overlay callback for instant success", async () => {
+test("warmup-client: no overlay callback for instant success", async () => {
   const fakeFetch =
     (() => Promise.resolve(new Response("ok"))) as unknown as typeof fetch;
   const transitions: boolean[] = [];
@@ -75,7 +76,7 @@ Deno.test("warmup-client: no overlay callback for instant success", async () => 
   assertEquals(transitions, []);
 });
 
-Deno.test("warmup-client: gives up after maxWaitMs and returns the warming response", async () => {
+test("warmup-client: gives up after maxWaitMs and returns the warming response", async () => {
   let calls = 0;
   const fakeFetch = (() => {
     calls++;
@@ -98,7 +99,7 @@ Deno.test("warmup-client: gives up after maxWaitMs and returns the warming respo
   assertEquals(transitions[transitions.length - 1], false);
 });
 
-Deno.test("warmup-client: streaming bodies are never retried", async () => {
+test("warmup-client: streaming bodies are never retried", async () => {
   let calls = 0;
   const fakeFetch = (() => {
     calls++;
@@ -120,9 +121,9 @@ Deno.test("warmup-client: streaming bodies are never retried", async () => {
   assertEquals(calls, 1, "a consumed stream body must not be re-sent");
 });
 
-Deno.test("warmup-client: fetchWarmupStatus parses the gateway payload", async () => {
+test("warmup-client: fetchWarmupStatus parses the gateway payload", async () => {
   const payload = {
-    backend: "deno",
+    backend: "bun",
     ready: false,
     total: 3,
     loaded: 1,

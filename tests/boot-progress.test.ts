@@ -6,7 +6,8 @@
  * cursor escapes, so we assert their absence here as a regression guard.
  */
 
-import { assert, assertEquals, assertStringIncludes } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals, assertStringIncludes } from "./_assert.ts";
 import {
   createBootProgress,
   createScanProgress,
@@ -33,7 +34,7 @@ class FakeSink {
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-Deno.test("boot-progress: completion lines print verbatim with a trailing newline", () => {
+test("boot-progress: completion lines print verbatim with a trailing newline", () => {
   const sink = new FakeSink();
   const p = createBootProgress(sink, { pulseMs: 0 });
   p.start(2);
@@ -48,7 +49,7 @@ Deno.test("boot-progress: completion lines print verbatim with a trailing newlin
   );
 });
 
-Deno.test("boot-progress: never emits cursor-rewrite escapes (no \\r, no clear-line)", () => {
+test("boot-progress: never emits cursor-rewrite escapes (no \\r, no clear-line)", () => {
   // The whole point of the new design — anything that overwrites in-place
   // would race with foreign console.log writers from imported modules.
   const sink = new FakeSink();
@@ -67,7 +68,7 @@ Deno.test("boot-progress: never emits cursor-rewrite escapes (no \\r, no clear-l
   assert(!text.includes("\x1b[2K"), "must not write ANSI clear-entire-line");
 });
 
-Deno.test("boot-progress: heartbeat fires after pulseMs and reports current state", async () => {
+test("boot-progress: heartbeat fires after pulseMs and reports current state", async () => {
   const sink = new FakeSink();
   const p = createBootProgress(sink, { pulseMs: 30 });
   p.start(3);
@@ -82,7 +83,7 @@ Deno.test("boot-progress: heartbeat fires after pulseMs and reports current stat
   assertStringIncludes(text, "2 in progress");
 });
 
-Deno.test("boot-progress: heartbeat suppresses repeats when nothing changed", async () => {
+test("boot-progress: heartbeat suppresses repeats when nothing changed", async () => {
   const sink = new FakeSink();
   const p = createBootProgress(sink, { pulseMs: 20 });
   p.start(2);
@@ -99,7 +100,7 @@ Deno.test("boot-progress: heartbeat suppresses repeats when nothing changed", as
   );
 });
 
-Deno.test("boot-progress: heartbeat resumes after state change (onFinish reset)", async () => {
+test("boot-progress: heartbeat resumes after state change (onFinish reset)", async () => {
   const sink = new FakeSink();
   const p = createBootProgress(sink, { pulseMs: 20 });
   p.start(3);
@@ -116,7 +117,7 @@ Deno.test("boot-progress: heartbeat resumes after state change (onFinish reset)"
   );
 });
 
-Deno.test("boot-progress: no heartbeat once everything has completed", async () => {
+test("boot-progress: no heartbeat once everything has completed", async () => {
   const sink = new FakeSink();
   const p = createBootProgress(sink, { pulseMs: 20 });
   p.start(1);
@@ -128,7 +129,7 @@ Deno.test("boot-progress: no heartbeat once everything has completed", async () 
   assertEquals(heartbeats.length, 0, "should not pulse after work is done");
 });
 
-Deno.test("boot-progress: pulseMs <= 0 disables heartbeats entirely", async () => {
+test("boot-progress: pulseMs <= 0 disables heartbeats entirely", async () => {
   const sink = new FakeSink();
   const p = createBootProgress(sink, { pulseMs: 0 });
   p.start(2);
@@ -138,7 +139,7 @@ Deno.test("boot-progress: pulseMs <= 0 disables heartbeats entirely", async () =
   assertEquals(sink.text().includes("still working"), false);
 });
 
-Deno.test("boot-progress: heartbeat inflight list is capped with '+N more'", async () => {
+test("boot-progress: heartbeat inflight list is capped with '+N more'", async () => {
   const sink = new FakeSink();
   const p = createBootProgress(sink, { pulseMs: 20 });
   p.start(20);
@@ -149,7 +150,7 @@ Deno.test("boot-progress: heartbeat inflight list is capped with '+N more'", asy
   assertStringIncludes(text, "+8 more");
 });
 
-Deno.test("boot-progress: stop() is idempotent and writes nothing on repeated calls", () => {
+test("boot-progress: stop() is idempotent and writes nothing on repeated calls", () => {
   const sink = new FakeSink();
   const p = createBootProgress(sink, { pulseMs: 1000 });
   p.start(1);
@@ -162,7 +163,7 @@ Deno.test("boot-progress: stop() is idempotent and writes nothing on repeated ca
   assertEquals(sink.text().length, before);
 });
 
-Deno.test("scan-progress: renders an in-place line with the found count on a TTY", () => {
+test("scan-progress: renders an in-place line with the found count on a TTY", () => {
   const sink = new FakeSink(true);
   const p = createScanProgress(sink, { tickMs: 0 });
   p.start();
@@ -177,7 +178,7 @@ Deno.test("scan-progress: renders an in-place line with the found count on a TTY
   assertStringIncludes(text, "found 7");
 });
 
-Deno.test("scan-progress: setPhase switches to the dependency-graph label", () => {
+test("scan-progress: setPhase switches to the dependency-graph label", () => {
   const sink = new FakeSink(true);
   const p = createScanProgress(sink, { tickMs: 0 });
   p.start();
@@ -186,7 +187,7 @@ Deno.test("scan-progress: setPhase switches to the dependency-graph label", () =
   assertStringIncludes(sink.text(), "Building dependency graph");
 });
 
-Deno.test("scan-progress: stop clears the line and is idempotent", () => {
+test("scan-progress: stop clears the line and is idempotent", () => {
   const sink = new FakeSink(true);
   const p = createScanProgress(sink, { tickMs: 0 });
   p.start();
@@ -200,7 +201,7 @@ Deno.test("scan-progress: stop clears the line and is idempotent", () => {
   assertEquals(sink.text().length, before, "stop is idempotent");
 });
 
-Deno.test("scan-progress: a non-TTY sink renders nothing (no \\r spam in logs)", () => {
+test("scan-progress: a non-TTY sink renders nothing (no \\r spam in logs)", () => {
   const sink = new FakeSink(false);
   const p = createScanProgress(sink, { tickMs: 0 });
   p.start();
@@ -210,7 +211,7 @@ Deno.test("scan-progress: a non-TTY sink renders nothing (no \\r spam in logs)",
   assertEquals(sink.text(), "", "piped/CI output must stay clean");
 });
 
-Deno.test("boot-progress: write errors on the sink don't crash the renderer", async () => {
+test("boot-progress: write errors on the sink don't crash the renderer", async () => {
   // Simulate a closed pipe — every writeSync throws. The renderer must
   // swallow the error rather than take the gateway down at boot.
   const broken = {

@@ -2,7 +2,8 @@
  * Tests for src/supervisor.ts.
  */
 
-import { assert, assertEquals, assertFalse } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals, assertFalse } from "./_assert.ts";
 import { FunctionSupervisor } from "../src/supervisor.ts";
 import { defaultManifest } from "../src/manifest.ts";
 
@@ -19,7 +20,7 @@ function withRecycle(
   return m;
 }
 
-Deno.test("supervisor: trips breaker once errorRate is exceeded over the window", () => {
+test("supervisor: trips breaker once errorRate is exceeded over the window", () => {
   const sup = new FunctionSupervisor();
   sup.setManifest(
     "fn",
@@ -41,7 +42,7 @@ Deno.test("supervisor: trips breaker once errorRate is exceeded over the window"
   assert((decision.retryAfter ?? 0) > 0);
 });
 
-Deno.test("supervisor: breaker re-closes after cooldown elapses", () => {
+test("supervisor: breaker re-closes after cooldown elapses", () => {
   const sup = new FunctionSupervisor();
   sup.setManifest(
     "fn",
@@ -62,7 +63,7 @@ Deno.test("supervisor: breaker re-closes after cooldown elapses", () => {
   assert(allowed.ok);
 });
 
-Deno.test("supervisor: maxRequests recommendation fires exactly once", () => {
+test("supervisor: maxRequests recommendation fires exactly once", () => {
   const sup = new FunctionSupervisor();
   sup.setManifest("fn", withRecycle({ maxRequests: 3, errorRate: 0 }));
 
@@ -77,7 +78,7 @@ Deno.test("supervisor: maxRequests recommendation fires exactly once", () => {
   assertEquals(sup.stats("fn").recycleRecommended, true);
 });
 
-Deno.test("supervisor: stats tracks invocations, errors and ratio", () => {
+test("supervisor: stats tracks invocations, errors and ratio", () => {
   const sup = new FunctionSupervisor();
   sup.setManifest("fn", withRecycle({ errorRate: 0.99, errorWindow: 10 }));
 
@@ -93,7 +94,7 @@ Deno.test("supervisor: stats tracks invocations, errors and ratio", () => {
   assertEquals(stats.breakerOpen, false);
 });
 
-Deno.test("supervisor: forget() drops state and manifest", () => {
+test("supervisor: forget() drops state and manifest", () => {
   const sup = new FunctionSupervisor();
   sup.setManifest("fn", defaultManifest());
   sup.record("fn", true);
@@ -104,13 +105,13 @@ Deno.test("supervisor: forget() drops state and manifest", () => {
   assertEquals(stats.invocations, 0);
 });
 
-Deno.test("supervisor: admit always allows when no manifest is registered", () => {
+test("supervisor: admit always allows when no manifest is registered", () => {
   const sup = new FunctionSupervisor();
   const decision = sup.admit("unknown");
   assert(decision.ok);
 });
 
-Deno.test("supervisor: never trips breaker before window is full", () => {
+test("supervisor: never trips breaker before window is full", () => {
   const sup = new FunctionSupervisor();
   sup.setManifest("fn", withRecycle({ errorRate: 0.1, errorWindow: 10 }));
 
@@ -124,7 +125,7 @@ Deno.test("supervisor: never trips breaker before window is full", () => {
   assert(r.breakerJustTripped);
 });
 
-Deno.test("supervisor: allStats() reports every known function", () => {
+test("supervisor: allStats() reports every known function", () => {
   const sup = new FunctionSupervisor();
   sup.setManifest("a", defaultManifest());
   sup.setManifest("b", defaultManifest());

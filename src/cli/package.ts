@@ -38,9 +38,18 @@
  * One signature, transitive integrity over the whole payload.
  */
 
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
-import { walk } from "jsr:@std/fs@^1/walk";
-import { BlobWriter, Uint8ArrayReader, ZipWriter } from "@zip-js/zip-js";
+import { BlobWriter, Uint8ArrayReader, ZipWriter } from "@zip.js/zip.js";
+import { stdout } from "../stdio.ts";
 import {
   decodeKey,
   ENVELOPE_SCHEMA,
@@ -138,6 +147,24 @@ function defaultVersion(manifestSha256: string, when: Date): string {
   return `${ts}-${manifestSha256.slice(0, 8)}`;
 }
 
+function isNotFound(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === "ENOENT";
+}
+
+/**
+ * Every file under `root`, depth-first, entries sorted by name so the
+ * zip's entry order is deterministic across filesystems.
+ */
+async function* walkFiles(root: string): AsyncGenerator<string> {
+  const entries = await readdir(root, { withFileTypes: true });
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  for (const entry of entries) {
+    const abs = join(root, entry.name);
+    if (entry.isDirectory()) yield* walkFiles(abs);
+    else if (entry.isFile() || entry.isSymbolicLink()) yield abs;
+  }
+}
+
 /**
  * Walk `<distDir>/manifest.json` + runtime subtrees and
  * return them as a flat list of (zipPath, bytes) pairs. README.txt
@@ -156,7 +183,7 @@ async function collectDistFiles(
   // twice.
   const manifestPath = join(distDir, "manifest.json");
   try {
-    await Deno.stat(manifestPath);
+    await stat(manifestPath);
   } catch {
     throw new Error(
       `1tube package: ${manifestPath} not found. Did you run \`1tube build\` first?`,
@@ -164,7 +191,7 @@ async function collectDistFiles(
   }
   const functionsDir = join(distDir, "functions");
   try {
-    await Deno.stat(functionsDir);
+    await stat(functionsDir);
   } catch {
     throw new Error(
       `1tube package: ${functionsDir} not found. Did the build emit zero functions?`,
@@ -173,86 +200,69 @@ async function collectDistFiles(
 
   const plan: Array<{ src: string; zipPath: string; size: number }> = [];
   {
-    const stat = await Deno.stat(manifestPath);
+    const manifestStat = await stat(manifestPath);
     plan.push({
       src: manifestPath,
       zipPath: "dist/manifest.json",
-      size: stat.size,
+      size: manifestStat.size,
     });
   }
-  for await (
-    const entry of walk(functionsDir, {
-      includeFiles: true,
-      includeDirs: false,
-    })
-  ) {
-    const stat = await Deno.stat(entry.path);
-    const rel = entry.path.slice(distDir.length).replace(/\\/g, "/").replace(
+  for await (const path of walkFiles(functionsDir)) {
+    const fileStat = await stat(path);
+    const rel = path.slice(distDir.length).replace(/\\/g, "/").replace(
       /^\/+/,
       "",
     );
-    plan.push({ src: entry.path, zipPath: `dist/${rel}`, size: stat.size });
+    plan.push({ src: path, zipPath: `dist/${rel}`, size: fileStat.size });
   }
 
   const sharedDir = join(distDir, "shared");
   try {
-    const stat = await Deno.stat(sharedDir);
-    if (stat.isDirectory) {
-      for await (
-        const entry of walk(sharedDir, {
-          includeFiles: true,
-          includeDirs: false,
-        })
-      ) {
-        const fileStat = await Deno.stat(entry.path);
-        const rel = entry.path.slice(distDir.length).replace(/\\/g, "/")
+    if ((await stat(sharedDir)).isDirectory()) {
+      for await (const path of walkFiles(sharedDir)) {
+        const fileStat = await stat(path);
+        const rel = path.slice(distDir.length).replace(/\\/g, "/")
           .replace(/^\/+/, "");
         plan.push({
-          src: entry.path,
+          src: path,
           zipPath: `dist/${rel}`,
           size: fileStat.size,
         });
       }
     }
   } catch (err) {
-    if (!(err instanceof Deno.errors.NotFound)) throw err;
+    if (!isNotFound(err)) throw err;
   }
 
   const chunksDir = join(distDir, "chunks");
   try {
-    const stat = await Deno.stat(chunksDir);
-    if (stat.isDirectory) {
-      for await (
-        const entry of walk(chunksDir, {
-          includeFiles: true,
-          includeDirs: false,
-        })
-      ) {
-        const fileStat = await Deno.stat(entry.path);
-        const rel = entry.path.slice(distDir.length).replace(/\\/g, "/")
+    if ((await stat(chunksDir)).isDirectory()) {
+      for await (const path of walkFiles(chunksDir)) {
+        const fileStat = await stat(path);
+        const rel = path.slice(distDir.length).replace(/\\/g, "/")
           .replace(/^\/+/, "");
         plan.push({
-          src: entry.path,
+          src: path,
           zipPath: `dist/${rel}`,
           size: fileStat.size,
         });
       }
     }
   } catch (err) {
-    if (!(err instanceof Deno.errors.NotFound)) throw err;
+    if (!isNotFound(err)) throw err;
   }
 
   for (const fn of manifest.functions) {
     for (const sourceFile of fn.sourceFiles ?? []) {
       const src = join(distDir, "sources", fn.name, sourceFile);
       try {
-        const fileStat = await Deno.stat(src);
-        if (fileStat.isFile) {
+        const fileStat = await stat(src);
+        if (fileStat.isFile()) {
           const rel = `sources/${fn.name}/${sourceFile}`.replace(/\\/g, "/");
           plan.push({ src, zipPath: `dist/${rel}`, size: fileStat.size });
         }
       } catch (err) {
-        if (!(err instanceof Deno.errors.NotFound)) throw err;
+        if (!isNotFound(err)) throw err;
       }
     }
   }
@@ -291,7 +301,7 @@ async function collectDistFiles(
   let cursorBytes = 0;
   for (let i = 0; i < plan.length; i++) {
     const p = plan[i];
-    const bytes = await Deno.readFile(p.src);
+    const bytes = new Uint8Array(await readFile(p.src));
     files.push({ zipPath: p.zipPath, bytes });
     cursorBytes += bytes.length;
     onProgress?.({
@@ -316,7 +326,7 @@ export async function packageDist(
   opts: PackageOptions,
 ): Promise<PackageResult> {
   const startedAt = performance.now();
-  const cwd = Deno.cwd();
+  const cwd = process.cwd();
   const distDir = isAbsolute(opts.distDir)
     ? opts.distDir
     : resolvePath(cwd, opts.distDir);
@@ -332,7 +342,7 @@ export async function packageDist(
   const manifestPath = join(distDir, "manifest.json");
   let manifestRaw: unknown;
   try {
-    manifestRaw = JSON.parse(await Deno.readTextFile(manifestPath));
+    manifestRaw = JSON.parse(await readFile(manifestPath, "utf8"));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(`1tube package: cannot read ${manifestPath}: ${msg}`);
@@ -416,7 +426,7 @@ export async function packageDist(
   await zip.close();
   const blob = await blobWriter.getData();
   const zipBuf = new Uint8Array(await blob.arrayBuffer());
-  await Deno.writeFile(outFile, zipBuf);
+  await writeFile(outFile, zipBuf);
   opts.onProgress?.({
     phase: "finalize",
     current: 1,
@@ -448,9 +458,9 @@ export async function readPayload(
   entries: Map<string, Uint8Array>;
 }> {
   const { BlobReader, ZipReader, Uint8ArrayWriter } = await import(
-    "@zip-js/zip-js"
+    "@zip.js/zip.js"
   );
-  const bytes = await Deno.readFile(payloadPath);
+  const bytes = await readFile(payloadPath);
   const blob = new Blob([bytes as BlobPart]);
   const reader = new ZipReader(new BlobReader(blob));
   try {
@@ -484,7 +494,7 @@ export async function readPayload(
 function makeProgressRenderer(): (e: PackageProgress) => void {
   const isTTY = (() => {
     try {
-      return Deno.stdout.isTerminal();
+      return stdout.isTerminal?.() ?? false;
     } catch {
       return false;
     }
@@ -536,10 +546,10 @@ function makeProgressRenderer(): (e: PackageProgress) => void {
       const padded = line.length < lastWidth
         ? line + " ".repeat(lastWidth - line.length)
         : line;
-      Deno.stdout.writeSync(new TextEncoder().encode(`\r${padded}`));
+      stdout.writeSync(new TextEncoder().encode(`\r${padded}`));
       lastWidth = line.length;
       if (e.phase === "finalize") {
-        Deno.stdout.writeSync(new TextEncoder().encode("\n"));
+        stdout.writeSync(new TextEncoder().encode("\n"));
       }
     } else if (isFinal || phaseTransition) {
       // Non-TTY: only print on phase boundaries to keep log volume
@@ -584,7 +594,7 @@ Options:
 
 /**
  * CLI entry point. Mirrors the shape of {@link runBuild} — returns
- * an exit code rather than calling Deno.exit, so the parent
+ * an exit code rather than calling process.exit, so the parent
  * dispatcher (`src/cli.ts`) can decide its own termination policy.
  */
 export async function runPackage(args: string[]): Promise<number> {
@@ -647,7 +657,7 @@ export async function runPackage(args: string[]): Promise<number> {
     return 2;
   }
 
-  const keyMaterial = signKeyArg ?? Deno.env.get("1TUBE_PACKAGE_SIGN_KEY");
+  const keyMaterial = signKeyArg ?? process.env["1TUBE_PACKAGE_SIGN_KEY"];
   if (!keyMaterial) {
     console.error(
       `[1tube package] no signing key. Pass --sign-key <hex|base64> or set ` +
@@ -669,7 +679,7 @@ export async function runPackage(args: string[]): Promise<number> {
   try {
     if (functionsDir) {
       if (!inDir) {
-        inDir = await Deno.makeTempDir({ prefix: "1tube-package-build-" });
+        inDir = await mkdtemp(join(tmpdir(), "1tube-package-build-"));
         cleanupDir = inDir;
       }
       const { runBuild } = await import("./build.ts");
@@ -713,7 +723,7 @@ export async function runPackage(args: string[]): Promise<number> {
     return 1;
   } finally {
     if (cleanupDir) {
-      await Deno.remove(cleanupDir, { recursive: true }).catch(() => {});
+      await rm(cleanupDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 }

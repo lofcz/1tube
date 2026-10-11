@@ -1,7 +1,7 @@
 /**
  * Hot reloader for the workerd backend.
  *
- * Owns a `Deno.watchFs` loop over the functions directory and a tiny
+ * Owns a `watchFs` (src/fs-watch.ts) loop over the functions directory and a tiny
  * debounce + classify pipeline:
  *
  *     fs event ─▶ classifyChangedPath ─▶ pendingChanges set
@@ -26,10 +26,11 @@
  *     a fake clock.
  *   - {@link createWorkerdHotReloader}: the loop that consumes a
  *     watcher iterable. Tests pass an async iterator of fake events
- *     instead of the real `Deno.watchFs` to avoid filesystem flake.
+ *     instead of the real `node:fs` watcher to avoid filesystem flake.
  */
 
 import { relative, sep as SEPARATOR } from "node:path";
+import { watchFs } from "../../fs-watch.ts";
 import type { FunctionManifest } from "../../manifest.ts";
 import type { WorkerdBackend, WorkerdReloadResult } from "./backend.ts";
 
@@ -37,7 +38,7 @@ import type { WorkerdBackend, WorkerdReloadResult } from "./backend.ts";
  * Map a changed filesystem path to either a function name or `null`
  * meaning "shared change — reload everything".
  *
- * Mirrors the helper in `server.ts` (Deno-path HMR) so a single
+ * Mirrors the helper in `server.ts` (Bun-backend HMR) so a single
  * change-classification rule applies across both backends.
  */
 export function classifyChangedPath(
@@ -190,9 +191,9 @@ export function createReloadDebouncer(
 }
 
 /**
- * Iterable surface compatible with both real `Deno.watchFs` and a
- * test-time fake. `Deno.watchFs` already implements this shape; we
- * type it explicitly so tests don't have to depend on the global.
+ * Iterable surface compatible with both the real {@link watchFs} and a
+ * test-time fake. `watchFs` already implements this shape; we type it
+ * explicitly so tests don't have to touch the filesystem.
  */
 export type FsEventStream = AsyncIterable<{ paths: readonly string[] }> & {
   close(): void;
@@ -204,7 +205,7 @@ export interface WorkerdHotReloaderOptions {
   /** Backend instance produced by `createWorkerdBackend`. Must already be `start()`ed. */
   backend: WorkerdBackend;
   /**
-   * Debounce window in ms. 200ms is the same value the Deno-path HMR
+   * Debounce window in ms. 200ms is the same value the Bun-backend HMR
    * uses; mirrors editor save-burst behaviour (e.g. format-on-save +
    * autosave write the file twice within ~50ms).
    */
@@ -221,7 +222,7 @@ export interface WorkerdHotReloaderOptions {
   ) => void;
   /**
    * Test seam: factory for the underlying watcher. Defaults to
-   * `Deno.watchFs(functionsDir, { recursive: true })`. Tests inject
+   * `watchFs(functionsDir, { recursive: true })`. Tests inject
    * an in-memory async iterator instead.
    */
   watch?: (functionsDir: string) => FsEventStream;
@@ -244,8 +245,7 @@ export function createWorkerdHotReloader(
 ): WorkerdHotReloader {
   const log = opts.log ?? ((line) => console.log(line));
   const watcherFactory = opts.watch ??
-    ((dir) =>
-      Deno.watchFs(dir, { recursive: true }) as unknown as FsEventStream);
+    ((dir) => watchFs(dir, { recursive: true }));
 
   let stream: FsEventStream | null = null;
   let stopped = false;

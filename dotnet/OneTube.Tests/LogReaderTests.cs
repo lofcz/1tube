@@ -52,7 +52,7 @@ public sealed class LogDbFixture : IDisposable
         using var inv = conn.CreateCommand();
         inv.CommandText =
             "INSERT INTO invocations (id, ts_ms, function_name, method, path, status, duration_ms, user_id, backend, error_kind, error_message) " +
-            "VALUES ($id, $ts, $fn, $method, $path, $status, $dur, $user, 'deno', $kind, $msg)";
+            "VALUES ($id, $ts, $fn, $method, $path, $status, $dur, $user, 'bun', $kind, $msg)";
         var pId = inv.Parameters.Add("$id", SqliteType.Text);
         var pTs = inv.Parameters.Add("$ts", SqliteType.Integer);
         var pFn = inv.Parameters.Add("$fn", SqliteType.Text);

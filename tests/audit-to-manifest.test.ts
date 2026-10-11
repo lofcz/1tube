@@ -5,7 +5,8 @@
  * shared-record fan-out, manifest merging, and unknown-permission triage.
  */
 
-import { assert, assertEquals } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals } from "./_assert.ts";
 import {
   type AuditRecord,
   buildPermissionMap,
@@ -41,7 +42,7 @@ function rec(
   return { permission, value, stack };
 }
 
-Deno.test("audit: extractPathsFromStack pulls out file paths from a typical Deno stack", () => {
+test("audit: extractPathsFromStack pulls out file paths from a typical Deno stack", () => {
   const stack = `Error: nope
     at validateRequest (file:///c:/proj/1tube/src/gateway/auth.ts:55:10)
     at handler (file:///c:/proj/sciobot/supabase/functions/ai-chat/index.ts:412:7)
@@ -52,7 +53,7 @@ Deno.test("audit: extractPathsFromStack pulls out file paths from a typical Deno
   assert(paths[1].endsWith("index.ts"));
 });
 
-Deno.test("audit: functionForPath identifies the owning function under functionsDir", () => {
+test("audit: functionForPath identifies the owning function under functionsDir", () => {
   assertEquals(
     functionForPath(fnPath("ai-chat", "helpers", "x.ts"), FNS_DIR),
     "ai-chat",
@@ -62,7 +63,7 @@ Deno.test("audit: functionForPath identifies the owning function under functions
   assertEquals(functionForPath("/somewhere/else/file.ts", FNS_DIR), null);
 });
 
-Deno.test("audit: ownerForRecord walks frames and returns the first matching function", () => {
+test("audit: ownerForRecord walks frames and returns the first matching function", () => {
   const r = rec("env", "OPENAI_API_KEY", [
     fnPath("_shared", "ai.ts"),
     fnPath("ai-chat", "index.ts"),
@@ -70,7 +71,7 @@ Deno.test("audit: ownerForRecord walks frames and returns the first matching fun
   assertEquals(ownerForRecord(r, FNS_DIR), "ai-chat");
 });
 
-Deno.test("audit: parseAuditLine ignores blanks/comments and returns valid records", () => {
+test("audit: parseAuditLine ignores blanks/comments and returns valid records", () => {
   assertEquals(parseAuditLine(""), null);
   assertEquals(parseAuditLine("   "), null);
   assertEquals(parseAuditLine("# comment"), null);
@@ -82,7 +83,7 @@ Deno.test("audit: parseAuditLine ignores blanks/comments and returns valid recor
   assertEquals(ok?.value, "OPENAI_API_KEY");
 });
 
-Deno.test("audit: buildPermissionMap groups by owning function across permission types", () => {
+test("audit: buildPermissionMap groups by owning function across permission types", () => {
   const records: AuditRecord[] = [
     rec("env", "OPENAI_API_KEY", [fnPath("ai-chat", "index.ts")]),
     rec("env", "OPENAI_API_KEY", [fnPath("ai-chat", "index.ts")]),
@@ -106,7 +107,7 @@ Deno.test("audit: buildPermissionMap groups by owning function across permission
   assertEquals([...ck.env], ["STRIPE_KEY"]);
 });
 
-Deno.test("audit: --include-shared fans shared records out to every known function", () => {
+test("audit: --include-shared fans shared records out to every known function", () => {
   const records: AuditRecord[] = [
     rec("env", "OPENAI_API_KEY", [fnPath("ai-chat", "index.ts")]),
     rec("env", "STRIPE_KEY", [fnPath("checkout", "index.ts")]),
@@ -125,7 +126,7 @@ Deno.test("audit: --include-shared fans shared records out to every known functi
   assertEquals(withShare.get("checkout")?.env.has("GLOBAL_LOG_LEVEL"), true);
 });
 
-Deno.test("audit: unknown permission types land in the `other` bag, not the manifest", () => {
+test("audit: unknown permission types land in the `other` bag, not the manifest", () => {
   const records: AuditRecord[] = [
     rec("env", "X", [fnPath("fn", "index.ts")]),
     rec("run", "/bin/ls", [fnPath("fn", "index.ts")]),
@@ -139,7 +140,7 @@ Deno.test("audit: unknown permission types land in the `other` bag, not the mani
   assertEquals(fn.other.get("ffi")?.has("lib.so"), true);
 });
 
-Deno.test("audit: permissionsToManifest produces sorted, deduped allowlists", () => {
+test("audit: permissionsToManifest produces sorted, deduped allowlists", () => {
   const fn = {
     env: new Set(["B", "A", "B"]),
     read: new Set<string>(),
@@ -155,7 +156,7 @@ Deno.test("audit: permissionsToManifest produces sorted, deduped allowlists", ()
   assertEquals(m.fromFile, true);
 });
 
-Deno.test("audit: permissionsToManifest with merge keeps existing entries (widen-only)", () => {
+test("audit: permissionsToManifest with merge keeps existing entries (widen-only)", () => {
   const existing = {
     ...defaultManifest(),
     permissions: { env: ["LEGACY"], read: ["/data"], write: [], net: [] },
@@ -185,7 +186,7 @@ Deno.test("audit: permissionsToManifest with merge keeps existing entries (widen
   assertEquals(replaced.permissions.read, []);
 });
 
-Deno.test("audit: end-to-end JSONL → manifest map (smoke test through the public API)", () => {
+test("audit: end-to-end JSONL → manifest map (smoke test through the public API)", () => {
   const aiPath = fnPath("ai-chat", "index.ts");
   const lines = [
     "# comment line",
@@ -214,7 +215,7 @@ Deno.test("audit: end-to-end JSONL → manifest map (smoke test through the publ
   assertEquals([...ai.net], ["api.openai.com"]);
 });
 
-Deno.test("audit: function names never contain a directory separator", () => {
+test("audit: function names never contain a directory separator", () => {
   // Sentinel: if path normalisation ever produces "fn/sub" buckets, we want
   // this to scream loudly rather than silently mis-attribute records.
   const owner = functionForPath(fnPath("ok", "x.ts"), FNS_DIR);

@@ -1,9 +1,9 @@
 /**
  * Cross-platform "what's the RSS of this PID" helper.
  *
- * Deno doesn't expose per-process memory accounting in any portable
- * API — `Deno.memoryUsage()` only reports the current process's V8
- * heap. We need to inspect the workerd *child* process from the
+ * Neither Bun nor Node expose per-process memory accounting for OTHER
+ * processes — `process.memoryUsage()` only reports the current process.
+ * We need to inspect the workerd *child* process from the
  * gateway, so we shell out to platform-native tools:
  *
  *   - **Linux**: read `/proc/{pid}/status` and parse `VmRSS:` (in
@@ -25,6 +25,8 @@
  * pure parsing logic also exported for unit testing.
  */
 
+import { readFile } from "node:fs/promises";
+
 const KB = 1024;
 
 /**
@@ -35,9 +37,9 @@ const KB = 1024;
 export async function pidRss(pid: number): Promise<number | null> {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
-    if (Deno.build.os === "linux") return await readRssLinux(pid);
-    if (Deno.build.os === "darwin") return await readRssMac(pid);
-    if (Deno.build.os === "windows") return await readRssWindows(pid);
+    if (process.platform === "linux") return await readRssLinux(pid);
+    if (process.platform === "darwin") return await readRssMac(pid);
+    if (process.platform === "win32") return await readRssWindows(pid);
     // Other Unixes (freebsd, etc.) fall through to ps which exists
     // on all of them.
     return await readRssMac(pid);
@@ -46,13 +48,28 @@ export async function pidRss(pid: number): Promise<number | null> {
   }
 }
 
+/** Run `cmd`, returning its stdout on exit 0 and `null` otherwise. */
+async function runCapture(cmd: string[]): Promise<string | null> {
+  const proc = Bun.spawn(cmd, {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "ignore",
+    windowsHide: true,
+  });
+  const [text, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    proc.exited,
+  ]);
+  return code === 0 ? text : null;
+}
+
 // ---------------------------------------------------------------------------
 // Linux: /proc/{pid}/status
 // ---------------------------------------------------------------------------
 
 async function readRssLinux(pid: number): Promise<number | null> {
   try {
-    const text = await Deno.readTextFile(`/proc/${pid}/status`);
+    const text = await readFile(`/proc/${pid}/status`, "utf8");
     return parseLinuxStatus(text);
   } catch {
     return null;
@@ -73,14 +90,8 @@ export function parseLinuxStatus(text: string): number | null {
 // ---------------------------------------------------------------------------
 
 async function readRssMac(pid: number): Promise<number | null> {
-  const cmd = new Deno.Command("ps", {
-    args: ["-o", "rss=", "-p", String(pid)],
-    stdout: "piped",
-    stderr: "null",
-  });
-  const out = await cmd.output();
-  if (!out.success) return null;
-  return parsePsOutput(new TextDecoder().decode(out.stdout));
+  const out = await runCapture(["ps", "-o", "rss=", "-p", String(pid)]);
+  return out === null ? null : parsePsOutput(out);
 }
 
 /** Parse `ps -o rss=` output (digits only, kilobytes). Exported for tests. */
@@ -102,14 +113,15 @@ export function parsePsOutput(text: string): number | null {
 // ---------------------------------------------------------------------------
 
 async function readRssWindows(pid: number): Promise<number | null> {
-  const cmd = new Deno.Command("tasklist", {
-    args: ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
-    stdout: "piped",
-    stderr: "null",
-  });
-  const out = await cmd.output();
-  if (!out.success) return null;
-  return parseTasklistCsv(new TextDecoder().decode(out.stdout));
+  const out = await runCapture([
+    "tasklist",
+    "/FI",
+    `PID eq ${pid}`,
+    "/FO",
+    "CSV",
+    "/NH",
+  ]);
+  return out === null ? null : parseTasklistCsv(out);
 }
 
 /**

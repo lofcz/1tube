@@ -5,8 +5,9 @@
  * single self-contained ESM file: they do not resolve `npm:`, `jsr:`, or
  * `https:` specifiers at runtime, so every module must be present on disk as a
  * fully-resolved ESM file before the function boots. This module fills that gap
- * by running esbuild over each function's `index.ts`, with
- * `@deno/esbuild-plugin` providing Deno-native specifier resolution.
+ * by running esbuild over each function's `index.ts`, with the compat esbuild
+ * plugin (`src/compat/esbuild-plugin.ts`) resolving Deno-style specifiers
+ * against the same dependency store the Bun gateway runtime uses.
  *
  * Everything backend-specific — the runtime shims injected as a banner/footer,
  * which esbuild platform/conditions to resolve under, which specifiers to keep
@@ -22,16 +23,26 @@
  *    via esbuild code-splitting (the prebuilt/firmware + Vercel Build Output
  *    paths), so common dependencies are stored once.
  *
- * This module is pure I/O orchestration around esbuild. The Deno test suite
+ * This module is pure I/O orchestration around esbuild. The test suite
  * drives it with real bundles against the playground fixtures — there is no mock
  * layer because esbuild's behaviour is the contract.
  */
 
+import { existsSync } from "node:fs";
+import { isBuiltin } from "node:module";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
-import * as esbuild from "npm:esbuild@^0.28.1";
-import { denoPlugin } from "jsr:@deno/esbuild-plugin@^1.2";
+import { fileURLToPath } from "node:url";
+import * as esbuild from "esbuild";
+import {
+  type CompatEnvironment,
+  createCompatEnvironment,
+} from "../compat/environment.ts";
+import {
+  compatEsbuildPlugin,
+  prepareBundleDependencies,
+} from "../compat/esbuild-plugin.ts";
+import { readImportMap } from "../compat/import-map.ts";
 import {
   SHARED_RUNTIME_TOKEN_ENV,
   SHARED_RUNTIME_URL_ENV,
@@ -115,7 +126,7 @@ export interface SharedModuleInput {
 
 /**
  * @deprecated Use {@link SharedModuleInput}. Retained as an alias so existing
- * importers (deno backend, tests) keep compiling.
+ * importers (bun backend, tests) keep compiling.
  */
 export type WorkerdSharedModuleInput = SharedModuleInput;
 
@@ -131,8 +142,9 @@ export interface BundlerOptions {
    */
   outDir: string;
   /**
-   * Path to the host project's `deno.json` so the Deno loader can pick up the
-   * import map. Optional — when omitted no import map is applied.
+   * Path to the host project's `deno.json[c]`, read only for its import map
+   * (`imports` / `scopes`). Optional — when omitted (or missing on disk) no
+   * import map is applied.
    */
   configPath?: string;
   /**
@@ -178,12 +190,92 @@ export interface SharedBundleResult extends SharedRuntimeModule {
 
 export async function disposeBundlerResources(): Promise<void> {
   await esbuild.stop();
-  // esbuild.stop() tears down the service process synchronously from
-  // esbuild's point of view, but Deno's node:child_process shim settles
-  // the underlying spawn wait op on the next turn. Let that completion
-  // run before sanitizer-enabled tests assert that no child process
-  // resources remain.
-  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/**
+ * Dependency store + remote cache, shared per (cwd, deps dir) so every
+ * bundler in the process funnels installs through ONE dependency manager —
+ * its install queue is what keeps concurrent builds from racing `bun
+ * install` in the same store.
+ */
+const compatStores = new Map<string, Omit<CompatEnvironment, "importMap" | "configPath">>();
+
+/**
+ * Deno-compat resolution for a build: npm:/jsr: via the managed store,
+ * https: via the remote cache, and the import map of `configPath` (only —
+ * an omitted config means "no import map", never auto-discovery). The
+ * import map is re-read per call so long-lived hosts pick up edits.
+ */
+function compatEnvironmentFor(configPath: string | undefined): CompatEnvironment {
+  const config = configPath && existsSync(configPath) ? configPath : undefined;
+  const key = `${process.cwd()}\0${process.env["1TUBE_DEPS_DIR"] ?? ""}`;
+  let store = compatStores.get(key);
+  if (!store) {
+    const { deps, remote } = createCompatEnvironment({ configPath: config });
+    store = { deps, remote };
+    compatStores.set(key, store);
+  }
+  return { ...store, importMap: readImportMap(config), configPath: config };
+}
+
+/**
+ * Node builtins stay external for every target, as they did under Deno's
+ * loader: `node:*` always, and a bare builtin name (`buffer`, `crypto`, …)
+ * when nothing else resolves it — a package that ships its own polyfill
+ * dependency (the npm `buffer` package) still gets it bundled. The runtime
+ * supplies the module (workerd via `nodejs_compat`, Vercel's Node itself).
+ */
+/**
+ * Bun's `isBuiltin` also reports modules Bun ships itself (`ws`, `undici`,
+ * `bun`, `bun:*`). Bundles run on Node/workerd, where those are ordinary
+ * npm packages that must be bundled.
+ */
+const BUN_ONLY_BUILTINS = new Set(["bun", "ws", "undici"]);
+
+function isNodeBuiltin(spec: string): boolean {
+  const head = spec.split("/", 1)[0];
+  return isBuiltin(spec) && !spec.startsWith("bun:") && !BUN_ONLY_BUILTINS.has(head);
+}
+
+function nodeBuiltinsPlugin(): esbuild.Plugin {
+  return {
+    name: "1tube-node-builtins",
+    setup(build) {
+      build.onResolve({ filter: /^node:/ }, (args) => ({
+        path: args.path,
+        external: true,
+      }));
+      build.onResolve({ filter: /^[a-z_][a-z0-9_/]*$/ }, async (args) => {
+        if (!isNodeBuiltin(args.path)) return undefined;
+        // Never answer a probe — ours or another plugin's — with another
+        // probe: two probing plugins would bounce a specifier forever.
+        const data = args.pluginData as { builtinProbe?: boolean; probe?: boolean } | undefined;
+        if (data?.builtinProbe || data?.probe) return undefined;
+        const probe = await build.resolve(args.path, {
+          importer: args.importer,
+          kind: args.kind,
+          resolveDir: args.resolveDir,
+          namespace: args.namespace,
+          pluginData: { builtinProbe: true },
+        });
+        if (probe.errors.length === 0 && !probe.external) return probe;
+        return { path: `node:${args.path}`, external: true };
+      });
+    },
+  };
+}
+
+/**
+ * Install every npm:/jsr: package reachable from `inputs` in one batch
+ * before esbuild runs. The plugin's resolver is synchronous, so anything
+ * missed here would fall back to a blocking per-package install mid-build.
+ */
+async function prepareInputs(
+  env: CompatEnvironment,
+  inputs: readonly BundleInput[],
+): Promise<void> {
+  if (inputs.length === 0) return;
+  await prepareBundleDependencies(inputs, env);
 }
 
 function sharedModuleStubSource(module: SharedModuleInput): string {
@@ -307,7 +399,7 @@ function toPosix(path: string): string {
 
 function entryProxySource(entrypoint: string, profile: BundleProfile): string {
   return `${profile.banner}
-await import(${JSON.stringify(pathToFileURL(entrypoint).href)});
+await import(${JSON.stringify(entrypoint)});
 ${profile.footer}
 `;
 }
@@ -347,10 +439,10 @@ function entryProxyPlugin(
 }
 
 async function patchOutputFile(path: string): Promise<void> {
-  const emitted = await Deno.readTextFile(path);
+  const emitted = await readFile(path, "utf8");
   const patched = patchCjsDefaultInterop(emitted);
   if (patched !== emitted) {
-    await Deno.writeTextFile(path, patched);
+    await writeFile(path, patched);
   }
 }
 
@@ -363,7 +455,7 @@ async function minifyOutputFile(
   originalByteLength: number;
   byteLength: number;
 }> {
-  const raw = await Deno.readTextFile(path);
+  const raw = await readFile(path, "utf8");
   // Prepend the profile preamble (e.g. the Node createRequire shim) before the
   // minify transform so it reaches the shared chunks where esbuild hoists
   // helpers like `__require`. esbuild's own `banner` can't do this — it only
@@ -388,11 +480,11 @@ async function minifyOutputFile(
   let code = result.code;
   if (sourcemap === "linked" && result.map) {
     const mapPath = `${path}.map`;
-    await Deno.writeTextFile(mapPath, result.map);
+    await writeFile(mapPath, result.map);
     code = code.replace(/\n?\/\/# sourceMappingURL=.*$/m, "");
     code += `\n//# sourceMappingURL=${mapPath.split(/[\\/]/).pop()}\n`;
   }
-  await Deno.writeTextFile(path, code);
+  await writeFile(path, code);
   return {
     originalByteLength,
     byteLength: new TextEncoder().encode(code).byteLength,
@@ -410,18 +502,19 @@ export function createBundler(opts: BundlerOptions): Bundler {
   const sourcemap = opts.sourcemap ?? "linked";
   const target = opts.esbuildTarget ?? DEFAULT_ESBUILD_TARGET;
 
-  // The Deno plugin uses the same Rust resolver as `deno run` (compiled to
-  // WASM), so resolution of npm:/jsr:/https:/file: specifiers matches the
-  // runtime exactly. Created once and reused across builds.
-  // The Rust loader auto-discovers `deno.lock` next to `deno.json` for
-  // JSR pinning; no explicit lockPath knob is exposed by the plugin.
-  const plugin = denoPlugin({ configPath: opts.configPath });
+  // The compat plugin resolves npm:/jsr:/https:/import-map specifiers
+  // through the same dependency store the Bun runtime uses, so a bundle
+  // binds to exactly the package versions a local run would. Created once
+  // and reused across builds; pinning lives in `.1tube/deps/bun.lock`.
+  const env = compatEnvironmentFor(opts.configPath);
+  const plugin = compatEsbuildPlugin(env);
   const sharedModules = opts.sharedModules ?? [];
   const plugins = [
     ...(profile.resolverPlugins ?? []),
     ...(sharedModules.length > 0
       ? [sharedModulesExternalPlugin(sharedModules)]
       : []),
+    nodeBuiltinsPlugin(),
     plugin,
   ];
 
@@ -431,10 +524,9 @@ export function createBundler(opts: BundlerOptions): Bundler {
 
     try {
       await esbuild.build({
-        // The deno-loader resolver needs absolute file URLs for entrypoints
-        // so its specifier matching is unambiguous on Windows (where naked
-        // paths can be interpreted as relative).
-        entryPoints: [pathToFileURL(input.entrypoint).href],
+        // Absolute path: esbuild's native resolver takes the entry, the
+        // compat plugin only claims Deno-style specifiers inside it.
+        entryPoints: [input.entrypoint],
         outfile,
         plugins,
         bundle: true,
@@ -473,25 +565,27 @@ export function createBundler(opts: BundlerOptions): Bundler {
 
     await patchOutputFile(outfile);
 
-    const stat = await Deno.stat(outfile);
+    const outStat = await stat(outfile);
     const sourcemapPath = sourcemap === "linked" ? `${outfile}.map` : null;
 
     return {
       name: input.name,
       bundlePath: outfile,
       sourcemapPath,
-      byteLength: stat.size,
+      byteLength: outStat.size,
       durationMs: performance.now() - start,
     };
   };
 
   return {
     async bundle(input) {
-      await ensureDir(opts.outDir);
+      await mkdir(opts.outDir, { recursive: true });
+      await prepareInputs(env, [input]);
       return await buildOne(input);
     },
     async bundleAll(inputs, runOpts = {}) {
-      await ensureDir(opts.outDir);
+      await mkdir(opts.outDir, { recursive: true });
+      await prepareInputs(env, inputs);
       // Bounded concurrency keeps esbuild from spawning a separate worker
       // for every function; on a 50-function project the default 4
       // saturates a modern laptop without thrashing.
@@ -524,21 +618,24 @@ export async function bundleAllChunked(
     inputs: BundleInput[];
   },
 ): Promise<ChunkedBundleAllResult> {
-  await ensureDir(opts.outDir);
+  await mkdir(opts.outDir, { recursive: true });
   const start = performance.now();
   const profile = opts.profile;
   const sourcemap = opts.sourcemap ?? "linked";
   const target = opts.esbuildTarget ?? DEFAULT_ESBUILD_TARGET;
   const sharedModules = opts.sharedModules ?? [];
+  const env = compatEnvironmentFor(opts.configPath);
+  await prepareInputs(env, opts.inputs);
   const plugins = [
     // Backend resolver plugins (e.g. node-builtin externalisation) must run
-    // before the deno loader gets a chance to resolve those specifiers.
+    // before the compat plugin gets a chance to resolve those specifiers.
     ...(profile.resolverPlugins ?? []),
     entryProxyPlugin(opts.inputs, profile),
     ...(sharedModules.length > 0
       ? [sharedModulesExternalPlugin(sharedModules)]
       : []),
-    denoPlugin({ configPath: opts.configPath }),
+    nodeBuiltinsPlugin(),
+    compatEsbuildPlugin(env),
   ];
   const entryPoints = Object.fromEntries(
     opts.inputs.map((input) => [input.name, `1tube-entry-proxy:${input.name}`]),
@@ -559,8 +656,8 @@ export async function bundleAllChunked(
       target,
       platform: profile.platform,
       conditions: [...profile.conditions],
-      // The Deno loader honours esbuild's `external`, short-circuiting these
-      // specifiers before resolution (e.g. optional native deps a library
+      // esbuild applies `external` before any plugin's onResolve, so these
+      // specifiers are never resolved (e.g. optional native deps a library
       // require()s behind a try/catch).
       ...(profile.external ? { external: [...profile.external] } : {}),
       sourcemap,
@@ -714,17 +811,23 @@ export async function bundleSharedModule(opts: {
   /** ECMAScript target forwarded to esbuild. Defaults to {@link DEFAULT_ESBUILD_TARGET}. */
   esbuildTarget?: string | string[];
 }): Promise<SharedBundleResult> {
-  await ensureDir(opts.outDir);
+  await mkdir(opts.outDir, { recursive: true });
   const start = performance.now();
   const profile = opts.profile;
   const target = opts.esbuildTarget ?? DEFAULT_ESBUILD_TARGET;
   const outfile = join(opts.outDir, `${opts.module.id}.js`);
+  const env = compatEnvironmentFor(opts.configPath);
+  await prepareInputs(env, [{
+    name: opts.module.id,
+    entrypoint: opts.module.sourcePath,
+  }]);
   await esbuild.build({
-    entryPoints: [pathToFileURL(opts.module.sourcePath).href],
+    entryPoints: [opts.module.sourcePath],
     outfile,
     plugins: [
       ...(profile.resolverPlugins ?? []),
-      denoPlugin({ configPath: opts.configPath }),
+      nodeBuiltinsPlugin(),
+      compatEsbuildPlugin(env),
     ],
     bundle: true,
     format: "esm",
@@ -791,9 +894,8 @@ async function maybeSharedModule(
   path: string,
 ): Promise<SharedModuleInput | null> {
   try {
-    const stat = await Deno.stat(path);
-    if (!stat.isFile) return null;
-    const source = await Deno.readTextFile(path);
+    if (!(await stat(path)).isFile()) return null;
+    const source = await readFile(path, "utf8");
     const exportNames = extractExportedFunctionNames(source);
     if (exportNames.length === 0) {
       throw new Error(`shared module ${path} does not export any functions`);
@@ -804,7 +906,7 @@ async function maybeSharedModule(
       exportNames,
     };
   } catch (err) {
-    if (err instanceof Deno.errors.NotFound) return null;
+    if ((err as { code?: string })?.code === "ENOENT") return null;
     throw err;
   }
 }
@@ -843,20 +945,19 @@ export async function discoverSharedModules(
  * Convenience: discover function entrypoints under `functionsDir` (one
  * subdirectory per function, each containing `index.ts`) and return the
  * canonical `BundleInput[]`. Mirrors `src/discovery.ts` filtering rules so
- * every backend sees the same function set as the Deno backend.
+ * every backend sees the same function set as the Bun backend.
  */
 export async function discoverEntrypoints(
   functionsDir: string,
 ): Promise<BundleInput[]> {
   const root = resolvePath(functionsDir);
   const out: BundleInput[] = [];
-  for await (const entry of Deno.readDir(root)) {
-    if (!entry.isDirectory) continue;
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
     if (entry.name.startsWith("_") || entry.name.endsWith("_shared")) continue;
     const indexPath = join(root, entry.name, "index.ts");
     try {
-      const stat = await Deno.stat(indexPath);
-      if (!stat.isFile) continue;
+      if (!(await stat(indexPath)).isFile()) continue;
     } catch {
       continue;
     }

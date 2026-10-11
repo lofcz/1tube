@@ -50,7 +50,7 @@ export const invocations = sqliteTable("invocations", {
   durationMs: integer("duration_ms").notNull(),
   /** Authenticated user id when the JWT probe succeeded. */
   userId: text("user_id"),
-  /** Execution backend: "deno" | "workerd". */
+  /** Execution backend: "bun" | "workerd" ("deno" in rows written before 0.2). */
   backend: text("backend").notNull(),
   /**
    * Failure classification when the GATEWAY produced the error response:

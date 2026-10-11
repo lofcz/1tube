@@ -9,7 +9,7 @@
  * grow it unboundedly with synthetic high-cardinality function names.
  */
 
-import type { Context, Next } from "npm:hono@4";
+import type { Context, Next } from "hono";
 import { logError, logInfo } from "../log-buffer.ts";
 import { getRoutePrefix, routeRemainder } from "./route-prefix.ts";
 import { uuidv7 } from "../logs/id.ts";
@@ -71,12 +71,12 @@ export interface InvocationErrorInfo {
  * middleware behaves exactly as before (stdout line + metrics only).
  */
 let invocationSink: ((row: InvocationRow) => void) | null = null;
-let invocationBackend: "deno" | "workerd" = "deno";
+let invocationBackend: "bun" | "workerd" = "bun";
 
 export function configureInvocationLogging(
   opts: {
     sink: ((row: InvocationRow) => void) | null;
-    backend: "deno" | "workerd";
+    backend: "bun" | "workerd";
   },
 ): void {
   invocationSink = opts.sink;

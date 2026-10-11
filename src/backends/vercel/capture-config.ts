@@ -15,9 +15,13 @@
  *
  * Cost & safety:
  *   - Runs ONLY at build time — the deployed function pays nothing.
- *   - Imports each entrypoint a single time; Deno caches the shared module graph
+ *   - Imports each entrypoint a single time; Bun caches the shared module graph
  *     (`handler.ts`, providers, …) across functions, so the marginal cost per
  *     function is just its own top-level `serve(...)` call.
+ *   - Entrypoints load through the Deno-compat runtime plugin (npm:/jsr:/https:
+ *     specifiers, import map), with every package they reach installed in one
+ *     batch first. A temporary `Deno` / `EdgeRuntime` global stands in for the
+ *     host's while the sweep runs, so top-level `Deno.env.get(...)` reads work.
  *   - The registry path returns before binding any server, so importing does not
  *     start listeners or do per-request work.
  *   - Resilient: a function that throws at import (e.g. a stray top-level env
@@ -25,8 +29,14 @@
  *     the global default.
  */
 
+import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import type { BundleInput } from "../../bundler/core.ts";
+import { createDenoNamespace, createEdgeRuntime } from "../../compat/deno-shim.ts";
+import { createCompatEnvironment } from "../../compat/environment.ts";
+import { prepareBundleDependencies } from "../../compat/esbuild-plugin.ts";
+import { readImportMap } from "../../compat/import-map.ts";
+import { compatState, configureCompat } from "../../compat/plugin.ts";
 
 /** What a function declared on its `serve({ ... })` call. */
 export interface DeclaredServeConfig {
@@ -43,6 +53,58 @@ interface RegistryStub {
 }
 
 const REGISTRY_KEY = "__edgeFunctionRegistry";
+
+export interface CaptureOptions {
+  /**
+   * deno.json[c] whose import map the entrypoints resolve against — the same
+   * one the bundle was built with. Omitted = no import map.
+   */
+  configPath?: string;
+  /** Functions root, so `_shared/*` files get import-map rewriting too. */
+  functionsDir?: string;
+}
+
+/**
+ * Point the process-global compat plugin at a dependency store + import map
+ * and install every npm:/jsr: package the entrypoints reach in one batch.
+ * A host that already configured the plugin (a running gateway) keeps its
+ * own store; only the import-map roots are added.
+ */
+async function prepareCompat(
+  inputs: readonly BundleInput[],
+  opts: CaptureOptions,
+): Promise<void> {
+  const configPath = opts.configPath && existsSync(opts.configPath)
+    ? opts.configPath
+    : undefined;
+  const importMap = readImportMap(configPath);
+  const state = compatState();
+  if (!state.deps || !state.remote) {
+    const { deps, remote } = createCompatEnvironment({ configPath });
+    configureCompat({ deps, remote, importMap });
+  }
+  if (importMap && opts.functionsDir) {
+    configureCompat({ importMap, functionRoots: [opts.functionsDir] });
+  }
+  await prepareBundleDependencies(inputs, {
+    deps: compatState().deps!,
+    importMap,
+  });
+}
+
+function processEnv() {
+  return {
+    get: (k: string) => process.env[k],
+    set: (k: string, v: string) => {
+      process.env[k] = v;
+    },
+    delete: (k: string) => {
+      delete process.env[k];
+    },
+    has: (k: string) => k in process.env,
+    toObject: () => ({ ...process.env }) as Record<string, string>,
+  };
+}
 
 /**
  * Minimal stand-in for `Deno.serve`'s return value so importing an entrypoint
@@ -67,9 +129,21 @@ function fakeHttpServer(): unknown {
 export async function captureDeclaredServeConfigs(
   inputs: readonly BundleInput[],
   onWarn: (message: string) => void = (m) => console.warn(m),
+  opts: CaptureOptions = {},
 ): Promise<Map<string, DeclaredServeConfig>> {
   const out = new Map<string, DeclaredServeConfig>();
   if (inputs.length === 0) return out;
+
+  try {
+    await prepareCompat(inputs, opts);
+  } catch (err) {
+    // A failed install surfaces per function below as an import error.
+    onWarn(
+      `could not pre-install dependencies for the serve() capture (${
+        err instanceof Error ? err.message : String(err)
+      })`,
+    );
+  }
 
   const globalAny = globalThis as Record<string, unknown>;
   const previousRegistry = globalAny[REGISTRY_KEY];
@@ -82,10 +156,24 @@ export async function captureDeclaredServeConfigs(
   };
   globalAny[REGISTRY_KEY] = stub;
 
-  // The registry path never calls Deno.serve, but neutralise it anyway so a raw
-  // `Deno.serve(...)` entrypoint can't bind a port (or leak a listener) during
-  // the sweep. Snapshot/restore around the whole pass.
-  const denoNs = (globalThis as { Deno?: { serve?: unknown } }).Deno;
+  // Bun has no `Deno` global, so install a temporary shim for the sweep; its
+  // `serve()` only records the handler. If the realm already has a `Deno`
+  // (a Deno host), neutralise its `serve` instead so a raw `Deno.serve(...)`
+  // entrypoint can't bind a port (or leak a listener). The registry path
+  // never calls Deno.serve either way. Snapshot/restore around the pass.
+  const hadDeno = "Deno" in globalAny;
+  const hadEdgeRuntime = "EdgeRuntime" in globalAny;
+  if (!hadDeno) {
+    globalAny.Deno = createDenoNamespace({
+      functionName: "<capture>",
+      env: processEnv(),
+      onServe: () => {},
+    });
+  }
+  if (!hadEdgeRuntime) globalAny.EdgeRuntime = createEdgeRuntime({});
+  const denoNs = hadDeno
+    ? (globalAny.Deno as { serve?: unknown } | undefined)
+    : undefined;
   const hadServe = !!denoNs && "serve" in denoNs;
   const previousServe = denoNs?.serve;
   if (denoNs) denoNs.serve = fakeHttpServer as unknown as typeof denoNs.serve;
@@ -116,6 +204,8 @@ export async function captureDeclaredServeConfigs(
         delete denoNs.serve;
       }
     }
+    if (!hadDeno) delete globalAny.Deno;
+    if (!hadEdgeRuntime) delete globalAny.EdgeRuntime;
   }
 
   return out;

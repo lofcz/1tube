@@ -36,7 +36,7 @@ public static class OneTubeExtensions
     {
         services.Configure(configure);
 
-        // The active-slot DenoHostService is registered three ways:
+        // The active-slot GatewayHostService is registered three ways:
         //   1. As a singleton concrete type so the supervisor can
         //      reach for it directly when it needs to drive
         //      lifecycle on the active host.
@@ -44,9 +44,9 @@ public static class OneTubeExtensions
         //      stable surface to talk to.
         //   3. As IHostedService so the .NET host boots/shuts it
         //      with the rest of the app.
-        services.AddSingleton<DenoHostService>();
-        services.AddSingleton<IGatewayHost>(sp => sp.GetRequiredService<DenoHostService>());
-        services.AddHostedService(sp => sp.GetRequiredService<DenoHostService>());
+        services.AddSingleton<GatewayHostService>();
+        services.AddSingleton<IGatewayHost>(sp => sp.GetRequiredService<GatewayHostService>());
+        services.AddHostedService(sp => sp.GetRequiredService<GatewayHostService>());
 
         // Diagnostic surfaces — singleton, no per-request state.
         services.AddSingleton<OneTube.Diagnostics.ExperimentRunner>();
@@ -67,7 +67,7 @@ public static class OneTubeExtensions
         services.AddLogging(builder =>
         {
             builder.AddFilter("Yarp.ReverseProxy.Forwarder.HttpForwarder", LogLevel.Warning);
-            builder.AddFilter<ConsoleLoggerProvider>(typeof(DenoHostService).FullName!, LogLevel.None);
+            builder.AddFilter<ConsoleLoggerProvider>(typeof(GatewayHostService).FullName!, LogLevel.None);
             builder.AddFilter<ConsoleLoggerProvider>("OneTube.Proxy", LogLevel.None);
         });
         services.Configure<SimpleConsoleFormatterOptions>(options =>
@@ -84,7 +84,7 @@ public static class OneTubeExtensions
     /// Enable the firmware update protocol. Registers the
     /// <see cref="FirmwareSupervisor"/>, replaces the destination
     /// provider with a swappable variant, and rewires the active
-    /// <see cref="DenoHostService"/> to consult <c>state.json</c>
+    /// <see cref="GatewayHostService"/> to consult <c>state.json</c>
     /// for its prebuilt directory at boot.
     ///
     /// <para>
@@ -110,16 +110,16 @@ public static class OneTubeExtensions
         services.Replace(ServiceDescriptor.Singleton<IGatewayDestinationProvider>(sp =>
             new SwappableDestinationProvider(sp.GetRequiredService<IGatewayHost>())));
 
-        // Replace the active DenoHostService factory so it consults
+        // Replace the active GatewayHostService factory so it consults
         // state.json (via the supervisor) for the boot prebuilt
         // directory. The supervisor must construct first — which it
         // does, because this factory pulls FirmwareSupervisor as a
-        // dependency before constructing the DenoHostService.
-        services.Replace(ServiceDescriptor.Singleton<DenoHostService>(sp =>
+        // dependency before constructing the GatewayHostService.
+        services.Replace(ServiceDescriptor.Singleton<GatewayHostService>(sp =>
         {
             var oneTubeOpts = sp.GetRequiredService<IOptions<OneTubeOptions>>().Value;
             var supervisor = sp.GetRequiredService<FirmwareSupervisor>();
-            var logger = sp.GetRequiredService<ILogger<DenoHostService>>();
+            var logger = sp.GetRequiredService<ILogger<GatewayHostService>>();
             _ = sp.GetService<WorkerdCompatibilityStore>();
 
             // SecretsStore is registered iff AddOneTubeSecrets was
@@ -138,7 +138,7 @@ public static class OneTubeExtensions
             //   3. null (gateway runs without a prebuilt — esbuild on boot)
             var bootPrebuilt = supervisor.BootPrebuiltDir ?? oneTubeOpts.PrebuiltDir;
             var slot = new GatewaySlot("active", oneTubeOpts.Port, bootPrebuilt);
-            return new DenoHostService(oneTubeOpts, slot, logger, secretsProvider);
+            return new GatewayHostService(oneTubeOpts, slot, logger, secretsProvider);
         }));
 
         return services;
@@ -227,7 +227,7 @@ public static class OneTubeExtensions
 
     /// <summary>
     /// Map the invocation-log query endpoints (served by the .NET host
-    /// straight from the SQLite file — no Deno hop). Returns the route
+    /// straight from the SQLite file — no gateway hop). Returns the route
     /// group so the consumer can attach their auth filter; logs contain
     /// user data and belong behind admin auth.
     /// </summary>

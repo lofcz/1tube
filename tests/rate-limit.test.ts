@@ -5,7 +5,8 @@
  * module under a unique URL fragment to start with empty buckets.
  */
 
-import { assertEquals } from "@std/assert";
+import { test } from "bun:test";
+import { assertEquals } from "./_assert.ts";
 import { Hono } from "hono";
 import { resetTubeEnv } from "./_helpers.ts";
 
@@ -33,7 +34,7 @@ function buildApp(
   return app;
 }
 
-Deno.test("rate-limit: blocks once tokens are exhausted (anon, default rpm)", async () => {
+test("rate-limit: blocks once tokens are exhausted (anon, default rpm)", async () => {
   resetTubeEnv();
   const { createRateLimiter } = await freshLimiter();
   const limiter = createRateLimiter({
@@ -57,7 +58,7 @@ Deno.test("rate-limit: blocks once tokens are exhausted (anon, default rpm)", as
   assertEquals(typeof body.retryAfterSeconds, "number");
 });
 
-Deno.test("rate-limit: per-user keying uses the userId set by upstream auth", async () => {
+test("rate-limit: per-user keying uses the userId set by upstream auth", async () => {
   resetTubeEnv();
   const { createRateLimiter } = await freshLimiter();
   const limiter = createRateLimiter({
@@ -88,7 +89,7 @@ Deno.test("rate-limit: per-user keying uses the userId set by upstream auth", as
   assertEquals(bobOk.status, 200);
 });
 
-Deno.test("rate-limit: ignores X-Forwarded-For when no trusted proxies are configured", async () => {
+test("rate-limit: ignores X-Forwarded-For when no trusted proxies are configured", async () => {
   resetTubeEnv();
   const { createRateLimiter } = await freshLimiter();
   const limiter = createRateLimiter({
@@ -114,7 +115,7 @@ Deno.test("rate-limit: ignores X-Forwarded-For when no trusted proxies are confi
   assertEquals(b.status, 429);
 });
 
-Deno.test("rate-limit: per-function rpm override applies independently of default", async () => {
+test("rate-limit: per-function rpm override applies independently of default", async () => {
   resetTubeEnv();
   const { createRateLimiter } = await freshLimiter();
   const limiter = createRateLimiter({
@@ -138,7 +139,7 @@ Deno.test("rate-limit: per-function rpm override applies independently of defaul
   assertEquals(cool.status, 200);
 });
 
-Deno.test("rate-limit: bucket eviction keeps the map within maxBuckets", async () => {
+test("rate-limit: bucket eviction keeps the map within maxBuckets", async () => {
   resetTubeEnv();
   const { createRateLimiter } = await freshLimiter();
   const limiter = createRateLimiter({
@@ -169,7 +170,7 @@ Deno.test("rate-limit: bucket eviction keeps the map within maxBuckets", async (
   assertEquals(eBlocked.status, 429);
 });
 
-Deno.test("rate-limit: manifest.rpm overrides static config when registry is supplied", async () => {
+test("rate-limit: manifest.rpm overrides static config when registry is supplied", async () => {
   resetTubeEnv();
   const { createRateLimiter } = await freshLimiter();
   const { FunctionRegistry } = await import("../src/registry.ts");
@@ -199,7 +200,7 @@ Deno.test("rate-limit: manifest.rpm overrides static config when registry is sup
   assertEquals(blocked.status, 429);
 });
 
-Deno.test("rate-limit: manifest rpm 0 exempts the function entirely", async () => {
+test("rate-limit: manifest rpm 0 exempts the function entirely", async () => {
   resetTubeEnv();
   const { createRateLimiter } = await freshLimiter();
   const { FunctionRegistry } = await import("../src/registry.ts");
@@ -229,7 +230,7 @@ Deno.test("rate-limit: manifest rpm 0 exempts the function entirely", async () =
   }
 });
 
-Deno.test("rate-limit: rateLimitBy 'global' shares one bucket across users", async () => {
+test("rate-limit: rateLimitBy 'global' shares one bucket across users", async () => {
   resetTubeEnv();
   const { createRateLimiter } = await freshLimiter();
   const { FunctionRegistry } = await import("../src/registry.ts");
@@ -270,7 +271,7 @@ Deno.test("rate-limit: rateLimitBy 'global' shares one bucket across users", asy
   assertEquals(bobBlocked.status, 429);
 });
 
-Deno.test("rate-limit: rateLimitBy 'ip' ignores the authenticated userId", async () => {
+test("rate-limit: rateLimitBy 'ip' ignores the authenticated userId", async () => {
   resetTubeEnv();
   const { createRateLimiter } = await freshLimiter();
   const { FunctionRegistry } = await import("../src/registry.ts");

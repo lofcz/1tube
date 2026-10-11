@@ -2,7 +2,7 @@ namespace OneTube;
 
 /// <summary>
 /// Translates <see cref="OneTubeOptions"/> into the argv + env that
-/// the 1tube Deno gateway expects. Pulled out of the host service so
+/// the 1tube gateway (<c>bun src/server.ts</c>) expects. Pulled out of the host service so
 /// it's independently testable: every CLI flag we emit lines up with
 /// a property on <see cref="OneTubeOptions"/>, and every
 /// option-derived env var lives in one place.
@@ -25,9 +25,8 @@ namespace OneTube;
 ///   </item>
 ///   <item>
 ///     <description>
-///       <c>--allow-all</c> is unconditional. The gateway needs net,
-///       fs, env, and run permissions; granting them piecemeal would
-///       just be busywork for the operator.
+///       Bun has no permission model, so there are no runtime flags:
+///       the argv is just the server script followed by gateway flags.
 ///     </description>
 ///   </item>
 /// </list>
@@ -35,7 +34,7 @@ namespace OneTube;
 internal static class GatewayCommand
 {
     /// <summary>
-    /// Build the argv list (excluding the deno binary itself).
+    /// Build the argv list (excluding the bun binary itself).
     /// The slot's port + prebuilt-dir override are honoured so the
     /// candidate gateway can boot on a different port and against
     /// a different staged version than the active one.
@@ -44,30 +43,28 @@ internal static class GatewayCommand
     {
         var args = new List<string>
         {
-            "run",
-            "--allow-all",
+            // Bun auto-loads .env / .env.local from the cwd; the host hands
+            // the gateway its environment explicitly, so never let a stray
+            // dotenv file in OneTubeGateway/ leak in.
+            "--no-env-file",
             serverScriptPath,
             // Resolve to absolute against AppContext.BaseDirectory.
-            // The Deno child runs with cwd = OneTubeGateway/ (so it
-            // can find the bundled deno.json), which means relative
-            // paths configured by the host would otherwise resolve
-            // against the gateway dir, not the host's bin/. Always
-            // hand the gateway absolute paths.
+            // The Bun child runs with cwd = OneTubeGateway/, which
+            // means relative paths configured by the host would
+            // otherwise resolve against the gateway dir, not the
+            // host's bin/. Always hand the gateway absolute paths.
             "--functions", ResolveHostPath(opts.FunctionsPath),
             "--port", slot.Port.ToString(),
             "--host", opts.Host,
-            "--backend", opts.Backend == OneTubeBackend.Workerd ? "workerd" : "deno",
-            // A lockfile is the single biggest boot-speed lever on a large
-            // functions project: without one Deno re-solves the entire
-            // npm/jsr version graph on every start, a multi-second floor the
-            // Worker herd all block on. We point --lock at a host-owned,
-            // absolute scratch path (next to the invocation-log DB) rather
-            // than letting Deno default to one next to the bundled gateway
-            // config — the child runs with cwd = OneTubeGateway/, so a
-            // relative default would land in the wrong place. We never pass
-            // --frozen, so a consumer bumping a function's dependency is
-            // appended to the lock without error on the next boot.
-            "--lock", ResolveManagedLockPath(opts),
+            "--backend", BackendName(opts.Backend),
+            // The managed npm:/jsr: store (package.json + bun.lock +
+            // node_modules) for the functions' own dependencies. Its
+            // bun.lock is the boot-speed lever the Deno-era --lock was:
+            // warm boots skip resolution entirely. Host-owned and
+            // absolute — never inside OneTubeGateway/ (which may be
+            // replaced on deploy) and never in the consumer's repo. A
+            // function bumping a dependency just re-installs into it.
+            "--deps-dir", ResolveDepsDir(opts),
         };
 
         if (opts.Hmr) args.Add("--hmr");
@@ -102,8 +99,8 @@ internal static class GatewayCommand
         {
             // Always pass the absolute resolved path here. We've
             // already validated it exists in the host service — the
-            // Deno gateway will call this directly with no further
-            // PATH lookup.
+            // gateway will call this directly with no further PATH
+            // lookup.
             if (!string.IsNullOrEmpty(resolvedWorkerdBin))
             {
                 args.Add("--workerd-bin");
@@ -194,18 +191,55 @@ internal static class GatewayCommand
             : Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, path));
 
     /// <summary>
-    /// Resolve the 1tube-managed Deno lockfile path. Kept next to the
-    /// invocation-log DB so all gateway scratch state lives together, and
-    /// always absolute because the Deno child runs with cwd =
-    /// OneTubeGateway/ — a relative path would resolve against the bundled
-    /// gateway dir, not the host. Owned by 1tube (not the consumer's repo),
-    /// so it never adds git churn or clashes with a project's own deno.lock.
+    /// Gateway <c>--backend</c> value for <paramref name="backend"/>.
     /// </summary>
-    internal static string ResolveManagedLockPath(OneTubeOptions opts)
+    internal static string BackendName(OneTubeBackend backend)
+        => backend == OneTubeBackend.Workerd ? "workerd" : "bun";
+
+    /// <summary>
+    /// Resolve the 1tube-managed dependency store (<c>--deps-dir</c>).
+    /// <c>{DataRoot}/onetube/deps</c> when a data root is configured;
+    /// otherwise a <c>deps/</c> dir next to the invocation-log DB (the
+    /// default <c>.1tube/logs.db</c> therefore yields <c>.1tube/deps</c>,
+    /// the gateway's own default layout). Always absolute because the
+    /// child runs with cwd = OneTubeGateway/. The gateway caches remote
+    /// <c>https:</c> modules in a sibling <c>remote/</c> dir.
+    /// </summary>
+    internal static string ResolveDepsDir(OneTubeOptions opts)
     {
+        if (!string.IsNullOrWhiteSpace(opts.DataRoot))
+        {
+            return ResolveHostPath(Path.Combine(opts.DataRoot, "onetube", "deps"));
+        }
         var logDb = ResolveLogDbPath(opts);
         var dir = Path.GetDirectoryName(logDb) ?? AppContext.BaseDirectory;
-        return Path.Combine(dir, "deno.lock");
+        return Path.Combine(dir, "deps");
+    }
+
+    /// <summary>
+    /// The bun binary setting to resolve: <see cref="OneTubeOptions.BunBinary"/>
+    /// when set; otherwise the obsolete <see cref="OneTubeOptions.DenoBinary"/>
+    /// if (and only if) it obviously points at bun (file name <c>bun</c> /
+    /// <c>bun.exe</c>), so a config that was already switched over keeps
+    /// working. Any other legacy value — a real deno path — is returned in
+    /// <paramref name="ignoredLegacy"/> for the caller to warn about, and
+    /// resolution falls back to <c>bun</c> on PATH.
+    /// </summary>
+    internal static string? SelectBunBinary(OneTubeOptions opts, out string? ignoredLegacy)
+    {
+        ignoredLegacy = null;
+        if (!string.IsNullOrWhiteSpace(opts.BunBinary)) return opts.BunBinary;
+
+#pragma warning disable CS0618 // DenoBinary is the obsolete alias we are honouring here.
+        var legacy = opts.DenoBinary;
+#pragma warning restore CS0618
+        if (string.IsNullOrWhiteSpace(legacy)) return null;
+
+        var name = Path.GetFileNameWithoutExtension(legacy.Trim().Replace('\\', '/').Split('/')[^1]);
+        if (string.Equals(name, "bun", StringComparison.OrdinalIgnoreCase)) return legacy;
+
+        ignoredLegacy = legacy;
+        return null;
     }
 
     /// <summary>
@@ -273,14 +307,15 @@ internal static class GatewayCommand
         env["PORT"] = slot.Port.ToString();
         env["FUNCTIONS_PATH"] = ResolveHostPath(opts.FunctionsPath);
         env["1TUBE_HOST"] = opts.Host;
-        // Let the gateway print which lockfile is in effect (it can't read
-        // its own process's --lock flag back out of Deno). Mirrors the
-        // --lock we pass in BuildArgs.
-        env["ONETUBE_LOCK"] = ResolveManagedLockPath(opts);
+        // Mirrors --deps-dir. The bundler (workerd backend) builds its own
+        // compat environment from env rather than parsed args, so without
+        // this it would fall back to <cwd>/.1tube/deps inside
+        // OneTubeGateway/.
+        env["1TUBE_DEPS_DIR"] = ResolveDepsDir(opts);
 
         if (opts.BodyLimitMb is double bodyMb && bodyMb > 0)
         {
-            // Deno parses this as a float; invariant culture so we
+            // The gateway parses this as a float; invariant culture so we
             // don't write `30,0` on a German-locale Windows host.
             env["1TUBE_BODY_LIMIT_MB"] = bodyMb.ToString(System.Globalization.CultureInfo.InvariantCulture);
         }

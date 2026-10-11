@@ -8,13 +8,16 @@
  *  - query layer: filters, keyset pagination, full-text search, tail
  *  - loggingMiddleware: invocation rows + id header + error classification
  *  - workerd console marker round-trip
- *  - real Deno worker console capture with per-invocation attribution
- *    under concurrent dispatches
+ *  - function-host console capture (one Bun.ModuleGraph per function)
+ *    with per-invocation attribution under concurrent dispatches
  */
 
-import { assert, assertEquals, assertFalse } from "@std/assert";
-import { join } from "@std/path";
+import { test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Hono } from "hono";
+import { assert, assertEquals, assertFalse } from "./_assert.ts";
 import { type LogDb, openLogDb } from "../src/logs/db.ts";
 import { createLogWriter } from "../src/logs/writer.ts";
 import { buildFtsMatch, createLogQuery } from "../src/logs/query.ts";
@@ -30,20 +33,20 @@ import {
 import { FunctionRegistry } from "../src/registry.ts";
 import { FunctionSupervisor } from "../src/supervisor.ts";
 import {
-  createDenoWorkerHost,
-  type WorkerConsoleEvent,
-} from "../src/backends/deno/worker-host.ts";
+  createFunctionHost,
+  type FunctionConsoleEvent,
+} from "../src/backends/bun/function-host.ts";
 
 async function withTempDb(
   fn: (db: LogDb, dir: string) => Promise<void> | void,
 ): Promise<void> {
-  const dir = await Deno.makeTempDir({ prefix: "1tube-logs-test-" });
+  const dir = await mkdtemp(join(tmpdir(), "1tube-logs-test-"));
   const db = await openLogDb(join(dir, "logs.db"));
   try {
     await fn(db, dir);
   } finally {
     db.close();
-    await Deno.remove(dir, { recursive: true });
+    await rm(dir, { recursive: true, force: true });
   }
 }
 
@@ -61,7 +64,7 @@ function seedInvocation(
   const id = over.id ?? uuidv7();
   db.raw.prepare(
     `INSERT INTO invocations (id, ts_ms, function_name, method, path, status, duration_ms, backend, error_kind)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'deno', ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'bun', ?)`,
   ).run(
     id,
     over.tsMs ?? Date.now(),
@@ -91,8 +94,8 @@ function seedLog(
 // Migrations / bootstrap
 // ---------------------------------------------------------------------------
 
-Deno.test("logs-db: fresh open creates schema + FTS and is idempotent", async () => {
-  const dir = await Deno.makeTempDir({ prefix: "1tube-logs-boot-" });
+test("logs-db: fresh open creates schema + FTS and is idempotent", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "1tube-logs-boot-"));
   try {
     const path = join(dir, "nested", "deeper", "logs.db");
     const db = await openLogDb(path);
@@ -117,7 +120,7 @@ Deno.test("logs-db: fresh open creates schema + FTS and is idempotent", async ()
     );
     again.close();
   } finally {
-    await Deno.remove(dir, { recursive: true });
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -125,7 +128,7 @@ Deno.test("logs-db: fresh open creates schema + FTS and is idempotent", async ()
 // Writer
 // ---------------------------------------------------------------------------
 
-Deno.test("logs-writer: sync mode writes straight through; FTS triggers index rows", async () => {
+test("logs-writer: sync mode writes straight through; FTS triggers index rows", async () => {
   await withTempDb((db) => {
     const writer = createLogWriter({ db, flushIntervalMs: 0 });
     const inv = uuidv7();
@@ -137,7 +140,7 @@ Deno.test("logs-writer: sync mode writes straight through; FTS triggers index ro
       path: "/functions/v1/hello",
       status: 200,
       durationMs: 5,
-      backend: "deno",
+      backend: "bun",
     });
     writer.recordLog({
       invocationId: inv,
@@ -157,7 +160,7 @@ Deno.test("logs-writer: sync mode writes straight through; FTS triggers index ro
   });
 });
 
-Deno.test("logs-writer: threshold triggers flush; queue overflow drops oldest", async () => {
+test("logs-writer: threshold triggers flush; queue overflow drops oldest", async () => {
   await withTempDb((db) => {
     const writer = createLogWriter({
       db,
@@ -190,7 +193,7 @@ Deno.test("logs-writer: threshold triggers flush; queue overflow drops oldest", 
   });
 });
 
-Deno.test("logs-writer: prune enforces retention age and row caps", async () => {
+test("logs-writer: prune enforces retention age and row caps", async () => {
   await withTempDb((db) => {
     const now = Date.now();
     const old = now - 30 * 24 * 60 * 60 * 1000;
@@ -232,7 +235,7 @@ Deno.test("logs-writer: prune enforces retention age and row caps", async () => 
 // FTS sanitization
 // ---------------------------------------------------------------------------
 
-Deno.test("logs-fts: buildFtsMatch quotes terms and neutralizes operators", () => {
+test("logs-fts: buildFtsMatch quotes terms and neutralizes operators", () => {
   assertEquals(buildFtsMatch("hello world"), '"hello" "world"');
   assertEquals(buildFtsMatch("  spaced   out  "), '"spaced" "out"');
   assertEquals(buildFtsMatch("pre*"), '"pre"*');
@@ -244,7 +247,7 @@ Deno.test("logs-fts: buildFtsMatch quotes terms and neutralizes operators", () =
   assertEquals(buildFtsMatch('"'), null);
 });
 
-Deno.test("logs-fts: hostile search input never throws and matches literally", async () => {
+test("logs-fts: hostile search input never throws and matches literally", async () => {
   await withTempDb((db) => {
     const inv = seedInvocation(db);
     seedLog(db, inv, 'user said "DROP TABLE" loudly');
@@ -265,7 +268,7 @@ Deno.test("logs-fts: hostile search input never throws and matches literally", a
 // Query layer
 // ---------------------------------------------------------------------------
 
-Deno.test("logs-query: filters + keyset pagination", async () => {
+test("logs-query: filters + keyset pagination", async () => {
   await withTempDb((db) => {
     const base = Date.now();
     for (let i = 0; i < 30; i++) {
@@ -309,7 +312,7 @@ Deno.test("logs-query: filters + keyset pagination", async () => {
   });
 });
 
-Deno.test("logs-query: getInvocation returns row + its console lines; tail is ascending", async () => {
+test("logs-query: getInvocation returns row + its console lines; tail is ascending", async () => {
   await withTempDb((db) => {
     const inv = seedInvocation(db, { id: "wanted" });
     seedLog(db, inv, "first line");
@@ -344,12 +347,12 @@ async function freshLogging(): Promise<
   return await import(`../src/gateway/logging.ts?test=${crypto.randomUUID()}`);
 }
 
-Deno.test("logging: middleware persists an invocation row and echoes the id header", async () => {
+test("logging: middleware persists an invocation row and echoes the id header", async () => {
   const mod = await freshLogging();
   const rows: import("../src/logs/writer.ts").InvocationRow[] = [];
   mod.configureInvocationLogging({
     sink: (r) => rows.push(r),
-    backend: "deno",
+    backend: "bun",
   });
 
   const app = new Hono();
@@ -372,7 +375,7 @@ Deno.test("logging: middleware persists an invocation row and echoes the id head
     assertEquals(rows[0].functionName, "hello");
     assertEquals(rows[0].method, "POST");
     assertEquals(rows[0].status, 200);
-    assertEquals(rows[0].backend, "deno");
+    assertEquals(rows[0].backend, "bun");
     assertEquals(rows[0].errorKind ?? null, null);
     // Query strings (token=…) must never be persisted.
     assertFalse(rows[0].path.includes("SECRET-QS"));
@@ -382,7 +385,7 @@ Deno.test("logging: middleware persists an invocation row and echoes the id head
   }
 });
 
-Deno.test("logging: setInvocationError classification lands on the persisted row", async () => {
+test("logging: setInvocationError classification lands on the persisted row", async () => {
   const mod = await freshLogging();
   const rows: import("../src/logs/writer.ts").InvocationRow[] = [];
   mod.configureInvocationLogging({
@@ -423,7 +426,7 @@ Deno.test("logging: setInvocationError classification lands on the persisted row
 // Workerd console marker
 // ---------------------------------------------------------------------------
 
-Deno.test("console-marker: round-trips a marked line; ignores ordinary output", () => {
+test("console-marker: round-trips a marked line; ignores ordinary output", () => {
   const payload = {
     id: "inv-1",
     level: "warn",
@@ -455,16 +458,49 @@ Deno.test("console-marker: round-trips a marked line; ignores ordinary output", 
 });
 
 // ---------------------------------------------------------------------------
-// Deno worker console capture (real Workers, concurrent attribution)
+// Function-host console capture (real graphs, concurrent attribution)
 // ---------------------------------------------------------------------------
 
-Deno.test("worker-console: lines attribute to the correct invocation under concurrency", async () => {
-  const tmp = await Deno.makeTempDir({ prefix: "1tube-worker-console-" });
-  try {
-    await Deno.mkdir(join(tmp, "echo"), { recursive: true });
-    await Deno.writeTextFile(
-      join(tmp, "echo", "index.ts"),
-      `
+async function bootCapture(source: string): Promise<{
+  events: FunctionConsoleEvent[];
+  registry: FunctionRegistry;
+  stop: () => Promise<void>;
+}> {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-fn-console-"));
+  await mkdir(join(tmp, "echo"), { recursive: true });
+  await writeFile(join(tmp, "echo", "index.ts"), source);
+  const registry = new FunctionRegistry();
+  const events: FunctionConsoleEvent[] = [];
+  const host = createFunctionHost({
+    functionsDir: tmp,
+    registry,
+    supervisor: new FunctionSupervisor(),
+    captureConsole: true,
+    onConsole: (e) => events.push(e),
+  });
+  const { errors } = await host.start();
+  assertEquals(errors, []);
+  return {
+    events,
+    registry,
+    stop: async () => {
+      await host.stop();
+      await rm(tmp, { recursive: true, force: true });
+    },
+  };
+}
+
+function dispatchTagged(registry: FunctionRegistry, tag: string, inv?: string): Promise<Response> {
+  return registry.workerHandle("echo")!.dispatch(
+    new Request(`http://localhost/?tag=${tag}`),
+    null,
+    new AbortController().signal,
+    inv,
+  );
+}
+
+test("function-console: lines attribute to the correct invocation under concurrency", async () => {
+  const { events, registry, stop } = await bootCapture(`
 console.log("boot line");
 const reg = (globalThis as any).__edgeFunctionRegistry;
 reg.register(async (req: Request) => {
@@ -472,66 +508,108 @@ reg.register(async (req: Request) => {
   console.log("start", tag);
   await new Promise((r) => setTimeout(r, 30));
   console.warn("end", tag);
+  await Promise.resolve();
+  console.info("after", tag);
   return new Response(tag);
+}, { public: true });
+`);
+  try {
+    // Interleaved dispatches with distinct invocation ids.
+    const tags = ["one", "two", "three", "four"];
+    const resps = await Promise.all(tags.map((t) => dispatchTagged(registry, t, `inv-${t}`)));
+    for (const [i, r] of resps.entries()) assertEquals(await r.text(), tags[i]);
+
+    const bootLines = events.filter((e) => e.message.includes("boot line"));
+    assertEquals(bootLines.length, 1);
+    assertEquals(bootLines[0].invocationId, null);
+    assertEquals(bootLines[0].functionName, "echo");
+
+    for (const tag of tags) {
+      const inv = `inv-${tag}`;
+      const start = events.find((e) => e.message === `start ${tag}`);
+      const end = events.find((e) => e.message === `end ${tag}`);
+      const after = events.find((e) => e.message === `after ${tag}`);
+      assert(start && end && after, `missing lines for ${tag}`);
+      // Attribution survives the timer hop inside the handler even with
+      // every request in flight at once.
+      assertEquals(start.invocationId, inv);
+      assertEquals(end.invocationId, inv);
+      assertEquals(after.invocationId, inv);
+      assertEquals(start.level, "log");
+      assertEquals(end.level, "warn");
+      assertEquals(after.level, "info");
+    }
+  } finally {
+    await stop();
+  }
+});
+
+test("function-console: background work keeps its invocation; formatting and truncation", async () => {
+  const { events, registry, stop } = await bootCapture(`
+(globalThis as any).__edgeFunctionRegistry.register((req: Request) => {
+  setTimeout(() => console.error("late", { nested: { n: 1 } }), 20);
+  EdgeRuntime.waitUntil(Promise.resolve().then(() => console.debug("waited")));
+  console.log("x".repeat(9000));
+  return new Response("ok");
+}, { public: true });
+setTimeout(() => console.log("module timer"), 0);
+`);
+  try {
+    assertEquals(await (await dispatchTagged(registry, "bg", "inv-bg")).text(), "ok");
+    await new Promise((r) => setTimeout(r, 60));
+    const late = events.find((e) => e.message.startsWith("late"));
+    assert(late, "late line captured");
+    assertEquals(late.invocationId, "inv-bg");
+    assertEquals(late.level, "error");
+    assertEquals(late.message, `late ${Bun.inspect({ nested: { n: 1 } })}`);
+    assertEquals(events.find((e) => e.message === "waited")?.invocationId, "inv-bg");
+    // Module-level timers belong to no invocation.
+    assertEquals(events.find((e) => e.message === "module timer")?.invocationId, null);
+    const long = events.find((e) => e.message.startsWith("xxx"));
+    assert(long);
+    assertEquals(long.message.length, 8 * 1024 + 1);
+    assert(long.message.endsWith("…"));
+  } finally {
+    await stop();
+  }
+});
+
+test("function-console: capture off leaves console untouched; onConsole still sees runtime errors", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-fn-console-off-"));
+  try {
+    await mkdir(join(tmp, "quiet"), { recursive: true });
+    await writeFile(
+      join(tmp, "quiet", "index.ts"),
+      `console.log("not captured");
+(globalThis as any).__edgeFunctionRegistry.register(() => {
+  setTimeout(() => { throw new Error("still reported"); }, 0);
+  return Response.json({ same: console === globalThis.console });
 }, { public: true });
 `,
     );
-
     const registry = new FunctionRegistry();
-    const supervisor = new FunctionSupervisor();
-    const events: WorkerConsoleEvent[] = [];
-    const host = createDenoWorkerHost({
+    const events: FunctionConsoleEvent[] = [];
+    const host = createFunctionHost({
       functionsDir: tmp,
       registry,
-      supervisor,
-      captureConsole: true,
+      supervisor: new FunctionSupervisor(),
       onConsole: (e) => events.push(e),
     });
-    const { errors } = await host.start();
     try {
-      assertEquals(errors, []);
-      const handle = registry.workerHandle("echo")!;
-
-      // Two interleaved dispatches with distinct invocation ids.
-      const mk = (tag: string, inv: string) =>
-        handle.dispatch(
-          new Request(`http://localhost/?tag=${tag}`),
-          null,
-          new AbortController().signal,
-          inv,
-        );
-      const [r1, r2] = await Promise.all([
-        mk("one", "inv-one"),
-        mk("two", "inv-two"),
-      ]);
-      assertEquals(await r1.text(), "one");
-      assertEquals(await r2.text(), "two");
-
-      // Give the postMessage channel a beat to drain.
-      await new Promise((r) => setTimeout(r, 100));
-
-      const bootLines = events.filter((e) => e.message.includes("boot line"));
-      assertEquals(bootLines.length, 1);
-      assertEquals(bootLines[0].invocationId, null);
-      assertEquals(bootLines[0].functionName, "echo");
-
-      for (
-        const [tag, inv] of [["one", "inv-one"], ["two", "inv-two"]] as const
-      ) {
-        const start = events.find((e) => e.message === `start ${tag}`);
-        const end = events.find((e) => e.message === `end ${tag}`);
-        assert(start, `missing start line for ${tag}`);
-        assert(end, `missing end line for ${tag}`);
-        // The interesting assertion: attribution survives the await
-        // inside the handler even with both requests in flight.
-        assertEquals(start.invocationId, inv);
-        assertEquals(end.invocationId, inv);
-        assertEquals(end.level, "warn");
-      }
+      assertEquals((await host.start()).errors, []);
+      const resp = await registry.workerHandle("quiet")!.dispatch(
+        new Request("http://localhost/"),
+        null,
+        new AbortController().signal,
+      );
+      assertEquals(await resp.json(), { same: true });
+      await new Promise((r) => setTimeout(r, 30));
+      assertEquals(events.filter((e) => e.message.includes("not captured")), []);
+      assert(events.some((e) => e.level === "error" && e.message.includes("still reported")));
     } finally {
       await host.stop();
     }
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });

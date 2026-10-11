@@ -1,19 +1,17 @@
-#!/usr/bin/env -S deno run --allow-read --allow-write
+#!/usr/bin/env bun
 /**
  * Generate per-function `1tube.json` manifests from a Deno permission audit log.
  *
  * Usage:
  *
- *   # 1) Boot 1tube with audit logging on, exercise every function once.
+ *   # 1) Run the functions under Deno (e.g. `supabase functions serve`)
+ *   #    with permission auditing on, and exercise every function once.
  *   $env:DENO_AUDIT_PERMISSIONS = "./perms.log"
  *   $env:DENO_TRACE_PERMISSIONS = "1"
- *   deno run --allow-all src/server.ts \
- *       --functions ../sciobot-next/supabase/functions
  *   # ...curl /functions/v1/<each-fn> ...
  *
  *   # 2) Convert the log into one 1tube.json per function.
- *   deno run --allow-read --allow-write \
- *       scripts/audit-to-manifest.ts \
+ *   bun scripts/audit-to-manifest.ts \
  *       --log ./perms.log \
  *       --functions ../sciobot-next/supabase/functions \
  *       [--write] [--merge] [--include-shared]
@@ -29,7 +27,8 @@
  * that read a globally-required env var).
  */
 
-import { join, normalize, relative, resolve, SEPARATOR } from "@std/path";
+import { readFile, writeFile } from "node:fs/promises";
+import { join, normalize, relative, resolve, sep as SEPARATOR } from "node:path";
 import {
   defaultManifest,
   type FunctionManifest,
@@ -284,17 +283,17 @@ function parseCliArgs(argv: string[]): CliArgs {
     else if (a === "--include-shared") out.includeShared = true;
     else if (a === "--help" || a === "-h") {
       printUsage();
-      Deno.exit(0);
+      process.exit(0);
     } else {
       console.error(`Unknown argument: ${a}`);
       printUsage();
-      Deno.exit(2);
+      process.exit(2);
     }
   }
   if (!out.log || !out.functionsDir) {
     console.error("Missing required --log and/or --functions arguments.");
     printUsage();
-    Deno.exit(2);
+    process.exit(2);
   }
   return out as CliArgs;
 }
@@ -312,7 +311,7 @@ async function readExistingManifest(
 ): Promise<FunctionManifest | undefined> {
   const path = join(functionsDir, name, MANIFEST_FILENAME);
   try {
-    const raw = await Deno.readTextFile(path);
+    const raw = await readFile(path, "utf8");
     const parsed = JSON.parse(raw) as Partial<FunctionManifest>;
     // We only care about merging permissions; the other fields stay as-is.
     return {
@@ -330,7 +329,7 @@ async function readExistingManifest(
 }
 
 async function readAuditLog(path: string): Promise<AuditRecord[]> {
-  const text = await Deno.readTextFile(path);
+  const text = await readFile(path, "utf8");
   const out: AuditRecord[] = [];
   for (const line of text.split(/\r?\n/)) {
     const rec = parseAuditLine(line);
@@ -382,18 +381,18 @@ export async function main(argv: string[]): Promise<number> {
     const existing = await readExistingManifest(fnsDirAbs, name);
     const manifest = permissionsToManifest(perms, existing, args.merge);
     const target = join(fnsDirAbs, name, MANIFEST_FILENAME);
-    const rel = relative(Deno.cwd(), target).split(SEPARATOR).join("/");
+    const rel = relative(process.cwd(), target).split(SEPARATOR).join("/");
     console.log(`  ${name}  →  ${rel}  ${summarisePerms(perms)}`);
 
     if (args.write) {
       const json = JSON.stringify(manifest, null, 2) + "\n";
-      await Deno.writeTextFile(target, json);
+      await writeFile(target, json);
     }
   }
   return 0;
 }
 
 if (import.meta.main) {
-  const code = await main(Deno.args);
-  Deno.exit(code);
+  const code = await main(process.argv.slice(2));
+  process.exit(code);
 }

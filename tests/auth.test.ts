@@ -6,7 +6,8 @@
  * tests can swap secrets between assertions without re-importing the module.
  */
 
-import { assertEquals, assertExists } from "@std/assert";
+import { test } from "bun:test";
+import { assertEquals, assertExists } from "./_assert.ts";
 import { probeRequest, validateRequest } from "../src/gateway/auth.ts";
 import { resetTubeEnv, signJwt } from "./_helpers.ts";
 
@@ -21,16 +22,16 @@ function reqWith(token: string | null): Request {
   });
 }
 
-Deno.test("auth: returns null without an Authorization header", async () => {
+test("auth: returns null without an Authorization header", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
+  process.env["JWT_SECRET"] = SECRET;
   const auth = await validateRequest(reqWith(null));
   assertEquals(auth, null);
 });
 
-Deno.test("auth: validates a freshly signed token and exposes the user id", async () => {
+test("auth: validates a freshly signed token and exposes the user id", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
+  process.env["JWT_SECRET"] = SECRET;
   const token = await signJwt(SECRET, {
     sub: "user-abc",
     email: "abc@example.com",
@@ -42,25 +43,25 @@ Deno.test("auth: validates a freshly signed token and exposes the user id", asyn
   assertEquals(auth.rawToken, token);
 });
 
-Deno.test("auth: rejects a token signed with a different secret", async () => {
+test("auth: rejects a token signed with a different secret", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
+  process.env["JWT_SECRET"] = SECRET;
   const token = await signJwt("a-different-secret-also-long-enough-for-hs256");
   const auth = await validateRequest(reqWith(token));
   assertEquals(auth, null);
 });
 
-Deno.test("auth: rejects an expired token", async () => {
+test("auth: rejects an expired token", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
+  process.env["JWT_SECRET"] = SECRET;
   const token = await signJwt(SECRET, { expIn: -10 });
   const auth = await validateRequest(reqWith(token));
   assertEquals(auth, null);
 });
 
-Deno.test("auth: rejects a token whose payload was tampered with", async () => {
+test("auth: rejects a token whose payload was tampered with", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
+  process.env["JWT_SECRET"] = SECRET;
   const token = await signJwt(SECRET, { sub: "user-1" });
   const [h, _p, s] = token.split(".");
   const forged = btoa(JSON.stringify({ sub: "admin", exp: 9999999999 }))
@@ -71,14 +72,14 @@ Deno.test("auth: rejects a token whose payload was tampered with", async () => {
   assertEquals(auth, null);
 });
 
-Deno.test("auth: rejects a malformed token (not three segments)", async () => {
+test("auth: rejects a malformed token (not three segments)", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
+  process.env["JWT_SECRET"] = SECRET;
   const auth = await validateRequest(reqWith("not.a.jwt.really"));
   assertEquals(auth, null);
 });
 
-Deno.test("auth: rejects when JWT_SECRET is unset", async () => {
+test("auth: rejects when JWT_SECRET is unset", async () => {
   resetTubeEnv();
   // Sign with one value but never expose it to the gateway.
   const token = await signJwt(SECRET);
@@ -86,41 +87,41 @@ Deno.test("auth: rejects when JWT_SECRET is unset", async () => {
   assertEquals(auth, null);
 });
 
-Deno.test("auth: probe reports unavailable when JWT_SECRET is unset", async () => {
+test("auth: probe reports unavailable when JWT_SECRET is unset", async () => {
   resetTubeEnv();
   const token = await signJwt(SECRET);
   const probed = await probeRequest(reqWith(token));
   assertEquals(probed.status, "unavailable");
 });
 
-Deno.test("auth: probe reports missing without a bearer", async () => {
+test("auth: probe reports missing without a bearer", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
+  process.env["JWT_SECRET"] = SECRET;
   const probed = await probeRequest(reqWith(null));
   assertEquals(probed.status, "missing");
 });
 
-Deno.test("auth: probe reports invalid for a bad signature", async () => {
+test("auth: probe reports invalid for a bad signature", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
+  process.env["JWT_SECRET"] = SECRET;
   const token = await signJwt("a-different-secret-also-long-enough-for-hs256");
   const probed = await probeRequest(reqWith(token));
   assertEquals(probed.status, "invalid");
 });
 
-Deno.test("auth: probe reports ok for a live token", async () => {
+test("auth: probe reports ok for a live token", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
+  process.env["JWT_SECRET"] = SECRET;
   const token = await signJwt(SECRET, { sub: "user-abc" });
   const probed = await probeRequest(reqWith(token));
   assertEquals(probed.status, "ok");
   if (probed.status === "ok") assertEquals(probed.auth.userId, "user-abc");
 });
 
-Deno.test("auth: accepts a token matching SUPABASE_SERVICE_ROLE_KEY as service role", async () => {
+test("auth: accepts a token matching SUPABASE_SERVICE_ROLE_KEY as service role", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
-  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "sb_secret_test_opaque_key_123");
+  process.env["JWT_SECRET"] = SECRET;
+  process.env["SUPABASE_SERVICE_ROLE_KEY"] = "sb_secret_test_opaque_key_123";
 
   const auth = await validateRequest(reqWith("sb_secret_test_opaque_key_123"));
   assertExists(auth);
@@ -128,39 +129,39 @@ Deno.test("auth: accepts a token matching SUPABASE_SERVICE_ROLE_KEY as service r
   assertEquals(auth.payload.role, "service_role");
   assertEquals(auth.rawToken, "sb_secret_test_opaque_key_123");
 
-  Deno.env.delete("SUPABASE_SERVICE_ROLE_KEY");
+  delete process.env["SUPABASE_SERVICE_ROLE_KEY"];
 });
 
-Deno.test("auth: rejects opaque tokens that do not match SUPABASE_SERVICE_ROLE_KEY", async () => {
+test("auth: rejects opaque tokens that do not match SUPABASE_SERVICE_ROLE_KEY", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
-  Deno.env.set("SUPABASE_SERVICE_ROLE_KEY", "sb_secret_expected");
+  process.env["JWT_SECRET"] = SECRET;
+  process.env["SUPABASE_SERVICE_ROLE_KEY"] = "sb_secret_expected";
 
   const auth = await validateRequest(reqWith("sb_secret_attacker_value"));
   assertEquals(auth, null);
 
-  Deno.env.delete("SUPABASE_SERVICE_ROLE_KEY");
+  delete process.env["SUPABASE_SERVICE_ROLE_KEY"];
 });
 
-Deno.test("auth: does not accept arbitrary tokens when SUPABASE_SERVICE_ROLE_KEY is unset", async () => {
+test("auth: does not accept arbitrary tokens when SUPABASE_SERVICE_ROLE_KEY is unset", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
-  Deno.env.delete("SUPABASE_SERVICE_ROLE_KEY");
+  process.env["JWT_SECRET"] = SECRET;
+  delete process.env["SUPABASE_SERVICE_ROLE_KEY"];
 
   const auth = await validateRequest(reqWith("sb_secret_anything"));
   assertEquals(auth, null);
 });
 
-Deno.test("auth: picks up a secret rotation between calls (lazy read)", async () => {
+test("auth: picks up a secret rotation between calls (lazy read)", async () => {
   resetTubeEnv();
-  Deno.env.set("JWT_SECRET", SECRET);
+  process.env["JWT_SECRET"] = SECRET;
   const token1 = await signJwt(SECRET, { sub: "old" });
   assertExists(await validateRequest(reqWith(token1)));
 
   // Rotate the secret. The next call must reject the old token AND accept a
   // newly-signed one without requiring a re-import.
   const NEW_SECRET = "rotated-secret-also-long-enough-for-hmac-sha256";
-  Deno.env.set("JWT_SECRET", NEW_SECRET);
+  process.env["JWT_SECRET"] = NEW_SECRET;
   const auth1 = await validateRequest(reqWith(token1));
   assertEquals(auth1, null);
 

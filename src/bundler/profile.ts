@@ -1,7 +1,7 @@
 /**
  * A `BundleProfile` describes how a given backend wants its edge functions
  * bundled. It is the seam that keeps the bundler core (`src/bundler/core.ts`)
- * target-agnostic: the core orchestrates esbuild + the Deno loader and injects
+ * target-agnostic: the core orchestrates esbuild + the compat plugin and injects
  * a banner/footer, but every backend-specific decision — which runtime globals
  * to shim, which esbuild conditions/platform to resolve under, which specifiers
  * to keep external — lives in a profile owned by that backend.
@@ -15,7 +15,7 @@
  * branching on a target inside shared bundler code.
  */
 
-import type * as esbuild from "npm:esbuild@^0.28.1";
+import type * as esbuild from "esbuild";
 
 export interface BundleProfile {
   /** Stable identifier used in diagnostics/error messages, e.g. `"workerd"`. */
@@ -45,13 +45,13 @@ export interface BundleProfile {
    */
   readonly footer: string;
   /**
-   * Bare specifiers to keep external. The Deno loader honours esbuild's
-   * `external`, so these are short-circuited before resolution — used for
+   * Bare specifiers to keep external. esbuild applies `external` before any
+   * plugin resolves, so these are short-circuited before resolution — used for
    * optional native deps a library `require()`s behind a try/catch.
    */
   readonly external?: readonly string[];
   /**
-   * esbuild plugins registered BEFORE the Deno loader, so they win for the
+   * esbuild plugins registered BEFORE the compat plugin, so they win for the
    * specifiers they claim (e.g. externalising Node builtins for the Node
    * target). Most profiles need none.
    */

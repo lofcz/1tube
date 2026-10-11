@@ -6,7 +6,8 @@
  * honouring the token's `exp` and the JWT_SECRET rotation contract.
  */
 
-import { assert, assertEquals, assertNotEquals } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals, assertNotEquals } from "./_assert.ts";
 import {
   _resetAuthForTests,
   _setVerifyCacheMaxForTests,
@@ -27,10 +28,10 @@ function reqWith(token: string): Request {
 function setup(secret = SECRET_A) {
   resetTubeEnv();
   _resetAuthForTests();
-  Deno.env.set("JWT_SECRET", secret);
+  process.env["JWT_SECRET"] = secret;
 }
 
-Deno.test("jwt-cache: second verify is a hit (skips SubtleCrypto)", async () => {
+test("jwt-cache: second verify is a hit (skips SubtleCrypto)", async () => {
   setup();
   const token = await signJwt(SECRET_A);
 
@@ -54,7 +55,7 @@ Deno.test("jwt-cache: second verify is a hit (skips SubtleCrypto)", async () => 
   assertEquals(b.userId, a.userId);
 });
 
-Deno.test("jwt-cache: many calls only miss once per distinct token", async () => {
+test("jwt-cache: many calls only miss once per distinct token", async () => {
   setup();
   const token = await signJwt(SECRET_A);
 
@@ -69,7 +70,7 @@ Deno.test("jwt-cache: many calls only miss once per distinct token", async () =>
   assertEquals(stats.size, 1);
 });
 
-Deno.test("jwt-cache: tampered tokens never enter the cache", async () => {
+test("jwt-cache: tampered tokens never enter the cache", async () => {
   setup();
   const good = await signJwt(SECRET_A);
   const parts = good.split(".");
@@ -101,7 +102,7 @@ Deno.test("jwt-cache: tampered tokens never enter the cache", async () => {
   assertEquals(stats.hits, 0);
 });
 
-Deno.test("jwt-cache: expired entry is evicted on hit (returns null + cleans)", async () => {
+test("jwt-cache: expired entry is evicted on hit (returns null + cleans)", async () => {
   setup();
 
   const shortLived = await signJwt(SECRET_A, { expIn: 1 });
@@ -120,7 +121,7 @@ Deno.test("jwt-cache: expired entry is evicted on hit (returns null + cleans)", 
   assertEquals(getVerifyCacheStats().size, 0, "expired entry must be evicted");
 });
 
-Deno.test("jwt-cache: rotating JWT_SECRET invalidates the cache", async () => {
+test("jwt-cache: rotating JWT_SECRET invalidates the cache", async () => {
   setup(SECRET_A);
   const tokenA = await signJwt(SECRET_A);
 
@@ -130,7 +131,7 @@ Deno.test("jwt-cache: rotating JWT_SECRET invalidates the cache", async () => {
 
   // Rotate the secret. The next call should clear the cache and reject the
   // old token (since it was signed with the previous key).
-  Deno.env.set("JWT_SECRET", SECRET_B);
+  process.env["JWT_SECRET"] = SECRET_B;
   const ok2 = await validateRequest(reqWith(tokenA));
   assertEquals(
     ok2,
@@ -142,7 +143,7 @@ Deno.test("jwt-cache: rotating JWT_SECRET invalidates the cache", async () => {
   assertEquals(stats.size, 0, "rotation must clear all cached entries");
 });
 
-Deno.test("jwt-cache: bounded eviction keeps cache at capacity", async () => {
+test("jwt-cache: bounded eviction keeps cache at capacity", async () => {
   setup();
   _setVerifyCacheMaxForTests(3);
 
@@ -167,7 +168,7 @@ Deno.test("jwt-cache: bounded eviction keeps cache at capacity", async () => {
   assertEquals(afterMisses, beforeMisses + 1, "evicted token must miss again");
 });
 
-Deno.test("jwt-cache: LRU bump — recent hits survive eviction", async () => {
+test("jwt-cache: LRU bump — recent hits survive eviction", async () => {
   setup();
   _setVerifyCacheMaxForTests(3);
 
@@ -203,7 +204,7 @@ Deno.test("jwt-cache: LRU bump — recent hits survive eviction", async () => {
   );
 });
 
-Deno.test("jwt-cache: empty/missing Authorization never touches the cache", async () => {
+test("jwt-cache: empty/missing Authorization never touches the cache", async () => {
   setup();
   const a = await validateRequest(new Request("http://x/"));
   assertEquals(a, null);
@@ -213,7 +214,7 @@ Deno.test("jwt-cache: empty/missing Authorization never touches the cache", asyn
   assertEquals(stats.misses, 0);
 });
 
-Deno.test("jwt-cache: stats counters distinguish hits from misses correctly", async () => {
+test("jwt-cache: stats counters distinguish hits from misses correctly", async () => {
   setup();
   const t1 = await signJwt(SECRET_A, { sub: "u1" });
   const t2 = await signJwt(SECRET_A, { sub: "u2" });

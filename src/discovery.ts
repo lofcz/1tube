@@ -11,6 +11,7 @@
 
 // node: specifiers so this module loads cleanly from node_modules in any
 // host Deno project (no shared import-map entry required).
+import { readdir, realpath, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { FunctionRegistry } from "./registry.ts";
@@ -72,11 +73,11 @@ export async function discoverAndLoad(
   const deferred: string[] = [];
   const errors: Array<{ name: string; error: string }> = [];
 
-  const resolvedDir = await Deno.realPath(functionsDir);
+  const resolvedDir = await realpath(functionsDir);
 
   const candidates: string[] = [];
-  for await (const entry of Deno.readDir(resolvedDir)) {
-    if (!entry.isDirectory) continue;
+  for (const entry of await readdir(resolvedDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
     if (entry.name.startsWith("_") || entry.name.endsWith("_shared")) {
       skipped.push(entry.name);
       continue;
@@ -92,7 +93,7 @@ export async function discoverAndLoad(
 
     const indexPath = join(resolvedDir, name, "index.ts");
     try {
-      await Deno.stat(indexPath);
+      await stat(indexPath);
       work.push(name);
     } catch {
       // No index.ts. If we were asked to reload this name explicitly, treat as
@@ -170,9 +171,7 @@ export async function discoverAndLoad(
           manifest,
         });
       }
-      await registry.runWithCurrentFunction(name, async () => {
-        await import(moduleUrl.href);
-      });
+      await registry.importFunction(name, moduleUrl.href);
       loaded.push(name);
       const durationMs = performance.now() - start;
       options?.onProgress?.({

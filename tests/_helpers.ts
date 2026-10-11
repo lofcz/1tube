@@ -108,7 +108,7 @@ export function resetTubeEnv(): void {
     "SUPABASE_SERVICE_ROLE_KEY",
     "SUPABASE_URL",
   ];
-  for (const k of keys) Deno.env.delete(k);
+  for (const k of keys) delete process.env[k];
 }
 
 /**

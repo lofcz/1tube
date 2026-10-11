@@ -8,7 +8,8 @@
  * - Confirms `safeFnName` clamps & sanitises function names.
  */
 
-import { assert, assertEquals, assertFalse } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals, assertFalse } from "./_assert.ts";
 import { Hono } from "hono";
 import {
   _configureLogBufferForTests,
@@ -72,7 +73,7 @@ function captureConsole(): { lines: CapturedLog[]; restore: () => void } {
   };
 }
 
-Deno.test("logging: success request emits a single info line, no auth/body/query", async () => {
+test("logging: success request emits a single info line, no auth/body/query", async () => {
   const { loggingMiddleware } = await freshLogging();
   const app = new Hono();
   app.use("/functions/v1/*", loggingMiddleware);
@@ -104,7 +105,7 @@ Deno.test("logging: success request emits a single info line, no auth/body/query
   assert(all.includes("200"), "status must be logged");
 });
 
-Deno.test("logging: error responses go to console.error and bump the error counter", async () => {
+test("logging: error responses go to console.error and bump the error counter", async () => {
   const mod = await freshLogging();
   const { loggingMiddleware, getCollectedMetrics } = mod;
   const app = new Hono();
@@ -125,7 +126,7 @@ Deno.test("logging: error responses go to console.error and bump the error count
   assert(cap.lines.some((l) => l.level === "error"));
 });
 
-Deno.test("logging: safeFnName strips control chars and shell metacharacters", async () => {
+test("logging: safeFnName strips control chars and shell metacharacters", async () => {
   const { safeFnName } = await freshLogging();
 
   assertEquals(safeFnName("hello"), "hello");
@@ -141,7 +142,7 @@ Deno.test("logging: safeFnName strips control chars and shell metacharacters", a
   assertEquals(sanitised.length, "\u001bhi\n;rm -rf /;there".length);
 });
 
-Deno.test("logging: safeFnName clamps to 80 chars + ellipsis on overflow", async () => {
+test("logging: safeFnName clamps to 80 chars + ellipsis on overflow", async () => {
   const { safeFnName } = await freshLogging();
   const long = "a".repeat(200);
   const out = safeFnName(long);
@@ -153,7 +154,7 @@ Deno.test("logging: safeFnName clamps to 80 chars + ellipsis on overflow", async
   assertEquals(safeFnName(exact), exact);
 });
 
-Deno.test("logging: metricsMap evicts oldest entries past capacity", async () => {
+test("logging: metricsMap evicts oldest entries past capacity", async () => {
   const mod = await freshLogging();
   const { loggingMiddleware, getCollectedMetrics } = mod;
   const app = new Hono();

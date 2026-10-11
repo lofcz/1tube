@@ -5,7 +5,8 @@
  * so we replicate just the bodyLimit middleware against a Hono app.
  */
 
-import { assertEquals } from "@std/assert";
+import { test } from "bun:test";
+import { assertEquals } from "./_assert.ts";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 
@@ -26,7 +27,7 @@ function appWithLimit(maxBytes: number) {
   return app;
 }
 
-Deno.test("body-cap: passes a request under the limit", async () => {
+test("body-cap: passes a request under the limit", async () => {
   const app = appWithLimit(1024);
   const res = await app.fetch(
     new Request("http://localhost/functions/v1/x", {
@@ -38,7 +39,7 @@ Deno.test("body-cap: passes a request under the limit", async () => {
   assertEquals((await res.json()).bytes, 100);
 });
 
-Deno.test("body-cap: rejects a request over the limit with 413", async () => {
+test("body-cap: rejects a request over the limit with 413", async () => {
   const app = appWithLimit(64);
   const res = await app.fetch(
     new Request("http://localhost/functions/v1/x", {
@@ -52,7 +53,7 @@ Deno.test("body-cap: rejects a request over the limit with 413", async () => {
   assertEquals(body.maxBytes, 64);
 });
 
-Deno.test("body-cap: rejects exactly-at-limit + 1 (boundary)", async () => {
+test("body-cap: rejects exactly-at-limit + 1 (boundary)", async () => {
   const app = appWithLimit(10);
   const res = await app.fetch(
     new Request("http://localhost/functions/v1/x", {

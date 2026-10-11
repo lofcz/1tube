@@ -1,9 +1,10 @@
 /**
- * Shared Deno-config resolution for the build commands.
+ * Shared deno.json resolution for the build commands.
  *
- * esbuild's Deno loader needs the host project's `deno.json[c]` to apply the
- * import map. Both `1tube build` (workerd) and `1tube vercel-build` resolve it
- * the same way, in priority order:
+ * Under Bun a `deno.json[c]` is only an import-map source (`imports` /
+ * `scopes`); the bundler's compat plugin applies it to function code. Both
+ * `1tube build` (workerd) and `1tube build --target vercel` resolve it the
+ * same way, in priority order:
  *
  *   1. explicit `--config <path>`  → must exist (hard error otherwise)
  *   2. explicit `--no-config`      → skip the import map entirely
@@ -15,7 +16,9 @@
  * edge functions (Supabase layout), not at repo root.
  */
 
+import { stat } from "node:fs/promises";
 import { isAbsolute, resolve as resolvePath } from "node:path";
+import { findDenoConfig } from "../compat/import-map.ts";
 
 export interface ResolveDenoConfigOptions {
   /** Function source dir (absolute or relative to cwd). */
@@ -40,15 +43,13 @@ export async function resolveDenoConfigPath(
   opts: ResolveDenoConfigOptions,
 ): Promise<ResolveDenoConfigResult> {
   const { functionsDir, configArg, onMessage } = opts;
+  const cwd = process.cwd();
 
   if (configArg !== undefined) {
     if (configArg === "") return {};
-    const abs = isAbsolute(configArg)
-      ? configArg
-      : resolvePath(Deno.cwd(), configArg);
+    const abs = isAbsolute(configArg) ? configArg : resolvePath(cwd, configArg);
     try {
-      const stat = await Deno.stat(abs);
-      if (!stat.isFile) throw new Error("not a regular file");
+      if (!(await stat(abs)).isFile()) throw new Error("not a regular file");
       return { configPath: abs };
     } catch (err) {
       return {
@@ -59,24 +60,14 @@ export async function resolveDenoConfigPath(
 
   const fnDirAbs = isAbsolute(functionsDir)
     ? functionsDir
-    : resolvePath(Deno.cwd(), functionsDir);
-  const candidates = [
-    `${Deno.cwd()}/deno.json`,
-    `${Deno.cwd()}/deno.jsonc`,
-    `${fnDirAbs}/deno.json`,
-    `${fnDirAbs}/deno.jsonc`,
-  ];
-  for (const abs of candidates) {
-    try {
-      const stat = await Deno.stat(abs);
-      if (stat.isFile) {
-        onMessage?.(`using deno config: ${abs}`);
-        return { configPath: abs };
-      }
-    } catch { /* not found, try next */ }
+    : resolvePath(cwd, functionsDir);
+  const found = findDenoConfig(cwd, fnDirAbs);
+  if (found) {
+    onMessage?.(`using deno config: ${found}`);
+    return { configPath: found };
   }
   onMessage?.(
-    `no deno.json / deno.jsonc at ${Deno.cwd()} or ${fnDirAbs} — bundling ` +
+    `no deno.json / deno.jsonc at ${cwd} or ${fnDirAbs} — bundling ` +
       `without an import map. Pass --config <path> if you want one.`,
   );
   return {};

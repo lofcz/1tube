@@ -17,15 +17,16 @@
  * fast unit-level sanity check on the lexical shape is done here.
  */
 
+import { test } from "bun:test";
 import {
   assert,
   assertEquals,
   assertStringIncludes,
   assertThrows,
-} from "@std/assert";
+} from "./_assert.ts";
 import { generateCapnp } from "../src/backends/workerd/capnp.ts";
 
-Deno.test("workerd-capnp: emits well-formed config for two functions", () => {
+test("workerd-capnp: emits well-formed config for two functions", () => {
   const result = generateCapnp([
     { name: "hello", bundleBasename: "hello.js" },
     { name: "echo", bundleBasename: "echo.js" },
@@ -71,7 +72,7 @@ Deno.test("workerd-capnp: emits well-formed config for two functions", () => {
   assertEquals(lOpens, lCloses, "brackets must balance in generated capnp");
 });
 
-Deno.test("workerd-capnp: identical inputs produce byte-identical output", () => {
+test("workerd-capnp: identical inputs produce byte-identical output", () => {
   const inputs = [
     { name: "hello", bundleBasename: "hello.js" },
     { name: "echo", bundleBasename: "echo.js" },
@@ -82,7 +83,7 @@ Deno.test("workerd-capnp: identical inputs produce byte-identical output", () =>
   assertEquals(a.routes, b.routes);
 });
 
-Deno.test("workerd-capnp: respects custom bind address and base port", () => {
+test("workerd-capnp: respects custom bind address and base port", () => {
   const result = generateCapnp(
     [{ name: "hello", bundleBasename: "hello.js" }],
     { bindAddress: "127.0.0.2", basePort: 9100 },
@@ -93,7 +94,7 @@ Deno.test("workerd-capnp: respects custom bind address and base port", () => {
   assertStringIncludes(result.text, `address = "127.0.0.2:9100"`);
 });
 
-Deno.test("workerd-capnp: per-function overrides win over global defaults", () => {
+test("workerd-capnp: per-function overrides win over global defaults", () => {
   const result = generateCapnp(
     [
       {
@@ -124,7 +125,7 @@ Deno.test("workerd-capnp: per-function overrides win over global defaults", () =
   );
 });
 
-Deno.test("workerd-capnp: de-duplicates compatibility flags in stable order", () => {
+test("workerd-capnp: de-duplicates compatibility flags in stable order", () => {
   const result = generateCapnp(
     [{
       name: "fn",
@@ -138,7 +139,7 @@ Deno.test("workerd-capnp: de-duplicates compatibility flags in stable order", ()
   assertEquals(occurrences, 1);
 });
 
-Deno.test("workerd-capnp: local outbound network still supports public HTTPS", () => {
+test("workerd-capnp: local outbound network still supports public HTTPS", () => {
   const result = generateCapnp(
     [{ name: "fn", bundleBasename: "fn.js" }],
     { allowLocalOutbound: true },
@@ -149,7 +150,7 @@ Deno.test("workerd-capnp: local outbound network still supports public HTTPS", (
   assertStringIncludes(result.text, `tlsOptions = (trustBrowserCas = true)`);
 });
 
-Deno.test("workerd-capnp: emits entry and shared chunk modules for prebuilt functions", () => {
+test("workerd-capnp: emits entry and shared chunk modules for prebuilt functions", () => {
   const result = generateCapnp([{
     name: "fn",
     bundleBasename: "functions/fn.js",
@@ -166,11 +167,11 @@ Deno.test("workerd-capnp: emits entry and shared chunk modules for prebuilt func
   );
 });
 
-Deno.test("workerd-capnp: rejects empty input", () => {
+test("workerd-capnp: rejects empty input", () => {
   assertThrows(() => generateCapnp([]), Error, "at least one function");
 });
 
-Deno.test("workerd-capnp: rejects duplicate function names", () => {
+test("workerd-capnp: rejects duplicate function names", () => {
   assertThrows(
     () =>
       generateCapnp([
@@ -182,7 +183,7 @@ Deno.test("workerd-capnp: rejects duplicate function names", () => {
   );
 });
 
-Deno.test("workerd-capnp: rejects unsafe service names", () => {
+test("workerd-capnp: rejects unsafe service names", () => {
   for (
     const bad of [
       "",
@@ -197,7 +198,6 @@ Deno.test("workerd-capnp: rejects unsafe service names", () => {
       () => generateCapnp([{ name: bad, bundleBasename: "x.js" }]),
       Error,
       "service name",
-      `expected rejection for ${JSON.stringify(bad)}`,
     );
   }
   // Sanity: known-good names accepted.
@@ -207,12 +207,12 @@ Deno.test("workerd-capnp: rejects unsafe service names", () => {
   }
 });
 
-Deno.test("workerd-capnp: accepts safe relative bundle paths", () => {
+test("workerd-capnp: accepts safe relative bundle paths", () => {
   const r = generateCapnp([{ name: "fn", bundleBasename: "functions/fn.js" }]);
   assert(r.text.includes('embed "functions/fn.js"'));
 });
 
-Deno.test("workerd-capnp: rejects unsafe bundle embed paths", () => {
+test("workerd-capnp: rejects unsafe bundle embed paths", () => {
   for (
     const bad of [
       "",
@@ -230,12 +230,11 @@ Deno.test("workerd-capnp: rejects unsafe bundle embed paths", () => {
       () => generateCapnp([{ name: "fn", bundleBasename: bad }]),
       Error,
       "bundle embed path",
-      `expected rejection for ${JSON.stringify(bad)}`,
     );
   }
 });
 
-Deno.test("workerd-capnp: rejects malformed dates and flags", () => {
+test("workerd-capnp: rejects malformed dates and flags", () => {
   assertThrows(
     () =>
       generateCapnp(
@@ -257,7 +256,7 @@ Deno.test("workerd-capnp: rejects malformed dates and flags", () => {
   );
 });
 
-Deno.test("workerd-capnp: rejects out-of-range or overflowing ports", () => {
+test("workerd-capnp: rejects out-of-range or overflowing ports", () => {
   assertThrows(
     () =>
       generateCapnp([{ name: "fn", bundleBasename: "fn.js" }], {
@@ -294,7 +293,7 @@ Deno.test("workerd-capnp: rejects out-of-range or overflowing ports", () => {
   );
 });
 
-Deno.test("workerd-capnp: omits bindings field when no env vars are forwarded", () => {
+test("workerd-capnp: omits bindings field when no env vars are forwarded", () => {
   const result = generateCapnp([{ name: "fn", bundleBasename: "fn.js" }]);
   // Operator can grep for "bindings" to find anything env-related; the
   // common case (no forwarding) must NOT mention the field at all so
@@ -305,7 +304,7 @@ Deno.test("workerd-capnp: omits bindings field when no env vars are forwarded", 
   );
 });
 
-Deno.test("workerd-capnp: emits fromEnvironment bindings without leaking values", () => {
+test("workerd-capnp: emits fromEnvironment bindings without leaking values", () => {
   // The literal value `super-secret-shhh` is intentionally not passed
   // anywhere into the generator — we only ever supply the *name*. This
   // test guards the security property that `config.capnp` on disk
@@ -329,7 +328,7 @@ Deno.test("workerd-capnp: emits fromEnvironment bindings without leaking values"
   );
 });
 
-Deno.test("workerd-capnp: de-duplicates env binding names in stable order", () => {
+test("workerd-capnp: de-duplicates env binding names in stable order", () => {
   const result = generateCapnp([{
     name: "fn",
     bundleBasename: "fn.js",
@@ -352,7 +351,7 @@ Deno.test("workerd-capnp: de-duplicates env binding names in stable order", () =
   );
 });
 
-Deno.test("workerd-capnp: rejects malformed env binding names", () => {
+test("workerd-capnp: rejects malformed env binding names", () => {
   for (
     const bad of ["", "1FOO", "has-dash", "has space", "has=eq", "has.dot"]
   ) {
@@ -365,12 +364,11 @@ Deno.test("workerd-capnp: rejects malformed env binding names", () => {
         }]),
       Error,
       "env var name",
-      `expected rejection for ${JSON.stringify(bad)}`,
     );
   }
 });
 
-Deno.test("workerd-capnp: socket and service names line up by index", () => {
+test("workerd-capnp: socket and service names line up by index", () => {
   const result = generateCapnp([
     { name: "alpha", bundleBasename: "alpha.js" },
     { name: "beta", bundleBasename: "beta.js" },

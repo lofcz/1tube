@@ -10,11 +10,10 @@
  *     socket is reachable via TCP — the most reliable
  *     listening-confirmation signal across workerd versions.
  *
- *   - `stop()` sends a graceful `SIGTERM` (or `taskkill /T` on Windows
- *     where Deno still doesn't support sending arbitrary signals),
+ *   - `stop()` sends a graceful `SIGTERM` (Windows has no signals, so
+ *     there it goes straight to `TerminateProcess` via `SIGKILL`),
  *     waits up to a configurable timeout, then escalates by killing
- *     the process via Deno's `kill()`. Idempotent — calling twice is
- *     safe.
+ *     the process with `SIGKILL`. Idempotent — calling twice is safe.
  *
  *   - `onExit(cb)` lets the orchestrator hook unexpected termination
  *     (the workerd backend's restart-on-crash policy lives there, not
@@ -29,14 +28,18 @@
  *     in isolation; the rest is orchestration over child processes,
  *     which the test suite covers via a fake "workerd-like" binary.
  *
- * The platform abstraction is intentionally thin. `Deno.Command` is the
- * only system surface we touch; this module makes no assumptions about
+ * The platform abstraction is intentionally thin. `Bun.spawn` is the
+ * only system surface we touch (plus `node:net` for readiness probes); this module makes no assumptions about
  * the workerd binary's exact path or version, in line with the project
  * decision to let operators ship whatever workerd they want via PATH or
  * the `1TUBE_WORKERD_BIN` env var.
  */
 
+import { connect } from "node:net";
+import { stderr } from "../../stdio.ts";
 import type { CapnpRoute } from "./capnp.ts";
+
+type ChildProcess = Bun.Subprocess<"ignore", "pipe", "pipe">;
 
 /** Default timeout for the readiness probe — generous enough for cold starts on slow disks. */
 const DEFAULT_READY_TIMEOUT_MS = 15_000;
@@ -61,9 +64,9 @@ export interface WorkerdProcessOptions {
   /**
    * Extra arguments inserted **before** `serve <capnpPath>` in argv.
    * Workerd treats these as global flags (e.g. `-v` for verbose). Also
-   * useful as a test seam — passing a `deno`-binary plus
-   * `["run", ..., script.ts, "--"]` here lets a Deno script stand in
-   * for the workerd binary in unit tests.
+   * useful as a test seam — passing the `bun` binary plus
+   * `[script.ts, "--"]` here lets a Bun script stand in for the workerd
+   * binary in unit tests.
    */
   globalArgs?: readonly string[];
   /**
@@ -81,13 +84,14 @@ export interface WorkerdProcessOptions {
    * Environment variables to pass through to workerd. Workerd doesn't
    * read its own env meaningfully (env bindings come from capnp), but
    * Node-shimmed code under nodejs_compat reads `process.env`, which
-   * workerd populates from the inherited environment. Defaults to the
-   * full parent env so dev experience matches plain `deno run`.
+   * workerd populates from the inherited environment. Merged over the
+   * full parent env (which is also the default) so dev experience matches
+   * running the function locally.
    */
   env?: Record<string, string>;
   /**
    * Sink for `[workerd]`-prefixed log lines. Defaults to writing to
-   * `Deno.stderr` synchronously so workerd output interleaves with
+   * stderr synchronously so workerd output interleaves with
    * 1tube's startup banner without buffering.
    */
   logLineSink?: (line: string) => void;
@@ -205,27 +209,32 @@ export function isCompatDateAtMost(date: string, ceiling: string): boolean {
  *
  * Has a hard 5-second timeout so a hung binary doesn't block boot.
  * Throws on any failure — the orchestrator decides whether to fall
- * back to the Deno backend or surface to the operator.
+ * back to the Bun backend or surface to the operator.
  */
 export async function probeVersion(binary: string): Promise<VersionInfo> {
-  const cmd = new Deno.Command(binary, {
-    args: ["--version"],
-    stdout: "piped",
-    stderr: "piped",
+  const child = Bun.spawn([binary, "--version"], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    windowsHide: true,
   });
-  const child = cmd.spawn();
   const timer = setTimeout(() => {
     try {
       child.kill("SIGKILL");
     } catch { /* already exited */ }
   }, 5_000);
   try {
-    const { code, stdout, stderr } = await child.output();
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
     if (code !== 0) {
-      const err = new TextDecoder().decode(stderr).trim();
-      throw new Error(`workerd --version exited with code ${code}: ${err}`);
+      throw new Error(
+        `workerd --version exited with code ${code}: ${stderr.trim()}`,
+      );
     }
-    return parseVersionOutput(new TextDecoder().decode(stdout));
+    return parseVersionOutput(stdout);
   } finally {
     clearTimeout(timer);
   }
@@ -237,14 +246,18 @@ export async function probeVersion(binary: string): Promise<VersionInfo> {
  * aborted before any attempt succeeds. Internal helper — not exported
  * because the public surface is `waitForPorts`.
  */
-async function probeOnce(hostname: string, port: number): Promise<boolean> {
-  try {
-    const conn = await Deno.connect({ hostname, port });
-    conn.close();
-    return true;
-  } catch {
-    return false;
-  }
+function probeOnce(hostname: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = connect({ host: hostname, port });
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once("error", () => {
+      socket.destroy();
+      resolve(false);
+    });
+  });
 }
 
 /**
@@ -307,7 +320,7 @@ function defaultLogLineSink(line: string): void {
   // is concurrently writing — the OS guarantees pipe writes <= PIPE_BUF
   // are atomic. Workerd lines are typically well under that limit.
   try {
-    Deno.stderr.writeSync(new TextEncoder().encode(`[workerd] ${line}\n`));
+    stderr.writeSync(new TextEncoder().encode(`[workerd] ${line}\n`));
   } catch {
     // stderr unavailable (test sandbox / closed handle). Drop silently
     // — losing log lines is preferable to crashing the process manager.
@@ -355,14 +368,14 @@ async function pumpLines(
 
 /**
  * Try to terminate a child process gracefully on every supported
- * platform. Deno on Windows still rejects `SIGTERM`, so on `windows`
- * we go straight to `SIGKILL` (which Deno emulates as `TerminateProcess`).
- * Returns true if the kill request was accepted by the OS, false if
- * the process was already gone.
+ * platform. Windows has no `SIGTERM`, so on `win32` callers go straight
+ * to `SIGKILL` (which Bun maps to `TerminateProcess`). Returns true if
+ * the kill request was accepted by the OS, false if the process was
+ * already gone.
  */
 function bestEffortKill(
-  child: Deno.ChildProcess,
-  signal: Deno.Signal,
+  child: ChildProcess,
+  signal: NodeJS.Signals,
 ): boolean {
   try {
     child.kill(signal);
@@ -427,7 +440,7 @@ export function createWorkerdProcess(
     (code: number | null, expected: boolean) => void
   >();
 
-  let child: Deno.ChildProcess | null = null;
+  let child: ChildProcess | null = null;
   let started = false;
   let stopRequested = false;
   let exited = false;
@@ -476,15 +489,16 @@ export function createWorkerdProcess(
         sink(line);
       };
 
-      const cmd = new Deno.Command(opts.binary, {
-        args,
+      child = Bun.spawn(command, {
         cwd,
-        env: opts.env,
-        stdout: "piped",
-        stderr: "piped",
+        // Bun replaces the child env wholesale when `env` is given; merge
+        // so a partial override still inherits PATH, HOME, etc.
+        env: opts.env ? { ...process.env, ...opts.env } : process.env,
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        windowsHide: true,
       });
-
-      child = cmd.spawn();
 
       // Pump stdout + stderr into the sink. Both pumps are awaited at
       // shutdown so the consumer can be sure no lines are lost.
@@ -497,8 +511,8 @@ export function createWorkerdProcess(
       // (bad capnp, port collision, missing binary feature) cancels
       // the readiness wait instead of hanging until the timeout.
       const exitAbort = new AbortController();
-      const exitWatch = child.status.then((status) => {
-        exitCode = status.code;
+      const exitWatch = child.exited.then((code) => {
+        exitCode = code;
         const expected = stopRequested;
         if (!expected) {
           // Crash before ready or during runtime. Abort the readiness
@@ -506,8 +520,8 @@ export function createWorkerdProcess(
           // any registered listeners.
           exitAbort.abort();
         }
-        fireExit(status.code, expected);
-        return status;
+        fireExit(code, expected);
+        return code;
       });
 
       try {
@@ -544,12 +558,12 @@ export function createWorkerdProcess(
       if (!child || exited) return;
       stopRequested = true;
 
-      // Try graceful first. `SIGTERM` works on Linux/macOS; on Windows
-      // Deno only supports `SIGKILL` so we go straight to that.
-      const isWindows = Deno.build.os === "windows";
+      // Try graceful first. `SIGTERM` works on Linux/macOS; Windows has
+      // no signals, so we go straight to `SIGKILL` (TerminateProcess).
+      const isWindows = process.platform === "win32";
       bestEffortKill(child, isWindows ? "SIGKILL" : "SIGTERM");
 
-      const status = child.status;
+      const status = child.exited;
       const escalator = setTimeout(() => {
         if (child) bestEffortKill(child, "SIGKILL");
       }, shutdownTimeoutMs);

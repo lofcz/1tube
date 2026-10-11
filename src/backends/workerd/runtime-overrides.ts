@@ -6,7 +6,15 @@ import {
   relative,
   resolve as resolvePath,
 } from "node:path";
-import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
+import {
+  copyFile,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import {
   defaultManifest,
   type FunctionManifest,
@@ -16,6 +24,14 @@ import {
 import type { PrebuiltManifest } from "./prebuilt.ts";
 
 const NAME_RX = /^[A-Za-z][A-Za-z0-9_-]*$/;
+
+async function ensureDir(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
+}
+
+function isNotFound(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === "ENOENT";
+}
 const OVERLAY_SCHEMA = 1;
 
 export type EditableFunctionOrigin = "manifest" | "patched" | "added";
@@ -90,7 +106,7 @@ export interface RuntimeOverrideStoreOptions {
 }
 
 export function defaultRuntimeOverrideRoot(cwd: string): string {
-  const env = Deno.env.get("1TUBE_RUNTIME_FUNCTIONS_DIR")?.trim();
+  const env = process.env["1TUBE_RUNTIME_FUNCTIONS_DIR"]?.trim();
   return env
     ? (isAbsolutePath(env) ? env : resolvePath(cwd, env))
     : resolvePath(cwd, ".1tube-cache", "runtime-functions");
@@ -137,40 +153,36 @@ function langFor(path: string): EditableSourceFile["language"] {
 
 async function pathExists(path: string): Promise<boolean> {
   try {
-    await Deno.stat(path);
+    await stat(path);
     return true;
   } catch (err) {
-    if (err instanceof Deno.errors.NotFound) return false;
+    if (isNotFound(err)) return false;
     throw err;
   }
 }
 
 async function readTextIfExists(path: string): Promise<string | null> {
   try {
-    return await Deno.readTextFile(path);
+    return await readFile(path, "utf8");
   } catch (err) {
-    if (err instanceof Deno.errors.NotFound) return null;
+    if (isNotFound(err)) return null;
     throw err;
   }
 }
 
 async function removeDirIfExists(path: string): Promise<void> {
-  try {
-    await Deno.remove(path, { recursive: true });
-  } catch (err) {
-    if (!(err instanceof Deno.errors.NotFound)) throw err;
-  }
+  await rm(path, { recursive: true, force: true });
 }
 
 async function listFiles(root: string): Promise<string[]> {
   const out: string[] = [];
   async function walk(dir: string) {
-    for await (const entry of Deno.readDir(dir)) {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
       if (entry.name === ".DS_Store") continue;
       const abs = join(dir, entry.name);
-      if (entry.isDirectory) {
+      if (entry.isDirectory()) {
         await walk(abs);
-      } else if (entry.isFile) {
+      } else if (entry.isFile()) {
         out.push(relative(root, abs).replaceAll("\\", "/"));
       }
     }
@@ -178,7 +190,7 @@ async function listFiles(root: string): Promise<string[]> {
   try {
     await walk(root);
   } catch (err) {
-    if (!(err instanceof Deno.errors.NotFound)) throw err;
+    if (!isNotFound(err)) throw err;
   }
   return out.sort((a, b) => a.localeCompare(b));
 }
@@ -434,7 +446,7 @@ export class RuntimeOverrideStore {
   private async persist(): Promise<void> {
     await ensureDir(this.rootDir);
     this.index.functions.sort((a, b) => a.name.localeCompare(b.name));
-    await Deno.writeTextFile(
+    await writeFile(
       this.indexPath,
       JSON.stringify(this.index, null, 2) + "\n",
     );
@@ -466,7 +478,7 @@ export class RuntimeOverrideStore {
         throw new Error(`source path escapes function dir: ${rel}`);
       }
       await ensureDir(dirname(abs));
-      await Deno.writeTextFile(abs, content);
+      await writeFile(abs, content);
     }
   }
 
@@ -486,7 +498,7 @@ export class RuntimeOverrideStore {
     for (const path of listed) {
       files.push({
         path,
-        content: await Deno.readTextFile(join(dir, safeRelPath(path))),
+        content: await readFile(join(dir, safeRelPath(path)), "utf8"),
         language: langFor(path),
       });
     }
@@ -530,7 +542,7 @@ export class RuntimeOverrideStore {
       for (const path of sourceFiles) {
         files.push({
           path,
-          content: await Deno.readTextFile(join(sourceDir, path)),
+          content: await readFile(join(sourceDir, path), "utf8"),
           language: langFor(path),
         });
       }
@@ -635,7 +647,7 @@ export class RuntimeOverrideStore {
     for (const path of files) {
       out.push({
         path,
-        content: await Deno.readTextFile(join(snapshotDir, path)),
+        content: await readFile(join(snapshotDir, path), "utf8"),
         language: langFor(path),
       });
     }
@@ -721,8 +733,7 @@ export async function copyPrebuiltRuntimeFiles(
     const from = join(prebuiltDir, safe);
     const to = join(cacheDir, safe);
     await ensureDir(dirname(to));
-    const content = await Deno.readFile(from);
-    await Deno.writeFile(to, content);
+    await copyFile(from, to);
   }
   for (const fn of prebuilt.functions) {
     await copyRel(fn.bundleFile);
@@ -735,7 +746,7 @@ export async function copyPrebuiltRuntimeFiles(
 export async function readTextDigestFile(
   path: string,
 ): Promise<{ bytes: number; sha256: string }> {
-  const data = await Deno.readFile(path);
+  const data = await readFile(path);
   const digest = await crypto.subtle.digest("SHA-256", data as BufferSource);
   return {
     bytes: data.byteLength,

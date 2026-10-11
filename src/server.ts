@@ -6,18 +6,15 @@
  * graceful shutdown, and per-function timeouts.
  *
  * Usage:
- *   deno run --allow-all src/server.ts
- *   deno run --allow-all src/server.ts --functions ../sciobot-next/supabase/functions --port 3100
- *   deno run --allow-all src/server.ts --dev --hmr   # local development
+ *   bun src/server.ts
+ *   bun src/server.ts --functions ../sciobot-next/supabase/functions --port 3100
+ *   bun src/server.ts --dev --hmr   # local development
  */
 
-// All third-party imports below use `npm:` / `node:` / `jsr:` specifiers
-// directly (not bare aliases from our deno.json) so this entry point loads
-// cleanly when launched from a host project's node_modules — bare
-// specifiers would otherwise require the host's deno.json to mirror our
-// import map. Same convention applies to every src/ file.
-import { type Context, Hono } from "npm:hono@4";
-import { bodyLimit } from "npm:hono@4/body-limit";
+import { realpath } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { type Context, Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { currentRequestStorage, FunctionRegistry } from "./registry.ts";
 import { probeRequest } from "./gateway/auth.ts";
 import { watchdogBody } from "./gateway/body-watchdog.ts";
@@ -45,8 +42,8 @@ import {
 } from "./gateway/route-prefix.ts";
 import { createHealthHandler, createMetricsHandler } from "./health.ts";
 import { FunctionSupervisor } from "./supervisor.ts";
-import { installEnvScope } from "./env-scope.ts";
 import { flushLogs } from "./log-buffer.ts";
+import { writeStderrLine } from "./stdio.ts";
 import { VERSION } from "./version.ts";
 import {
   createWorkerdBackend,
@@ -57,23 +54,27 @@ import {
   type WorkerdHotReloader,
 } from "./backends/workerd/hot-reloader.ts";
 import {
-  createDenoWorkerHost,
-  type DenoWorkerHost,
+  createAttributedConsole,
+  createFunctionHost,
+  currentInvocation,
+  type FunctionConsoleEvent,
+  sharedCodeHooks,
+  type FunctionHost,
   type SpawnProgress,
-} from "./backends/deno/worker-host.ts";
+} from "./backends/bun/function-host.ts";
 import {
-  createDenoHotReloader,
-  type DenoHotReloader,
-} from "./backends/deno/hot-reloader.ts";
+  createHotReloader,
+  type HotReloader,
+} from "./backends/bun/hot-reloader.ts";
 import {
-  createDenoSharedRuntime,
-  type DenoSharedRuntime,
+  createSharedRuntime,
   discoverSharedModules,
-} from "./backends/deno/shared-runtime.ts";
-import {
-  createRewriteCache,
-  type RewriteCache,
-} from "./backends/deno/source-rewriter.ts";
+  type SharedRuntime,
+} from "./backends/bun/shared-runtime.ts";
+import { configureCompat } from "./compat/plugin.ts";
+import { parseReleaseAge } from "./compat/deps.ts";
+import { createCompatEnvironment } from "./compat/environment.ts";
+import { createSharedDependencies, type SharedDependencies } from "./compat/shared-deps.ts";
 import {
   createEnvHotReloader,
   type EnvHotReloader,
@@ -113,7 +114,7 @@ export const EXIT_CODES = {
   USAGE: 64,
   CONFIG: 78,
 } as const;
-/** Mirror in any external supervisor (see dotnet/OneTube/DenoHostService.cs). */
+/** Mirror in any external supervisor (see dotnet/OneTube/GatewayHostService.cs). */
 export const PERMANENT_EXIT_CODES: ReadonlySet<number> = new Set([
   EXIT_CODES.USAGE,
   EXIT_CODES.CONFIG,
@@ -147,8 +148,8 @@ interface CliOpts {
   hmr: boolean;
   lazy: boolean;
   /**
-   * Deferred boot (Deno backend only). The gateway starts serving
-   * immediately and function Workers spawn in the background; a request
+   * Deferred boot (Bun backend only). The gateway starts serving
+   * immediately and functions import in the background; a request
    * for a not-yet-ready function bumps it to the front of the queue and
    * gets a `503` + `X-1tube-Warming: 1` response the frontend can use to
    * show a "backend is warming up" overlay. Defaults to on in dev/HMR
@@ -157,14 +158,16 @@ interface CliOpts {
    */
   deferBoot: boolean;
   /**
-   * Colocated (single-isolate) dev mode for the Deno backend. Hosts every
-   * function in ONE Worker so shared deps compile + evaluate once total
-   * instead of once per function — the dominant warm-boot cost on large
-   * projects. Trades crash/global isolation for speed, so it defaults on
-   * only in dev/HMR and is forced off under workerd. Override with
-   * `--colocate` / `--isolate-per-function` or `1TUBE_COLOCATE=1|0`.
+   * Shared dependencies (Bun backend): npm/jsr/remote packages imported by
+   * functions are evaluated once and shared, while each function's own
+   * files stay isolated in its module graph. Cuts boot from ~N× to ~1× the
+   * cost of a heavy SDK. Shares third-party module state between
+   * functions, so it defaults on only in dev/HMR, and is forced off when
+   * manifest env enforcement is on. `--share-deps` / `--isolate-deps` or
+   * `1TUBE_SHARE_DEPS=1|0` (legacy: `--colocate` / `--isolate-per-function`,
+   * `1TUBE_COLOCATE`).
    */
-  colocate: boolean;
+  shareDeps: boolean;
   /**
    * How long (ms) the dispatcher waits for a warming function before
    * answering with the warming 503. Keeps fast-loading functions from
@@ -172,22 +175,22 @@ interface CliOpts {
    */
   warmupGraceMs: number;
   /**
-   * How long (ms) a request waits for an in-flight HMR respawn of its
-   * function before falling back to the previous (stale) worker. Fresh
+   * How long (ms) a request waits for an in-flight HMR reload of its
+   * function before falling back to the previous (stale) module graph. Fresh
    * code wins by default — this is the Vite-style "request stalls until
    * the rebuild lands" behavior. Stale fallbacks are marked with
    * `X-1tube-Stale: 1`. `1TUBE_HMR_FRESH_WAIT_MS`, default 2500;
-   * 0 disables waiting (always serve whatever worker is live).
+   * 0 disables waiting (always serve whatever graph is live).
    */
   hmrFreshWaitMs: number;
   /**
-   * Function execution backend. `"deno"` (default) imports each
-   * function as a Deno module in this process — same as 1tube has
-   * always done. `"workerd"` bundles each function into a
-   * Cloudflare-style worker and serves it from a workerd subprocess
-   * for hard isolation between functions and the gateway.
+   * Function execution backend. `"bun"` (default) imports each function
+   * into its own `Bun.ModuleGraph` in this process. `"workerd"` bundles
+   * each function into a Cloudflare-style worker and serves it from a
+   * workerd subprocess for hard isolation between functions and the
+   * gateway. `"deno"` is accepted as a legacy alias for `"bun"`.
    */
-  backend: "deno" | "workerd";
+  backend: "bun" | "workerd";
   /**
    * Optional path to the workerd binary. Falls back to
    * `1TUBE_WORKERD_BIN`, then plain `"workerd"` resolved via PATH.
@@ -206,15 +209,22 @@ interface CliOpts {
   workerdEnv?: readonly string[];
   /** Shared module paths for gateway-owned process-wide code. */
   workerdShared?: readonly string[];
-  /** Max concurrent Deno Worker spawns during eager boot/reload. */
-  denoWorkerConcurrency?: number;
+  /** Max functions importing concurrently during boot/reload (Bun backend). */
+  functionConcurrency?: number;
   /**
-   * Grace window (ms) an HMR-superseded Deno worker keeps serving its
-   * in-flight requests before it is terminated. Prevents a reload under
+   * Grace window (ms) an HMR-superseded module graph keeps serving its
+   * in-flight requests before it is disposed. Prevents a reload under
    * load from dropping responses. `1TUBE_HMR_DRAIN_MS`, default 10000;
-   * 0 reverts to terminate-immediately. Deno backend only.
+   * 0 disposes immediately. Bun backend only.
    */
-  denoReloadDrainMs?: number;
+  reloadDrainMs?: number;
+  /**
+   * Managed store for `npm:`/`jsr:` specifiers (package.json + bun.lock).
+   * `--deps-dir` / `1TUBE_DEPS_DIR`, default `.1tube/deps`.
+   */
+  depsDir: string;
+  /** Minimum release age (seconds) for managed installs. */
+  minimumReleaseAgeSeconds?: number;
   /**
    * First loopback port workerd may use for per-function sockets.
    * The backend reserves a second generation range at +500 during
@@ -291,10 +301,10 @@ interface CliOpts {
 }
 
 function parseArgs(): CliOpts {
-  const args = Deno.args;
+  const args = process.argv.slice(2);
 
   const envFlag = (name: string) => {
-    const v = Deno.env.get(name);
+    const v = process.env[name];
     return v === "1" || v === "true";
   };
 
@@ -304,60 +314,67 @@ function parseArgs(): CliOpts {
   // function cost (no on-demand transpile tax). Opt in to lazy with
   // --lazy or 1TUBE_LAZY=1 when boot speed matters more than first-hit
   // latency (e.g. sites with hundreds of rarely-called functions).
-  const lazyEnv = Deno.env.get("1TUBE_LAZY");
+  const lazyEnv = process.env["1TUBE_LAZY"];
   let lazy = lazyEnv === undefined
     ? false
     : (lazyEnv === "1" || lazyEnv === "true");
   // Deferred boot: tri-state until the end of parsing — when neither the
   // env var nor a CLI flag decides, it follows dev/hmr mode.
-  const deferEnv = Deno.env.get("1TUBE_DEFER_BOOT");
+  const deferEnv = process.env["1TUBE_DEFER_BOOT"];
   let deferBoot: boolean | undefined = deferEnv === undefined
     ? undefined
     : (deferEnv === "1" || deferEnv.toLowerCase() === "true");
-  // Colocated (single-isolate) dev mode: tri-state until the end of
-  // parsing. When undecided it follows dev/hmr (Deno backend only), since
-  // its whole point is a fast dev loop. `1TUBE_COLOCATE=1|0` or
-  // `--colocate` / `--isolate-per-function` force it either way.
-  const colocateEnv = Deno.env.get("1TUBE_COLOCATE");
-  let colocate: boolean | undefined = colocateEnv === undefined
+  // Shared dependencies: tri-state like deferred boot.
+  const shareEnv = process.env["1TUBE_SHARE_DEPS"] ?? process.env["1TUBE_COLOCATE"];
+  let shareDeps: boolean | undefined = shareEnv === undefined
     ? undefined
-    : (colocateEnv === "1" || colocateEnv.toLowerCase() === "true");
+    : (shareEnv === "1" || shareEnv.toLowerCase() === "true");
   let warmupGraceMs = (() => {
-    const v = parseInt(Deno.env.get("1TUBE_WARMUP_GRACE_MS") || "", 10);
+    const v = parseInt(process.env["1TUBE_WARMUP_GRACE_MS"] || "", 10);
     return Number.isFinite(v) && v >= 0 ? v : 250;
   })();
   const hmrFreshWaitMs = (() => {
-    const v = parseInt(Deno.env.get("1TUBE_HMR_FRESH_WAIT_MS") || "", 10);
+    const v = parseInt(process.env["1TUBE_HMR_FRESH_WAIT_MS"] || "", 10);
     return Number.isFinite(v) && v >= 0 ? v : 2500;
   })();
-  const backendEnv = (Deno.env.get("1TUBE_BACKEND") ?? "").trim().toLowerCase();
-  let backend: "deno" | "workerd" = backendEnv === "workerd"
+  const backendEnv = (process.env["1TUBE_BACKEND"] ?? "").trim().toLowerCase();
+  let backend: "bun" | "workerd" = backendEnv === "workerd"
     ? "workerd"
-    : "deno";
-  let workerdBin: string | undefined = Deno.env.get("1TUBE_WORKERD_BIN") ||
+    : "bun";
+  const parseBackend = (raw: string): "bun" | "workerd" => {
+    const v = raw.toLowerCase();
+    if (v === "bun" || v === "workerd") return v;
+    if (v === "deno") return "bun";
+    console.error(
+      `[1tube] FATAL: --backend must be 'bun' or 'workerd', got ${JSON.stringify(v)}`,
+    );
+    process.exit(EXIT_CODES.USAGE);
+  };
+  let workerdBin: string | undefined = process.env["1TUBE_WORKERD_BIN"] ||
     undefined;
   // Operator can either use --workerd-env=A,B,C on the CLI or set
   // 1TUBE_WORKERD_ENV. The CLI flag wins; otherwise the backend reads
   // the env var itself so a missing flag still picks up the var.
   let workerdEnv: readonly string[] | undefined;
-  const workerdShared: string[] = (Deno.env.get("1TUBE_WORKERD_SHARED") ?? "")
+  const workerdShared: string[] = (process.env["1TUBE_WORKERD_SHARED"] ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
-  let denoWorkerConcurrency: number | undefined = (() => {
-    const v = Deno.env.get("1TUBE_DENO_WORKER_CONCURRENCY");
+  let functionConcurrency: number | undefined = (() => {
+    const v = process.env["1TUBE_CONCURRENCY"] ??
+      process.env["1TUBE_DENO_WORKER_CONCURRENCY"];
     if (!v) return undefined;
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n > 0 ? n : undefined;
   })();
-  let denoReloadDrainMs: number | undefined = (() => {
-    const v = Deno.env.get("1TUBE_HMR_DRAIN_MS");
+  let reloadDrainMs: number | undefined = (() => {
+    const v = process.env["1TUBE_HMR_DRAIN_MS"];
     if (!v) return undefined;
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n >= 0 ? n : undefined;
   })();
   let workerdBasePort: number | undefined = (() => {
-    const v = Deno.env.get("1TUBE_WORKERD_BASE_PORT");
+    const v = process.env["1TUBE_WORKERD_BASE_PORT"];
     if (!v) return undefined;
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n > 0 ? n : undefined;
@@ -367,79 +384,83 @@ function parseArgs(): CliOpts {
   // → operator-supplied bind. Empty string disables.
   const DEFAULT_INSPECTOR_ADDR = "127.0.0.1:9229";
   let workerdInspector: string | undefined = (() => {
-    const v = Deno.env.get("1TUBE_INSPECTOR");
+    const v = process.env["1TUBE_INSPECTOR"];
     if (v === undefined) return undefined;
     if (v === "" || v === "0" || v.toLowerCase() === "false") return undefined;
     if (v === "1" || v.toLowerCase() === "true") return DEFAULT_INSPECTOR_ADDR;
     return v;
   })();
-  let prebuiltDir: string | undefined = Deno.env.get("1TUBE_PREBUILT") ||
+  let prebuiltDir: string | undefined = process.env["1TUBE_PREBUILT"] ||
     undefined;
   // Auto-kill leftover workerd processes if the boot preflight finds
   // port conflicts. CLI flag overrides env var; both default to off.
   let killStaleWorkerd: boolean = (() => {
-    const v = Deno.env.get("1TUBE_KILL_STALE_WORKERD");
+    const v = process.env["1TUBE_KILL_STALE_WORKERD"];
     return v === "1" || v?.toLowerCase() === "true";
   })();
   // V8 max heap size for workerd, in MB. CLI flag overrides env var.
   let workerdMaxHeapMB: number | undefined = (() => {
-    const v = Deno.env.get("1TUBE_WORKERD_MAX_HEAP_MB");
+    const v = process.env["1TUBE_WORKERD_MAX_HEAP_MB"];
     if (!v) return undefined;
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n > 0 ? n : undefined;
   })();
   let workerdCompatibilityDate: string | undefined =
-    Deno.env.get("1TUBE_WORKERD_COMPAT_DATE") || undefined;
+    process.env["1TUBE_WORKERD_COMPAT_DATE"] || undefined;
   const workerdCompatibilityFlags: string[] =
-    (Deno.env.get("1TUBE_WORKERD_COMPAT_FLAGS") ?? "")
+    (process.env["1TUBE_WORKERD_COMPAT_FLAGS"] ?? "")
       .split(",")
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
   let workerdExperimental = envFlag("1TUBE_WORKERD_EXPERIMENTAL");
   // Invocation log store. Enabled unless explicitly turned off.
-  const invocationLogsEnv = Deno.env.get("1TUBE_INVOCATION_LOGS");
+  const invocationLogsEnv = process.env["1TUBE_INVOCATION_LOGS"];
   let invocationLogs = invocationLogsEnv === undefined
     ? true
     : !(invocationLogsEnv === "0" ||
       invocationLogsEnv.toLowerCase() === "false");
-  let logDbPath = Deno.env.get("1TUBE_LOG_DB") || ".1tube/logs.db";
+  let logDbPath = process.env["1TUBE_LOG_DB"] || ".1tube/logs.db";
   let logRetentionDays: number | undefined = (() => {
-    const v = parseInt(Deno.env.get("1TUBE_LOG_RETENTION_DAYS") || "", 10);
+    const v = parseInt(process.env["1TUBE_LOG_RETENTION_DAYS"] || "", 10);
     return Number.isFinite(v) && v >= 0 ? v : undefined;
   })();
   let logMaxRows: number | undefined = (() => {
-    const v = parseInt(Deno.env.get("1TUBE_LOG_MAX_ROWS") || "", 10);
+    const v = parseInt(process.env["1TUBE_LOG_MAX_ROWS"] || "", 10);
     return Number.isFinite(v) && v >= 0 ? v : undefined;
   })();
   const logMaxInvocations: number | undefined = (() => {
-    const v = parseInt(Deno.env.get("1TUBE_LOG_MAX_INVOCATIONS") || "", 10);
+    const v = parseInt(process.env["1TUBE_LOG_MAX_INVOCATIONS"] || "", 10);
     return Number.isFinite(v) && v >= 0 ? v : undefined;
   })();
-  const logConsoleEnv = Deno.env.get("1TUBE_LOG_CONSOLE");
+  let depsDir = process.env["1TUBE_DEPS_DIR"] || join(".1tube", "deps");
+  let minimumReleaseAgeSeconds = parseReleaseAge(
+    process.env["1TUBE_MINIMUM_DEPENDENCY_AGE"],
+  );
+  const logConsoleEnv = process.env["1TUBE_LOG_CONSOLE"];
   const logConsoleCapture = logConsoleEnv === undefined
     ? true
     : !(logConsoleEnv === "0" || logConsoleEnv.toLowerCase() === "false");
 
-  let port = parseInt(Deno.env.get("PORT") || "3100", 10);
-  let host = (Deno.env.get("1TUBE_HOST") || "127.0.0.1").trim();
-  let functionsPath = Deno.env.get("FUNCTIONS_PATH") || "./supabase/functions";
+  let port = parseInt(process.env["PORT"] || "3100", 10);
+  let host = (process.env["1TUBE_HOST"] || "127.0.0.1").trim();
+  let functionsPath = process.env["FUNCTIONS_PATH"] || "./supabase/functions";
   // Normalized at the end via setRoutePrefix(); kept raw here so an
   // explicit CLI flag can still override the env var.
-  let routePrefix = Deno.env.get("1TUBE_ROUTE_PREFIX") || "/functions/v1";
+  let routePrefix = process.env["1TUBE_ROUTE_PREFIX"] || "/functions/v1";
   // Matches Vercel Fluid's maxDuration cap. Per-function `serve({ timeoutMs })`
   // / `1tube.json` still override. `FUNCTION_TIMEOUT_MS` / `--timeout` win last.
   const DEFAULT_FUNCTION_TIMEOUT_MS = 800_000;
   let defaultTimeoutMs = parseInt(
-    Deno.env.get("FUNCTION_TIMEOUT_MS") || String(DEFAULT_FUNCTION_TIMEOUT_MS),
+    process.env["FUNCTION_TIMEOUT_MS"] || String(DEFAULT_FUNCTION_TIMEOUT_MS),
     10,
   );
-  const bodyLimitMb = parseFloat(Deno.env.get("1TUBE_BODY_LIMIT_MB") || "30");
+  const bodyLimitMb = parseFloat(process.env["1TUBE_BODY_LIMIT_MB"] || "30");
   const bodyReadIdleMs = parseInt(
-    Deno.env.get("1TUBE_BODY_READ_MS") || "30000",
+    process.env["1TUBE_BODY_READ_MS"] || "30000",
     10,
   );
   const shutdownGraceMs = parseInt(
-    Deno.env.get("1TUBE_SHUTDOWN_GRACE_MS") || "10000",
+    process.env["1TUBE_SHUTDOWN_GRACE_MS"] || "10000",
     10,
   );
 
@@ -469,13 +490,17 @@ function parseArgs(): CliOpts {
       deferBoot = true;
     } else if (a === "--defer-boot=false" || a === "--no-defer-boot") {
       deferBoot = false;
-    } else if (a === "--colocate" || a === "--colocate=true") {
-      colocate = true;
     } else if (
-      a === "--colocate=false" || a === "--no-colocate" ||
+      a === "--share-deps" || a === "--share-deps=true" ||
+      a === "--colocate" || a === "--colocate=true"
+    ) {
+      shareDeps = true;
+    } else if (
+      a === "--isolate-deps" || a === "--share-deps=false" ||
+      a === "--no-colocate" || a === "--colocate=false" ||
       a === "--isolate-per-function"
     ) {
-      colocate = false;
+      shareDeps = false;
     } else if (a === "--warmup-grace-ms" && args[i + 1]) {
       const n = parseInt(args[++i], 10);
       if (Number.isFinite(n) && n >= 0) warmupGraceMs = n;
@@ -483,27 +508,9 @@ function parseArgs(): CliOpts {
       const n = parseInt(a.slice("--warmup-grace-ms=".length), 10);
       if (Number.isFinite(n) && n >= 0) warmupGraceMs = n;
     } else if (a === "--backend" && args[i + 1]) {
-      const v = args[++i].toLowerCase();
-      if (v !== "deno" && v !== "workerd") {
-        console.error(
-          `[1tube] FATAL: --backend must be 'deno' or 'workerd', got ${
-            JSON.stringify(v)
-          }`,
-        );
-        Deno.exit(EXIT_CODES.USAGE);
-      }
-      backend = v;
+      backend = parseBackend(args[++i]);
     } else if (a.startsWith("--backend=")) {
-      const v = a.slice("--backend=".length).toLowerCase();
-      if (v !== "deno" && v !== "workerd") {
-        console.error(
-          `[1tube] FATAL: --backend must be 'deno' or 'workerd', got ${
-            JSON.stringify(v)
-          }`,
-        );
-        Deno.exit(EXIT_CODES.USAGE);
-      }
-      backend = v;
+      backend = parseBackend(a.slice("--backend=".length));
     } else if (a === "--workerd-bin" && args[i + 1]) {
       workerdBin = args[++i];
     } else if (a === "--workerd-env" && args[i + 1]) {
@@ -520,18 +527,32 @@ function parseArgs(): CliOpts {
       workerdShared.push(args[++i]);
     } else if (a.startsWith("--workerd-shared=")) {
       workerdShared.push(a.slice("--workerd-shared=".length));
-    } else if (a === "--deno-worker-concurrency" && args[i + 1]) {
+    } else if (
+      (a === "--concurrency" || a === "--deno-worker-concurrency") && args[i + 1]
+    ) {
       const n = parseInt(args[++i], 10);
-      if (Number.isFinite(n) && n > 0) denoWorkerConcurrency = n;
-    } else if (a.startsWith("--deno-worker-concurrency=")) {
-      const n = parseInt(a.slice("--deno-worker-concurrency=".length), 10);
-      if (Number.isFinite(n) && n > 0) denoWorkerConcurrency = n;
+      if (Number.isFinite(n) && n > 0) functionConcurrency = n;
+    } else if (
+      a.startsWith("--concurrency=") || a.startsWith("--deno-worker-concurrency=")
+    ) {
+      const n = parseInt(a.slice(a.indexOf("=") + 1), 10);
+      if (Number.isFinite(n) && n > 0) functionConcurrency = n;
     } else if (a === "--hmr-drain-ms" && args[i + 1]) {
       const n = parseInt(args[++i], 10);
-      if (Number.isFinite(n) && n >= 0) denoReloadDrainMs = n;
+      if (Number.isFinite(n) && n >= 0) reloadDrainMs = n;
     } else if (a.startsWith("--hmr-drain-ms=")) {
       const n = parseInt(a.slice("--hmr-drain-ms=".length), 10);
-      if (Number.isFinite(n) && n >= 0) denoReloadDrainMs = n;
+      if (Number.isFinite(n) && n >= 0) reloadDrainMs = n;
+    } else if (a === "--deps-dir" && args[i + 1]) {
+      depsDir = args[++i];
+    } else if (a.startsWith("--deps-dir=")) {
+      depsDir = a.slice("--deps-dir=".length);
+    } else if (a === "--minimum-dependency-age" && args[i + 1]) {
+      minimumReleaseAgeSeconds = parseReleaseAge(args[++i]);
+    } else if (a.startsWith("--minimum-dependency-age=")) {
+      minimumReleaseAgeSeconds = parseReleaseAge(
+        a.slice("--minimum-dependency-age=".length),
+      );
     } else if (a === "--workerd-base-port" && args[i + 1]) {
       const n = parseInt(args[++i], 10);
       if (Number.isFinite(n) && n > 0) workerdBasePort = n;
@@ -628,30 +649,21 @@ function parseArgs(): CliOpts {
     }
   }
 
-  // Make derived dev state observable to other modules via env.
-  if (dev) Deno.env.set("1TUBE_DEV", "1");
+  // Make derived state observable to other modules via env (the workerd
+  // bundler builds its own compat environment from these).
+  if (dev) process.env["1TUBE_DEV"] = "1";
+  process.env["1TUBE_DEPS_DIR"] = resolve(depsDir);
 
   // Deferred boot defaults to on whenever the operator is iterating
   // (dev/HMR) — boot speed is what matters there. Prod keeps the eager
   // "everything is ready before we accept traffic" contract unless the
   // operator opts in. Workerd serves every function from one bundle
-  // generation, so deferral only applies to the Deno backend.
-  const deferBootResolved = backend === "deno" && (deferBoot ?? (dev || hmr));
+  // generation, so deferral only applies to the Bun backend.
+  const deferBootResolved = backend === "bun" && (deferBoot ?? (dev || hmr));
+  const shareDepsResolved = backend === "bun" && (shareDeps ?? (dev || hmr));
   if (deferBoot === true && backend === "workerd") {
     console.warn(
       "[1tube] --defer-boot is ignored on the workerd backend (functions boot as one bundle generation).",
-    );
-  }
-
-  // Colocated mode is a DEV accelerator: in a single isolate, shared deps
-  // compile + evaluate once instead of once per function (the dominant
-  // warm-boot cost on large projects). It trades crash/global isolation
-  // for speed, so it's the default only when iterating (dev/hmr) on the
-  // Deno backend, and never in prod or under workerd.
-  const colocateResolved = backend === "deno" && (colocate ?? (dev || hmr));
-  if (colocate === true && backend === "workerd") {
-    console.warn(
-      "[1tube] --colocate is ignored on the workerd backend (functions already share one bundle generation).",
     );
   }
 
@@ -668,15 +680,17 @@ function parseArgs(): CliOpts {
     hmr,
     lazy,
     deferBoot: deferBootResolved,
-    colocate: colocateResolved,
+    shareDeps: shareDepsResolved,
     warmupGraceMs,
     hmrFreshWaitMs,
     backend,
     workerdBin,
     workerdEnv,
     workerdShared,
-    denoWorkerConcurrency,
-    denoReloadDrainMs,
+    functionConcurrency,
+    reloadDrainMs,
+    depsDir: resolve(depsDir),
+    minimumReleaseAgeSeconds,
     workerdBasePort,
     workerdInspector,
     workerdMaxHeapMB,
@@ -721,105 +735,6 @@ const LOCAL_SUPABASE_STATUS_KEYS: Record<string, string[]> = {
   SUPABASE_SERVICE_ROLE_KEY: ["SERVICE_ROLE_KEY"],
 };
 
-function stripJsonc(text: string): string {
-  let out = "";
-  let inString = false;
-  let quote = "";
-  let escaped = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    const next = text[i + 1];
-    if (inString) {
-      out += ch;
-      if (escaped) {
-        escaped = false;
-      } else if (ch === "\\") {
-        escaped = true;
-      } else if (ch === quote) {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      inString = true;
-      quote = ch;
-      out += ch;
-      continue;
-    }
-    if (ch === "/" && next === "/") {
-      while (i < text.length && text[i] !== "\n") i++;
-      out += "\n";
-      continue;
-    }
-    if (ch === "/" && next === "*") {
-      i += 2;
-      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
-      i++;
-      continue;
-    }
-    out += ch;
-  }
-  return out.replace(/,\s*([}\]])/g, "$1");
-}
-
-async function findDenoConfigPath(
-  functionsDirAbs: string,
-): Promise<string | undefined> {
-  for (
-    const candidate of [
-      `${Deno.cwd()}/deno.json`,
-      `${Deno.cwd()}/deno.jsonc`,
-      `${functionsDirAbs}/deno.json`,
-      `${functionsDirAbs}/deno.jsonc`,
-    ]
-  ) {
-    try {
-      const stat = await Deno.stat(candidate);
-      if (stat.isFile) return candidate;
-    } catch {
-      // Try the next conventional location.
-    }
-  }
-  return undefined;
-}
-
-async function readDenoImportMap(
-  configPath: string | undefined,
-): Promise<
-  | {
-    imports?: Record<string, string>;
-    scopes?: Record<string, Record<string, string>>;
-  }
-  | undefined
-> {
-  if (!configPath) return undefined;
-  try {
-    const raw = await Deno.readTextFile(configPath);
-    const parsed = JSON.parse(stripJsonc(raw)) as {
-      imports?: Record<string, string>;
-      scopes?: Record<string, Record<string, string>>;
-    };
-    const out: {
-      imports?: Record<string, string>;
-      scopes?: Record<string, Record<string, string>>;
-    } = {};
-    if (parsed.imports && typeof parsed.imports === "object") {
-      out.imports = parsed.imports;
-    }
-    if (parsed.scopes && typeof parsed.scopes === "object") {
-      out.scopes = parsed.scopes;
-    }
-    if (out.imports || out.scopes) return out;
-  } catch (err) {
-    console.warn(
-      `[1tube] Could not read Deno import map from ${configPath}: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  }
-  return undefined;
-}
-
 // Only secrets the gateway *itself* uses on the hot path. Anything an edge
 // function happens to need (publishable/secret keys, OPENAI_API_KEY, …) is
 // the function author's contract with the host — refusing to boot because
@@ -834,20 +749,20 @@ const DEV_SUPABASE_KEYS_REQUIRED = [
 ] as const;
 
 function missingDevSupabaseKeys(): string[] {
-  return DEV_SUPABASE_KEYS_REQUIRED.filter((key) => !Deno.env.get(key));
+  return DEV_SUPABASE_KEYS_REQUIRED.filter((key) => !process.env[key]);
 }
 
 function applyStatusEnv(statusEnv: Record<string, string>): number {
   let applied = 0;
   for (const [target, sources] of Object.entries(LOCAL_SUPABASE_STATUS_KEYS)) {
-    if (Deno.env.get(target)) continue;
+    if (process.env[target]) continue;
     const value = sources
       .map((source) => statusEnv[source])
       .find((candidate) =>
         typeof candidate === "string" && candidate.length > 0
       );
     if (!value) continue;
-    Deno.env.set(target, value);
+    process.env[target] = value;
     applied++;
   }
   return applied;
@@ -867,10 +782,10 @@ function applyDevEnvAliases(): number {
     ["SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_ROLE_KEY"],
   ];
   for (const [from, to] of aliasPairs) {
-    if (Deno.env.get(to)) continue;
-    const value = Deno.env.get(from);
+    if (process.env[to]) continue;
+    const value = process.env[from];
     if (!value) continue;
-    Deno.env.set(to, value);
+    process.env[to] = value;
     applied++;
   }
   return applied;
@@ -878,11 +793,11 @@ function applyDevEnvAliases(): number {
 
 function devStatusRetryConfig(): { attempts: number; delayMs: number } {
   const attemptsRaw = parseInt(
-    Deno.env.get("1TUBE_DEV_STATUS_ATTEMPTS") || "",
+    process.env["1TUBE_DEV_STATUS_ATTEMPTS"] || "",
     10,
   );
   const delayRaw = parseInt(
-    Deno.env.get("1TUBE_DEV_STATUS_RETRY_MS") || "",
+    process.env["1TUBE_DEV_STATUS_RETRY_MS"] || "",
     10,
   );
   return {
@@ -896,7 +811,7 @@ function devStatusRetryConfig(): { attempts: number; delayMs: number } {
 async function applyDevDefaults() {
   let applied = applyDevEnvAliases();
 
-  const skipStatus = (Deno.env.get("1TUBE_DEV_SKIP_SUPABASE_STATUS") || "") ===
+  const skipStatus = (process.env["1TUBE_DEV_SKIP_SUPABASE_STATUS"] || "") ===
     "1";
   const { attempts, delayMs } = devStatusRetryConfig();
 
@@ -933,8 +848,8 @@ async function applyDevDefaults() {
   }
 
   for (const [key, value] of Object.entries(LOCAL_SUPABASE_DEFAULTS)) {
-    if (!Deno.env.get(key)) {
-      Deno.env.set(key, value);
+    if (!process.env[key]) {
+      process.env[key] = value;
       applied++;
     }
   }
@@ -952,7 +867,7 @@ async function applyDevDefaults() {
         `the missing vars in .env (SUPABASE_ANON_KEY / SUPABASE_SERVICE_ROLE_KEY, ` +
         `or VITE_SUPABASE_PUBLISHABLE_KEY + SUPABASE_SERVICE_ROLE_KEY).`,
     );
-    Deno.exit(EXIT_CODES.CONFIG);
+    process.exit(EXIT_CODES.CONFIG);
   }
 }
 
@@ -966,12 +881,12 @@ async function readLocalSupabaseStatusEnv(): Promise<Record<string, string>> {
 
   for (const runner of runners) {
     try {
-      const output = await new Deno.Command(runner.command, {
-        args: runner.args,
-        stdout: "piped",
-        stderr: "piped",
-      }).output();
-      const stdout = new TextDecoder().decode(output.stdout);
+      const proc = Bun.spawn([runner.command, ...runner.args], {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      const stdout = await new Response(proc.stdout).text();
+      await proc.exited;
       const parsed = parseSupabaseStatusEnv(stdout);
       // Accept stdout even on non-zero exit — `supabase status` often warns
       // about stopped optional services while still printing usable keys.
@@ -1016,7 +931,7 @@ function enforceProdSecrets() {
   // crash, so it's gone.
   const missing: string[] = [];
   for (const k of SECRETS_REQUIRED_IN_PROD) {
-    const v = Deno.env.get(k);
+    const v = process.env[k];
     if (!v) {
       missing.push(k);
     }
@@ -1027,7 +942,7 @@ function enforceProdSecrets() {
         `Set them in the environment, or pass --dev / 1TUBE_DEV=1 to use the ` +
         `built-in local Supabase defaults (NEVER do this in production).`,
     );
-    Deno.exit(EXIT_CODES.CONFIG);
+    process.exit(EXIT_CODES.CONFIG);
   }
 }
 
@@ -1036,7 +951,7 @@ function enforceProdSecrets() {
 // ---------------------------------------------------------------------------
 
 const opts = parseArgs();
-const internalKey = Deno.env.get("INTERNAL_KEY")?.trim() || undefined;
+const internalKey = process.env["INTERNAL_KEY"]?.trim() || undefined;
 
 function isInternalRequest(req: Request): boolean {
   if (!internalKey) return false;
@@ -1057,13 +972,12 @@ if (opts.dev) {
   enforceProdSecrets();
 }
 
-const denoVersion =
-  `${Deno.version.deno} (V8 ${Deno.version.v8}, TS ${Deno.version.typescript})`;
-const bannerText = `  1tube v${VERSION}  ·  Deno ${denoVersion}  `;
+const runtimeVersion = `${Bun.version} (${Bun.revision.slice(0, 9)})`;
+const bannerText = `  1tube v${VERSION}  ·  Bun ${runtimeVersion}  `;
 const bannerLine = "─".repeat(bannerText.length);
 console.log(`\x1b[36m┌${bannerLine}┐\x1b[0m`);
 console.log(
-  `\x1b[36m│\x1b[0m  \x1b[1m1tube\x1b[0m v${VERSION}  \x1b[2m·\x1b[0m  Deno ${denoVersion}  \x1b[36m│\x1b[0m`,
+  `\x1b[36m│\x1b[0m  \x1b[1m1tube\x1b[0m v${VERSION}  \x1b[2m·\x1b[0m  Bun ${runtimeVersion}  \x1b[36m│\x1b[0m`,
 );
 console.log(`\x1b[36m└${bannerLine}┘\x1b[0m`);
 console.log(
@@ -1077,24 +991,6 @@ console.log(
       opts.bodyReadIdleMs > 0 ? opts.bodyReadIdleMs + "ms" : "off"
     }`,
 );
-
-// A lockfile is the single biggest boot-speed lever on a large functions
-// project: without one Deno re-solves the whole npm/jsr version graph on
-// every start (a multi-second floor that the Worker herd all block on).
-// The launcher and the .NET host point `--lock` at a gateway-owned
-// `.1tube/deno.lock` and advertise it here via ONETUBE_LOCK so the choice
-// is visible. We can't read our own process's `--lock` back from Deno, so
-// when that hint is absent we can't tell a lockfile boot from a `--no-lock`
-// boot — hence only a positive confirmation is printed.
-{
-  const managedLock = Deno.env.get("ONETUBE_LOCK") ??
-    Deno.env.get("1TUBE_LOCK");
-  if (managedLock) {
-    console.log(
-      `[1tube] Lockfile: ${managedLock} (managed — deps auto-tracked, no --no-lock needed)`,
-    );
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Invocation log store (SQLite + FTS5)
@@ -1153,15 +1049,13 @@ if (opts.invocationLogs) {
 
 const registry = new FunctionRegistry();
 const supervisor = new FunctionSupervisor();
-(globalThis as any).__edgeFunctionRegistry = registry;
 
 // ---------------------------------------------------------------------------
 // Process-level error handlers
 //
-// Installed AFTER `supervisor` exists so they can attribute orphan rejections
-// to the originating function. AsyncLocalStorage context propagation through
-// unhandled rejections requires Deno 2.7+ — older runtimes will see no
-// `currentRequestStorage` value and just log the error without function tag.
+// Errors escaping function code are routed by each function's
+// `Bun.ModuleGraph` `onError` (and attributed there). These catch whatever
+// reaches the gateway itself, so a stray rejection never kills the process.
 // ---------------------------------------------------------------------------
 
 function fnNameFromAsyncContext(): string | null {
@@ -1169,33 +1063,31 @@ function fnNameFromAsyncContext(): string | null {
   return store?.functionName ?? null;
 }
 
-globalThis.addEventListener("unhandledrejection", (e) => {
-  e.preventDefault();
+process.on("unhandledRejection", (reason) => {
   const fn = fnNameFromAsyncContext();
   if (fn) {
-    console.error(`[1tube] Unhandled rejection in "${fn}":`, e.reason);
+    console.error(`[1tube] Unhandled rejection in "${fn}":`, reason);
     // Count this against the function so the breaker can trip on
     // fire-and-forget code that consistently leaks rejections.
     supervisor.record(fn, true);
   } else {
-    console.error("[1tube] Unhandled promise rejection:", e.reason);
+    console.error("[1tube] Unhandled promise rejection:", reason);
   }
 });
 
-globalThis.addEventListener("error", (e) => {
+process.on("uncaughtException", (err) => {
   const fn = fnNameFromAsyncContext();
-  const detail = (e as ErrorEvent).error ?? (e as ErrorEvent).message;
   if (fn) {
-    console.error(`[1tube] Uncaught error in "${fn}":`, detail);
+    console.error(`[1tube] Uncaught error in "${fn}":`, err);
   } else {
-    console.error("[1tube] Uncaught error:", detail);
+    console.error("[1tube] Uncaught error:", err);
   }
 });
 
-const enforceManifest = (Deno.env.get("1TUBE_ENFORCE_MANIFEST") ?? "") === "1";
-const allowAll = (Deno.env.get("1TUBE_ALLOW_ALL") ?? "") === "1";
-if (enforceManifest && !allowAll) {
-  installEnvScope();
+const enforceManifest = (process.env["1TUBE_ENFORCE_MANIFEST"] ?? "") === "1";
+const allowAll = (process.env["1TUBE_ALLOW_ALL"] ?? "") === "1";
+const enforceEnv = enforceManifest && !allowAll;
+if (enforceEnv) {
   console.log(
     "[1tube] Manifest enforcement ON: per-function env reads filtered by 1tube.json permissions.env",
   );
@@ -1213,31 +1105,31 @@ if (enforceManifest && !allowAll) {
 // watcher, and that's gated off when prebuilt is on.
 const resolvedFunctionsPath = opts.prebuiltDir ? "" : await (async () => {
   try {
-    return await Deno.realPath(opts.functionsPath);
+    return await realpath(opts.functionsPath);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
       `[1tube] FATAL: functions directory not found: ${opts.functionsPath} (${msg})`,
     );
     flushLogs();
-    Deno.exit(EXIT_CODES.CONFIG);
+    process.exit(EXIT_CODES.CONFIG);
   }
 })();
 
 // Backend selection. The workerd path runs functions inside an isolated
-// workerd subprocess. The deno path runs each function in a Web Worker
-// so HMR is a clean `worker.terminate()` + new Worker, and so functions
-// don't share an isolate (each has its own module cache and globals).
-// In both cases the gateway is a thin auth/rate-limit/proxy layer.
+// workerd subprocess. The bun path imports each function into its own
+// `Bun.ModuleGraph` so HMR is a clean graph swap + dispose, and functions
+// don't share module state or globals. In both cases the gateway is a thin
+// auth/rate-limit/proxy layer.
 let workerdBackend: WorkerdBackend | null = null;
 let workerdHotReloader: WorkerdHotReloader | null = null;
 let workerdWatchdog: WorkerdWatchdog | null = null;
 const workerdNames = new Set<string>();
-let denoWorkerHost: DenoWorkerHost | null = null;
-let denoHotReloader: DenoHotReloader | null = null;
+let functionHost: FunctionHost | null = null;
+let hotReloader: HotReloader | null = null;
 let envHotReloader: EnvHotReloader | null = null;
-let denoSharedRuntimeRef: DenoSharedRuntime | null = null;
-let denoRewriteCacheRef: RewriteCache | null = null;
+let sharedRuntimeRef: SharedRuntime | null = null;
+let sharedDepsRef: SharedDependencies | null = null;
 
 if (opts.backend === "workerd") {
   if (opts.workerdInspector) {
@@ -1295,11 +1187,10 @@ if (opts.backend === "workerd") {
   }
   workerdBackend = createWorkerdBackend({
     functionsDir: opts.functionsPath,
-    // The bundler resolves npm: / jsr: / https: specifiers via Deno's
-    // own loader, so it needs the project's deno.json to find the
-    // import map and lockfile. Look for one alongside cwd; tests
-    // override via the configPath option directly.
-    configPath: `${Deno.cwd()}/deno.json`,
+    // The bundler resolves npm: / jsr: / https: specifiers through the
+    // Deno-compat layer; a deno.json alongside cwd supplies the import
+    // map. Tests override via the configPath option directly.
+    configPath: join(process.cwd(), "deno.json"),
     workerdBin: opts.workerdBin,
     envAllowlist: opts.workerdEnv,
     sharedModulePaths: opts.workerdShared,
@@ -1335,11 +1226,7 @@ if (opts.backend === "workerd") {
           });
         }
         // Keep the developer-facing console behaviour too.
-        try {
-          Deno.stderr.writeSync(
-            new TextEncoder().encode(`[workerd] ${marked.msg}\n`),
-          );
-        } catch { /* */ }
+        writeStderrLine(`[workerd] ${marked.msg}`);
         return;
       }
       if (logWriter) {
@@ -1354,9 +1241,7 @@ if (opts.backend === "workerd") {
       }
       // Surface workerd's own logs through stderr with a tag so they
       // interleave with [1tube] output cleanly.
-      try {
-        Deno.stderr.writeSync(new TextEncoder().encode(`[workerd] ${line}\n`));
-      } catch { /* */ }
+      writeStderrLine(`[workerd] ${line}`);
     },
     onUnexpectedExit: ({ crashCount, expectedRetry }) => {
       if (!expectedRetry) {
@@ -1392,7 +1277,7 @@ if (opts.backend === "workerd") {
   } catch (err) {
     console.error("[1tube] FATAL: workerd backend failed during startup:", err);
     flushLogs();
-    Deno.exit(EXIT_CODES.CONFIG);
+    process.exit(EXIT_CODES.CONFIG);
   }
   for (const n of workerdBackend.functionNames) workerdNames.add(n);
   // Bridge workerd manifests into the in-process registry + supervisor.
@@ -1424,7 +1309,7 @@ if (opts.backend === "workerd") {
   // watchdog stays off — silently, so existing deployments aren't
   // surprised by sudden recycle behaviour.
   const explicitCap = parseInt(
-    Deno.env.get("1TUBE_WORKERD_MAX_RSS_MB") || "",
+    process.env["1TUBE_WORKERD_MAX_RSS_MB"] || "",
     10,
   );
   const explicitBudget = Number.isFinite(explicitCap) && explicitCap > 0
@@ -1442,7 +1327,7 @@ if (opts.backend === "workerd") {
   const budget = explicitBudget ?? recommended;
   if (budget !== null) {
     const intervalMs = parseInt(
-      Deno.env.get("1TUBE_WORKERD_RSS_INTERVAL_MS") || "",
+      process.env["1TUBE_WORKERD_RSS_INTERVAL_MS"] || "",
       10,
     );
     workerdWatchdog = createWorkerdWatchdog({
@@ -1486,63 +1371,108 @@ if (opts.backend === "workerd") {
     }
   }
 } else {
-  // Deno backend: each function runs in its own Web Worker so HMR is
-  // a clean `worker.terminate()` + new Worker (fresh module cache for
-  // the entire dep graph). The dep-graph keeps the affected-set
-  // precise — touching a file under `_shared/` only restarts the
-  // workers that actually transitively import it.
+  // Bun backend: each function is imported into its own Bun.ModuleGraph, so
+  // HMR is a graph swap (fresh module state for the whole import tree) and
+  // functions never share module state. The dep-graph keeps the affected
+  // set precise — touching a file under `_shared/` only reloads the
+  // functions that transitively import it.
   if (opts.lazy) {
     console.warn(
-      "[1tube] --lazy is ignored on the Deno backend (Workers are spawned eagerly at boot).",
+      "[1tube] --lazy is ignored on the Bun backend (use --defer-boot for background boot).",
     );
   }
   console.log(`[1tube] Loading functions from: ${opts.functionsPath}`);
-  // Pull the deno.json import map (if any) so the dep-graph can resolve bare
-  // specifiers to their actual file URLs. Supabase projects commonly keep this
-  // file under `supabase/functions`, not the repo root; Deno's Worker runtime
-  // sees it when the user starts 1tube with `--config`, so our HMR graph needs
-  // to discover the same conventional location.
-  const denoConfigPath = await findDenoConfigPath(resolvedFunctionsPath);
-  const importMap = await readDenoImportMap(denoConfigPath);
-  const denoImportMapOptions = denoConfigPath && importMap
-    ? {
-      importMap: importMap.imports,
-      importMapScopes: importMap.scopes,
-      importMapBase: denoConfigPath,
-    }
-    : undefined;
 
-  // Shared modules (Supabase _shared/profile-cache.ts convention +
-  // any explicit --workerd-shared paths) are evaluated ONCE here in
-  // the gateway main isolate. Function Workers receive auto-generated
-  // RPC stubs in place of the real source via the source rewriter,
-  // so a top-level `subscribeToProfileChanges()` runs once total
-  // instead of once per Worker.
-  // Colocated mode hosts every function in one isolate, so a shared
-  // module is imported exactly once there naturally — the gateway-side
-  // "load once + RPC stub" machinery (and the source rewriter it needs)
-  // is redundant and is skipped entirely.
-  const discoveredShared = opts.colocate ? [] : await discoverSharedModules(
+  const recordFunctionConsole = (event: FunctionConsoleEvent) => {
+    if (!logWriter || !opts.logConsoleCapture) return;
+    logWriter.recordLog({
+      invocationId: event.invocationId,
+      tsMs: event.tsMs,
+      level: event.level,
+      functionName: event.functionName,
+      source: event.invocationId ? "function" : "boot",
+      message: event.message,
+    });
+  };
+
+  // Deno compatibility: npm:/jsr:/https: specifiers and the project's
+  // deno.json import map. Supabase projects commonly keep deno.json under
+  // `supabase/functions`, not the repo root, so both locations are checked.
+  const { deps, remote, importMap } = createCompatEnvironment({
+    functionsDir: resolvedFunctionsPath,
+    depsDir: opts.depsDir,
+    minimumReleaseAgeSeconds: opts.minimumReleaseAgeSeconds,
+  });
+  if (importMap) {
+    console.log(`[1tube] Import map: ${importMap.base}`);
+  }
+  // Per-function env scoping can't hold if a package instance is shared
+  // (it would read the real process env), so enforcement wins.
+  if (opts.shareDeps && !enforceEnv) {
+    sharedDepsRef = createSharedDependencies({
+      // Shared code runs on behalf of whichever function called into it.
+      globals: {
+        __edgeFunctionRegistry: sharedCodeHooks,
+        ...(logWriter && opts.logConsoleCapture
+          ? { console: createAttributedConsole(recordFunctionConsole) }
+          : {}),
+      },
+      onServe: (handler) => sharedCodeHooks.serve(handler),
+      onWaitUntil: (p) => sharedCodeHooks.waitUntil(p),
+      onError: (err, kind) => {
+        const inv = currentInvocation();
+        if (inv) supervisor.record(inv.functionName, true);
+        console.error(
+          `[1tube] ${kind === "unhandledRejection" ? "Unhandled rejection" : "Uncaught error"} in shared code${
+            inv ? ` (via "${inv.functionName}")` : ""
+          }:`,
+          err,
+        );
+      },
+    });
+    console.log(
+      "[1tube] Shared dependencies: ON (packages + shared code evaluate once for all functions; --isolate-deps to turn off)",
+    );
+  } else if (opts.shareDeps) {
+    console.log("[1tube] Shared dependencies: OFF (manifest env enforcement is on)");
+  }
+  configureCompat({
+    deps,
+    remote,
+    importMap,
+    sharedDeps: sharedDepsRef,
+    functionsDir: resolvedFunctionsPath,
+    functionRoots: [
+      resolvedFunctionsPath,
+      ...(importMap ? [dirname(importMap.base)] : []),
+    ],
+  });
+
+  // Shared modules (Supabase _shared/profile-cache.ts convention + any
+  // explicit --workerd-shared paths) are evaluated ONCE in the gateway;
+  // every function importing one gets the same live exports.
+  const discoveredShared = await discoverSharedModules(
     resolvedFunctionsPath,
     opts.workerdShared ?? [],
   );
-  let denoSharedRuntime: DenoSharedRuntime | undefined;
-  let denoRewriteCache: RewriteCache | undefined;
+  let sharedRuntime: SharedRuntime | undefined;
   if (discoveredShared.length > 0) {
-    denoSharedRuntime = await createDenoSharedRuntime(discoveredShared);
-    const cacheDir = await Deno.makeTempDir({ prefix: "1tube-deno-shared-" });
-    denoRewriteCache = createRewriteCache({
-      cacheDir,
-      sharedRuntime: denoSharedRuntime,
-      ...(denoImportMapOptions ?? {}),
-    });
-    denoSharedRuntimeRef = denoSharedRuntime;
-    denoRewriteCacheRef = denoRewriteCache;
-    console.log(
-      `[1tube] Shared module(s) loaded once in gateway: ${
-        discoveredShared.map((m) => m.id).join(", ")
-      }`,
-    );
+    try {
+      sharedRuntime = await createSharedRuntime(discoveredShared);
+      sharedRuntimeRef = sharedRuntime;
+      configureCompat({ shared: sharedRuntime });
+      console.log(
+        `[1tube] Shared module(s) loaded once in gateway: ${
+          discoveredShared.map((m) => m.id).join(", ")
+        }`,
+      );
+    } catch (err) {
+      console.error(
+        `[1tube] Shared module(s) failed to load — functions will import them directly: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
   // MRU warm-up seed: the invocation log store remembers which
@@ -1557,77 +1487,56 @@ if (opts.backend === "workerd") {
     }
   }
 
-  denoWorkerHost = createDenoWorkerHost({
+  functionHost = createFunctionHost({
     functionsDir: resolvedFunctionsPath,
     registry,
     supervisor,
+    deps,
+    importMap,
+    enforceEnv,
+    // Graphs only get replaced under HMR; that's when open streams need
+    // to keep a superseded graph alive.
+    trackStreams: opts.hmr,
     captureConsole: opts.logConsoleCapture && logWriter !== null,
-    onConsole: (event) => {
-      if (!logWriter || !opts.logConsoleCapture) return;
-      logWriter.recordLog({
-        invocationId: event.invocationId,
-        tsMs: event.tsMs,
-        level: event.level,
-        functionName: event.functionName,
-        source: event.invocationId ? "function" : "boot",
-        message: event.message,
-      });
-    },
-    ...(opts.denoWorkerConcurrency
-      ? { concurrency: opts.denoWorkerConcurrency }
-      : {}),
-    ...(opts.denoReloadDrainMs !== undefined
-      ? { reloadDrainMs: opts.denoReloadDrainMs }
-      : {}),
-    ...(opts.colocate ? { colocate: true } : {}),
-    ...(denoImportMapOptions ?? {}),
-    ...(denoSharedRuntime ? { sharedRuntime: denoSharedRuntime } : {}),
-    ...(denoRewriteCache ? { rewriteCache: denoRewriteCache } : {}),
-    ...(bootRecency && bootRecency.size > 0
-      ? { initialRecency: bootRecency }
-      : {}),
+    onConsole: recordFunctionConsole,
+    ...(opts.functionConcurrency ? { concurrency: opts.functionConcurrency } : {}),
+    ...(opts.reloadDrainMs !== undefined ? { reloadDrainMs: opts.reloadDrainMs } : {}),
+    ...(sharedRuntime ? { sharedRuntime } : {}),
+    ...(bootRecency && bootRecency.size > 0 ? { initialRecency: bootRecency } : {}),
   });
 
-  // Boot progress: append-only `[i/N] ✓ name (123ms)` per worker plus
+  // Boot progress: append-only `[i/N] ✓ name (123ms)` per function plus
   // a heartbeat every 2s so a project with many functions / a slow
-  // import shows progress instead of looking hung. Suppressed for
-  // small projects (≤2 functions) where the per-completion line is
-  // already enough signal.
+  // import shows progress instead of looking hung.
   const bootStart = performance.now();
-  const progress = createBootProgress(Deno.stdout, { pulseMs: 2000 });
-  // Live in-place "scanning" line for the pre-spawn phase (directory
-  // discovery + batch dep-graph). Safe to redraw in place here because no
-  // function module has been imported yet, so nothing else is writing to
-  // the TTY. Cleared the instant the first worker spawn line prints.
-  const scanProgress = createScanProgress(Deno.stdout);
-  const bootProfile = Deno.env.get("1TUBE_BOOT_PROFILE") === "1" ||
-    Deno.env.get("1TUBE_BOOT_PROFILE")?.toLowerCase() === "true";
+  const progress = createBootProgress(undefined, { pulseMs: 2000 });
+  // Live in-place "scanning" line for the pre-import phase (directory
+  // discovery, dep-graph, dependency install). Safe to redraw in place
+  // because no function module has been imported yet.
+  const scanProgress = createScanProgress();
+  const bootProfile = process.env["1TUBE_BOOT_PROFILE"] === "1" ||
+    process.env["1TUBE_BOOT_PROFILE"]?.toLowerCase() === "true";
   let started = false;
   const padTo = (n: number, width: number) => String(n).padStart(width, " ");
-  // Workers spawn in parallel, so `p.index` (assigned at spawn-start
-  // time) doesn't match the order in which finish lines are printed
-  // — the result reads as a jumbled `[8/53] ... [4/53] ... [7/53]`.
-  // Track a separate "print order" counter so the output reads
-  // monotonically. We still get the correct total + per-fn name +
-  // duration; the only thing that changes is the column we display.
+  // Imports run concurrently, so `p.index` (assigned at start) doesn't
+  // match completion order; number lines by print order instead.
   let printOrder = 0;
   const startCallbacks = {
-    onScanProgress: (p: { found: number; phase: "scan" | "graph" }) => {
+    onScanProgress: (p: { found: number; phase: "scan" | "graph" | "install" }) => {
       scanProgress.setPhase(p.phase);
       scanProgress.setFound(p.found);
     },
-    onBatchGraph: (p: { total: number; durationMs: number }) => {
+    onBatchGraph: (p: { total: number; durationMs: number; installMs: number }) => {
       if (bootProfile) {
         console.log(
-          `[1tube] boot profile: dep graph for ${p.total} function(s) in ${
+          `[1tube] boot profile: dep graph + install for ${p.total} function(s) in ${
             p.durationMs.toFixed(0)
-          }ms`,
+          }ms (install ${p.installMs.toFixed(0)}ms)`,
         );
       }
     },
     onSpawnStart: (p: { index: number; total: number; name: string }) => {
-      // Clear the scanning line before the first append-only spawn line
-      // lands, so the two never collide on the same TTY row.
+      // Clear the scanning line before the first append-only line lands.
       scanProgress.stop();
       if (!started) {
         progress.start(p.total);
@@ -1640,9 +1549,9 @@ if (opts.backend === "workerd") {
       const status = p.ok ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
       const tail = p.ok ? "" : ` — ${p.error ?? "error"}`;
       const profile = bootProfile
-        ? ` graph=${p.graphMs.toFixed(0)}ms rewrite=${
-          p.rewriteMs.toFixed(0)
-        }ms worker=${p.workerMs.toFixed(0)}ms`
+        ? ` graph=${p.graphMs.toFixed(0)}ms install=${
+          p.installMs.toFixed(0)
+        }ms import=${p.importMs.toFixed(0)}ms`
         : "";
       const idx = ++printOrder;
       progress.onFinish(
@@ -1674,14 +1583,10 @@ if (opts.backend === "workerd") {
 
   scanProgress.start();
   if (opts.deferBoot) {
-    // Deferred boot: the gateway starts serving right away; Workers spawn
-    // in the background. A request for a not-yet-ready function bumps it
-    // to the front of the queue (see the dispatcher's warming path).
-    const { discovered, done } = await denoWorkerHost.startDeferred(
-      startCallbacks,
-    );
-    // Scan is done by the time startDeferred resolves (spawns continue in
-    // the background); clear the line before the deferred-boot message.
+    // Deferred boot: the gateway starts serving right away; functions
+    // import in the background. A request for a not-yet-ready function
+    // bumps it to the front of the queue (see the dispatcher's warming path).
+    const { discovered, done } = await functionHost.startDeferred(startCallbacks);
     scanProgress.stop();
     console.log(
       `[1tube] Deferred boot: ${discovered.length} function(s) warming in ` +
@@ -1693,20 +1598,19 @@ if (opts.backend === "workerd") {
       logBootSummary(loaded, errors, "Warmed");
     });
   } else {
-    const { loaded, errors } = await denoWorkerHost.start(startCallbacks);
+    const { loaded, errors } = await functionHost.start(startCallbacks);
     scanProgress.stop();
     progress.stop();
     logBootSummary(loaded, errors, "Loaded");
   }
 
   if (opts.hmr) {
-    denoHotReloader = createDenoHotReloader({
-      host: denoWorkerHost,
+    hotReloader = createHotReloader({
+      host: functionHost,
       functionsDir: resolvedFunctionsPath,
-      ...(denoSharedRuntime ? { sharedRuntime: denoSharedRuntime } : {}),
-      ...(denoRewriteCache ? { rewriteCache: denoRewriteCache } : {}),
+      ...(sharedRuntime ? { sharedRuntime } : {}),
     });
-    await denoHotReloader.start();
+    await hotReloader.start();
   } else {
     console.log(
       "[1tube] HMR disabled (set 1TUBE_HMR=1 or pass --hmr to enable)",
@@ -1714,10 +1618,10 @@ if (opts.backend === "workerd") {
   }
 }
 
-// Env-file HMR: Deno's `--env-file` only loads at process start, and
-// the functions-dir watcher never sees project-root `.env` saves.
+// Env-file HMR: `--env-file` only loads at process start, and the
+// functions-dir watcher never sees project-root `.env` saves.
 // Watch the same files the launcher forwarded (via 1TUBE_ENV_FILES)
-// or the conventional `.env*` in cwd, re-apply into Deno.env, and
+// or the conventional `.env*` in cwd, re-apply into process.env, and
 // respawn every function so secret rotations land immediately.
 if (opts.hmr && !opts.prebuiltDir) {
   const envFiles = resolveWatchedEnvFiles();
@@ -1733,8 +1637,8 @@ if (opts.hmr && !opts.prebuiltDir) {
           );
           return;
         }
-        if (denoWorkerHost) {
-          const summary = await denoWorkerHost.reload(
+        if (functionHost) {
+          const summary = await functionHost.reload(
             "all",
             "env file changed",
           );
@@ -1769,7 +1673,7 @@ const app = new Hono<{ Variables: GatewayVariables }>();
 // Operators tuning the global default for prod use `1TUBE_DEFAULT_RPM`;
 // load-testers needing zero limits use `1TUBE_DISABLE_RATE_LIMIT=1`,
 // honoured inside the limiter factory itself.
-const defaultRpmEnv = parseInt(Deno.env.get("1TUBE_DEFAULT_RPM") || "", 10);
+const defaultRpmEnv = parseInt(process.env["1TUBE_DEFAULT_RPM"] || "", 10);
 const rpmOverride = Number.isFinite(defaultRpmEnv) && defaultRpmEnv > 0
   ? defaultRpmEnv
   : null;
@@ -1803,7 +1707,7 @@ if (opts.routePrefix !== "/functions/v1") {
 //   6. Rate limiter (now sees a real userId for per-user keying)
 app.use(fnRouteWildcard, corsMiddleware);
 // Backend-aware function-existence probe. On the workerd backend the
-// bundled-set captured at boot is the source; on the deno backend the
+// bundled-set captured at boot is the source; on the bun backend the
 // registry's worker-handle map is. Both expose the same Map-lookup-cost
 // contract.
 const functionExists = (name: string): boolean =>
@@ -1902,7 +1806,7 @@ const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "[::1]", "localhost"]);
 const LOCAL_HOST_SUFFIXES = [".localhost", ".local", ".test", ".internal"];
 
 function parseExtraExposeHosts(): string[] {
-  const raw = Deno.env.get("1TUBE_EXPOSE_ERROR_HOSTS") ?? "";
+  const raw = process.env["1TUBE_EXPOSE_ERROR_HOSTS"] ?? "";
   return raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 }
 const extraExposeHosts = parseExtraExposeHosts();
@@ -1935,7 +1839,7 @@ function shouldExposeErrorDetails(
   c: { req: { header: (n: string) => string | undefined } },
 ): boolean {
   // Operator override wins both ways.
-  const override = Deno.env.get("1TUBE_EXPOSE_ERRORS");
+  const override = process.env["1TUBE_EXPOSE_ERRORS"];
   if (override === "1" || override === "true") return true;
   if (override === "0" || override === "false") return false;
   if (!opts.dev) return false;
@@ -1966,7 +1870,7 @@ app.all(routeDispatchPattern(), async (c) => {
   // probe, body limit, rate limit, body-watchdog) is applied above —
   // here we translate the validated request into a proxy call to the
   // right workerd service, and gate it through the same circuit-
-  // breaker the Deno path uses. Per-function timeouts come from the
+  // breaker the Bun path uses. Per-function timeouts come from the
   // manifest (loaded at workerd boot and registered with `registry`
   // + `supervisor`); request bodies still pass through the body-read
   // watchdog so a slow client can't pin a workerd-backed slot.
@@ -1975,7 +1879,7 @@ app.all(routeDispatchPattern(), async (c) => {
 
     // Gate on the supervisor BEFORE forwarding so an open breaker
     // fails fast — never wakes the workerd subprocess for a request
-    // we'd reject anyway. This mirrors the Deno path exactly.
+    // we'd reject anyway. This mirrors the Bun path exactly.
     const decision = supervisor.admit(name);
     if (!decision.ok) {
       const headers: Record<string, string> = {};
@@ -2002,7 +1906,7 @@ app.all(routeDispatchPattern(), async (c) => {
         );
       }).body
       : null;
-    // Mirror the Deno-path URL rewrite: user code expects to see the
+    // Mirror the Bun-path URL rewrite: user code expects to see the
     // pathname without the gateway route prefix, matching Supabase
     // Edge Runtime behaviour. Without this strip, hello/echo see the
     // gateway prefix in their `new URL(req.url).pathname`.
@@ -2025,7 +1929,7 @@ app.all(routeDispatchPattern(), async (c) => {
       headers: proxyHeaders,
       body: wrappedBody,
       signal: abort.signal,
-      // @ts-ignore -- Deno supports duplex on Request
+      // @ts-ignore -- duplex is required for streaming request bodies
       duplex: "half",
     });
     const auth = (c as any).get("__authContext") ?? null;
@@ -2040,7 +1944,7 @@ app.all(routeDispatchPattern(), async (c) => {
     }
 
     // Per-function timeout from the manifest, falling back to the
-    // gateway-wide default. Same precedence the Deno path uses.
+    // gateway-wide default. Same precedence the Bun path uses.
     const timeoutMs = wdManifest?.timeoutMs ?? opts.defaultTimeoutMs;
     const timer = timeoutMs > 0
       ? setTimeout(
@@ -2119,32 +2023,31 @@ app.all(routeDispatchPattern(), async (c) => {
     return response;
   }
 
-  // Deno backend dispatch path: forward the request to the function's
-  // Worker over postMessage. Each function lives in its own Worker so
-  // there's no in-process handler to invoke; HMR works by terminating
-  // the worker (clean module cache) and spawning a fresh one.
+  // Bun backend dispatch path: call the function's handler inside its
+  // module graph. HMR swaps the handle for one backed by a fresh graph,
+  // so a request always reaches whichever graph is live.
   let handle = registry.workerHandle(name);
-  if (!handle && denoWorkerHost) {
-    // Deferred boot: the function is known but its Worker isn't up yet.
+  if (!handle && functionHost) {
+    // Deferred boot: the function is known but its graph isn't up yet.
     // Bump it to the front of the boot queue, give it a short grace
     // window (fast spawns never surface the overlay), then tell the
     // frontend the backend is warming up. The 503 carries
     // `X-1tube-Warming: 1` + Retry-After so clients can distinguish
     // warm-up from real latency, show an overlay, and retry.
-    const bootState = denoWorkerHost.bootState(name);
+    const bootState = functionHost.bootState(name);
     if (bootState === "queued" || bootState === "loading") {
-      denoWorkerHost.prioritize(name);
-      const outcome = await denoWorkerHost.whenReady(name, opts.warmupGraceMs);
+      functionHost.prioritize(name);
+      const outcome = await functionHost.whenReady(name, opts.warmupGraceMs);
       if (outcome === "ready") {
         handle = registry.workerHandle(name);
       } else if (outcome === "timeout") {
-        const status = denoWorkerHost.bootStatus();
+        const status = functionHost.bootStatus();
         return c.json(
           {
             error: "Backend is warming up",
             reason: "function_warming",
             function: name,
-            state: denoWorkerHost.bootState(name) ?? "loading",
+            state: functionHost.bootState(name) ?? "loading",
             warmup: {
               total: status.total,
               ready: status.ready.length,
@@ -2159,11 +2062,11 @@ app.all(routeDispatchPattern(), async (c) => {
       }
       // "failed"/"unknown" fall through to the checks below.
     }
-    if (!handle && denoWorkerHost.bootState(name) === "failed") {
-      const status = denoWorkerHost.bootStatus();
+    if (!handle && functionHost.bootState(name) === "failed") {
+      const status = functionHost.bootStatus();
       const failure = status.failed.find((f) => f.name === name);
       console.error(
-        `[1tube] Request for "${name}" but its worker failed to boot: ${
+        `[1tube] Request for "${name}" but it failed to boot: ${
           failure?.error ?? "unknown error"
         }`,
       );
@@ -2185,19 +2088,19 @@ app.all(routeDispatchPattern(), async (c) => {
   }
 
   // HMR freshness: a live handle whose boot state is queued/loading means
-  // an HMR respawn for this function is pending or in flight — the
-  // current worker runs pre-edit code. Bump the respawn to the front and
+  // an HMR reload for this function is pending or in flight — the
+  // current graph runs pre-edit code. Bump the reload to the front and
   // wait briefly so a save → refresh cycle returns the NEW code (the
   // Vite model: the request stalls until the rebuild lands). On timeout
-  // or respawn failure we fall back to the previous worker and mark the
+  // or reload failure we fall back to the previous graph and mark the
   // response with `X-1tube-Stale: 1`.
   let staleServe = false;
-  if (denoWorkerHost) {
-    const bootState = denoWorkerHost.bootState(name);
+  if (functionHost) {
+    const bootState = functionHost.bootState(name);
     if (bootState === "queued" || bootState === "loading") {
-      denoWorkerHost.prioritize(name);
+      functionHost.prioritize(name);
       const outcome = opts.hmrFreshWaitMs > 0
-        ? await denoWorkerHost.whenReady(name, opts.hmrFreshWaitMs)
+        ? await functionHost.whenReady(name, opts.hmrFreshWaitMs)
         : "timeout";
       if (outcome === "ready") {
         handle = registry.workerHandle(name) ?? handle;
@@ -2256,7 +2159,7 @@ app.all(routeDispatchPattern(), async (c) => {
     headers: c.req.raw.headers,
     body: wrappedBody,
     signal: abort.signal,
-    // @ts-ignore -- Deno supports duplex on Request
+    // @ts-ignore -- duplex is required for streaming request bodies
     duplex: "half",
   });
 
@@ -2360,10 +2263,10 @@ app.all(routeDispatchPattern(), async (c) => {
 // fast-fail middleware already distinguishes via 404 vs 401.
 app.use("/1tube/warmup", corsMiddleware);
 app.get("/1tube/warmup", (c) => {
-  if (opts.backend === "deno" && denoWorkerHost) {
-    const s = denoWorkerHost.bootStatus();
+  if (opts.backend === "bun" && functionHost) {
+    const s = functionHost.bootStatus();
     return c.json({
-      backend: "deno",
+      backend: "bun",
       ready: s.loading.length === 0 && s.queued.length === 0,
       total: s.total,
       loaded: s.ready.length,
@@ -2555,57 +2458,47 @@ app.get("/", (c) => c.json({ status: "ok" }));
 // Serve + graceful shutdown
 // ---------------------------------------------------------------------------
 
-console.log(`[1tube] Starting on http://${opts.host}:${opts.port}`);
-if (opts.host === "127.0.0.1" || opts.host === "localhost") {
-  console.log(
-    "[1tube] Bound to loopback only. Pass --host 0.0.0.0 (or 1TUBE_HOST=0.0.0.0) to expose externally.",
+function serverErrorResponse(err: unknown): Response {
+  console.error(`[1tube] Request error: ${err}`);
+  // No request context here, so fall back to bind-address + extras.
+  const override = process.env["1TUBE_EXPOSE_ERRORS"];
+  const expose = override === "1" || override === "true"
+    ? true
+    : override === "0" || override === "false"
+    ? false
+    : opts.dev && isLocalHostname(opts.host);
+  if (!expose) return new Response("Internal error", { status: 500 });
+  const e = err instanceof Error ? err : new Error(String(err));
+  return Response.json(
+    { error: "Internal error", message: e.message, stack: e.stack, name: e.name },
+    { status: 500 },
   );
 }
 
-const serverAbort = new AbortController();
-const server = Deno.serve(
-  {
+let server: Bun.Server<undefined>;
+try {
+  server = Bun.serve({
     port: opts.port,
     hostname: opts.host,
-    signal: serverAbort.signal,
-    onListen: () => {
-      // Suppress Deno's default "Listening on ..." line; we already
-      // emitted one above. Keeping the default ALSO leaks a duplicate
-      // URL and makes it harder for tooling that scrapes the prefix.
-    },
-    onError: (err) => {
-      console.error(`[1tube] Request error: ${err}`);
-      // No request context here, so fall back to bind-address + extras.
-      const override = Deno.env.get("1TUBE_EXPOSE_ERRORS");
-      const expose = override === "1" || override === "true"
-        ? true
-        : override === "0" || override === "false"
-        ? false
-        : opts.dev && isLocalHostname(opts.host);
-      if (!expose) return new Response("Internal error", { status: 500 });
-      const e = err instanceof Error ? err : new Error(String(err));
-      return Response.json(
-        { error: "Internal error", message: e.message, stack: e.stack, name: e.name },
-        { status: 500 },
-      );
-    },
-  },
-  app.fetch,
-);
-// `Deno.serve` does most of its bind work asynchronously; if the port
-// is already taken (the typical "previous gateway didn't release the
-// port" case after Ctrl-C + immediate restart) the error surfaces on
-// `server.finished`, NOT on the call above. Without this catch the
-// runtime prints "Unhandled promise rejection" with a giant stack
-// trace, which is both ugly and obscures the actionable advice. We
-// translate to a one-line message + exit code 1, mirroring the way
-// `npm start` etc. typically behave.
-server.finished.catch((err: unknown) => {
-  if (shuttingDown) return;
+    // Function timeouts and the body-read watchdog own request lifetimes;
+    // Bun's default 10s idle timeout would cut long-polling / quiet
+    // streaming responses well before `defaultTimeoutMs`.
+    idleTimeout: 0,
+    // The bodyLimit middleware answers oversize uploads with a JSON 413;
+    // keep Bun's own hard cap above it so that path is reachable.
+    maxRequestBodySize: Math.max(opts.bodyLimitBytes * 2, 128 * 1024 * 1024),
+    development: false,
+    fetch: app.fetch,
+    error: serverErrorResponse,
+  });
+} catch (err) {
+  // A taken port (typically: the previous gateway hasn't released it yet
+  // after Ctrl-C + immediate restart) throws synchronously here. Translate
+  // to a one-line message instead of a stack trace.
   const msg = err instanceof Error ? err.message : String(err);
   if (
-    err instanceof Deno.errors.AddrInUse ||
-    /address already in use|EADDRINUSE|os error 10048/i.test(msg)
+    (err as { code?: string })?.code === "EADDRINUSE" ||
+    /address already in use|EADDRINUSE|in use/i.test(msg)
   ) {
     console.error(
       `[1tube] Port ${opts.port} is already in use on ${opts.host}.`,
@@ -2618,13 +2511,21 @@ server.finished.catch((err: unknown) => {
   } else {
     console.error(`[1tube] HTTP server failed: ${msg}`);
   }
-  // Best-effort drain of in-process resources so subscriptions /
-  // workers / temp dirs don't outlive the gateway.
+  // Best-effort teardown of in-process resources so subscriptions and
+  // module graphs don't outlive the gateway, but exit promptly regardless.
   shutdown("server-error").catch(() => {});
-  // shutdown() awaits Workers; we want to exit promptly even if a
-  // Worker hangs, so race with a short timeout.
-  setTimeout(() => Deno.exit(1), 500);
-});
+  setTimeout(() => process.exit(1), 500);
+  await new Promise(() => {});
+  throw err;
+}
+
+// Report the bound port (differs from opts.port for `--port 0`).
+console.log(`[1tube] Starting on http://${opts.host}:${server.port}`);
+if (opts.host === "127.0.0.1" || opts.host === "localhost") {
+  console.log(
+    "[1tube] Bound to loopback only. Pass --host 0.0.0.0 (or 1TUBE_HOST=0.0.0.0) to expose externally.",
+  );
+}
 
 let shuttingDown = false;
 async function shutdown(reason: string) {
@@ -2648,9 +2549,9 @@ async function shutdown(reason: string) {
       console.warn("[1tube] workerd hot reloader stop() error:", err);
     });
   }
-  if (denoHotReloader) {
-    denoHotReloader.stop().catch((err) => {
-      console.warn("[1tube] deno hot reloader stop() error:", err);
+  if (hotReloader) {
+    hotReloader.stop().catch((err) => {
+      console.warn("[1tube] hot reloader stop() error:", err);
     });
   }
   if (envHotReloader) {
@@ -2659,10 +2560,10 @@ async function shutdown(reason: string) {
     });
   }
 
-  // Phase 1: stop accepting NEW connections. Already-accepted
-  // requests keep running against the still-live workerd. This is
-  // the call that lets `server.finished` eventually resolve.
-  serverAbort.abort();
+  // Phase 1: stop accepting NEW connections. Already-accepted requests
+  // keep running against the still-live backend; the returned promise
+  // resolves once they have all completed.
+  const finished = server ? server.stop(false) : Promise.resolve();
 
   // Phase 2: wait for the gateway's in-flight requests to drain.
   // Critically, we await BEFORE tearing down workerd — the previous
@@ -2671,7 +2572,7 @@ async function shutdown(reason: string) {
   // forwarding through it (502s on the way out).
   const drainStart = performance.now();
   const drained = await Promise.race([
-    server.finished.then(() => "drained" as const),
+    finished.then(() => "drained" as const),
     new Promise<"timeout">((resolve) =>
       setTimeout(() => resolve("timeout"), remaining())
     ),
@@ -2680,13 +2581,13 @@ async function shutdown(reason: string) {
   if (drained === "timeout") {
     console.warn(
       `[1tube] Gateway drain grace expired after ${drainMs.toFixed(0)}ms; ` +
-        `forcing workerd teardown — some in-flight requests may have been dropped.`,
+        `forcing ${opts.backend} backend teardown — some in-flight requests may have been dropped.`,
     );
   } else {
     console.log(
       `[1tube] Gateway drained ${
         drainMs.toFixed(0)
-      }ms; tearing down workerd...`,
+      }ms; tearing down ${opts.backend} backend...`,
     );
   }
 
@@ -2718,22 +2619,19 @@ async function shutdown(reason: string) {
     }
   }
 
-  // Phase 3 (deno): terminate every per-function Worker. Bounded by
-  // whatever shutdown grace remains; teardown is fast (just SIGKILL
-  // equivalents in V8 isolate-land) so we don't bother racing it.
-  if (denoWorkerHost) {
-    await denoWorkerHost.stop().catch((err) => {
-      console.warn("[1tube] deno worker host stop() error:", err);
+  // Phase 3 (bun): dispose every function's module graph (cancels their
+  // timers and I/O). Fast, so it isn't raced against the grace window.
+  if (functionHost) {
+    await functionHost.stop().catch((err) => {
+      console.warn("[1tube] function host stop() error:", err);
     });
   }
-  if (denoSharedRuntimeRef) {
-    await denoSharedRuntimeRef.stop().catch((err) => {
-      console.warn("[1tube] deno shared runtime stop() error:", err);
+  if (sharedRuntimeRef) {
+    await sharedRuntimeRef.stop().catch((err) => {
+      console.warn("[1tube] shared runtime stop() error:", err);
     });
   }
-  if (denoRewriteCacheRef) {
-    await denoRewriteCacheRef.stop().catch(() => {});
-  }
+  sharedDepsRef?.dispose();
 
   // Persist anything still queued in the invocation log store, then
   // close it so the WAL is checkpointed and external readers see a
@@ -2744,13 +2642,9 @@ async function shutdown(reason: string) {
   flushLogs();
   console.log("[1tube] Drain complete; exiting.");
   flushLogs();
-  Deno.exit(0);
+  process.exit(0);
 }
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
-  try {
-    Deno.addSignalListener(sig, () => shutdown(sig));
-  } catch {
-    // SIGTERM not supported on Windows; ignore.
-  }
+  process.on(sig, () => void shutdown(sig));
 }

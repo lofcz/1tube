@@ -8,7 +8,7 @@
     <PackageId>OneTube</PackageId>
     <Version>0.3.20</Version>
     <Authors>OneTube contributors</Authors>
-    <Description>Host Supabase-compatible edge functions inside ASP.NET with zero-copy YARP proxying. Supports the deno and workerd backends; operator supplies explicit binary paths.</Description>
+    <Description>Host Supabase-compatible edge functions inside ASP.NET with zero-copy YARP proxying. The gateway runs on Bun (in-process or workerd backend); operator supplies explicit binary paths.</Description>
     <PackageProjectUrl>https://github.com/lofcz/1tube</PackageProjectUrl>
     <RepositoryUrl>https://github.com/lofcz/1tube</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
@@ -43,10 +43,15 @@
     Ship the 1tube TypeScript gateway sources as package content.
     Consumers (priprava, sciobot-next-host, …) must NOT need a sibling
     1tube checkout to run the gateway: restore/publish materializes
-    OneTubeGateway/ next to the host output, and DenoHostService resolves
-    it via AppContext.BaseDirectory.
-    deno.json travels with the sources so jsr:/npm: specifiers in the
-    gateway resolve through 1tube's own import map (not the consumer's).
+    OneTubeGateway/ next to the host output, and GatewayHostService
+    resolves it via AppContext.BaseDirectory.
+    package.json + bun.lock travel with the sources but node_modules does
+    NOT (esbuild's binary is per-platform): on first start the host runs
+    a frozen-lockfile, production-only `bun install` in OneTubeGateway/, so the
+    gateway's own imports (hono, drizzle-orm, esbuild, …) resolve from
+    OneTubeGateway/node_modules at the exact versions the lockfile pins.
+    package.json is also where the gateway reads its version from;
+    tsconfig.json carries the compiler options Bun applies to src/.
   -->
   <ItemGroup>
     <Content Include="..\..\src\**\*.ts"
@@ -57,12 +62,12 @@
       <Pack>true</Pack>
       <PackagePath>contentFiles\any\any\OneTubeGateway\src\%(RecursiveDir)%(Filename)%(Extension)</PackagePath>
     </Content>
-    <Content Include="..\..\deno.json">
-      <Link>OneTubeGateway\deno.json</Link>
+    <Content Include="..\..\package.json;..\..\bun.lock;..\..\tsconfig.json">
+      <Link>OneTubeGateway\%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <Pack>true</Pack>
-      <PackagePath>contentFiles\any\any\OneTubeGateway\deno.json</PackagePath>
+      <PackagePath>contentFiles\any\any\OneTubeGateway\%(Filename)%(Extension)</PackagePath>
     </Content>
     <!--
       SQL migrations for the invocation log store. Applied by the

@@ -6,7 +6,7 @@ namespace OneTube;
 /// <summary>
 /// Resolves an executable path with explicit-path-first semantics.
 ///
-/// The two backends 1tube depends on (<c>deno</c> and <c>workerd</c>)
+/// The two runtimes 1tube depends on (<c>bun</c> and <c>workerd</c>)
 /// don't ship inside this NuGet package — operators install them out
 /// of band. We give them three ways to point at a binary:
 ///
@@ -23,7 +23,7 @@ namespace OneTube;
 ///   </item>
 ///   <item>
 ///     <description>
-///       <b>Bare command name</b> (e.g. <c>"deno"</c>). The resolver
+///       <b>Bare command name</b> (e.g. <c>"bun"</c>). The resolver
 ///       calls <c>where</c> on Windows or <c>which</c> on Unix and
 ///       captures the first hit. Useful on developer machines.
 ///     </description>

@@ -38,7 +38,7 @@ export interface InvocationRow {
   status: number;
   durationMs: number;
   userId?: string | null;
-  backend: "deno" | "workerd";
+  backend: "bun" | "workerd";
   errorKind?: InvocationErrorKind | null;
   errorMessage?: string | null;
   errorStack?: string | null;

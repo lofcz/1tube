@@ -3,7 +3,7 @@ namespace OneTube.Logs;
 /// <summary>
 /// Read-only access to the 1tube gateway's invocation log store.
 ///
-/// <para>The gateway (Deno) is the single writer and owns the schema +
+/// <para>The gateway (Bun) is the single writer and owns the schema +
 /// migrations; this reader opens the same SQLite file concurrently
 /// (WAL mode) and only ever issues SELECTs. No HTTP hop — a Blazor
 /// Server admin page can inject this directly and query at local-disk

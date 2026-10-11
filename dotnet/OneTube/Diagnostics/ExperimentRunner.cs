@@ -76,12 +76,12 @@ public sealed class ExperimentRunner
         var tokens = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["WorkerdPath"] = ctx.WorkerdPath ?? "",
-            ["DenoPath"] = ctx.DenoPath ?? "",
+            ["BunPath"] = ctx.BunPath ?? "",
             ["GatewayRoot"] = ctx.GatewayRoot,
             ["ServerScript"] = Path.Combine(ctx.GatewayRoot, "src", "server.ts"),
             ["DataRoot"] = ctx.DataRoot,
             ["DiagDir"] = ctx.DiagnosticsDir,
-            ["DenoCache"] = ctx.DenoCacheDir,
+            ["BunCache"] = ctx.BunCacheDir,
             ["ProbeCapnp"] = Path.Combine(ctx.DiagnosticsDir, "workerd-probe.capnp"),
             ["ActiveCapnp"] = ctx.ActiveCapnpPath ?? "",
             ["RandomPort"] = ctx.RandomPort1.ToString(),
@@ -167,7 +167,7 @@ public sealed class ExperimentRunner
                 DurationMs: sw.ElapsedMilliseconds, Stdout: "", Stderr: "",
                 Error: "executable was empty after token expansion (was " + spec.Executable + ")");
         }
-        // Bare executable names (powershell.exe, cmd.exe, deno) live
+        // Bare executable names (powershell.exe, cmd.exe, bun) live
         // on PATH, not as absolute paths — resolve them ourselves so
         // template authors don't have to hard-code C:\Windows\System32
         // paths everywhere. We only do PATH lookup when the user
@@ -388,10 +388,10 @@ public sealed class ExperimentRunner
         },
         new ExperimentSpec
         {
-            Id = "deno-version",
-            Name = "deno --version",
-            Description = "Smoke test: deno binary sanity.",
-            Executable = "${DenoPath}",
+            Id = "bun-version",
+            Name = "bun --version",
+            Description = "Smoke test: bun binary sanity.",
+            Executable = "${BunPath}",
             Args = ["--version"],
             TimeoutSec = 5,
         },
@@ -410,7 +410,7 @@ public sealed class ExperimentRunner
         {
             Id = "workerd-active-firmware",
             Name = "workerd serve <active firmware capnp>",
-            Description = "Run workerd directly on the firmware's most recent generated capnp, no deno wrapper. If this crashes but workerd-minimal doesn't, the bug is in our generated config.",
+            Description = "Run workerd directly on the firmware's most recent generated capnp, no gateway wrapper. If this crashes but workerd-minimal doesn't, the bug is in our generated config.",
             Executable = "${WorkerdPath}",
             Args = ["serve", "${ActiveCapnp}"],
             Cwd = "${DiagDir}",
@@ -449,8 +449,8 @@ public sealed class ExperimentRunner
         new ExperimentSpec
         {
             Id = "crash-dumps",
-            Name = "list workerd/deno crash dumps",
-            Description = "Scans the standard Windows Error Reporting locations for recent workerd/deno crash dumps. WER writes a .dmp on std::terminate if collection is enabled; if no files appear here, WER dump collection is disabled for the host identity (HKCU\\Software\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps).",
+            Name = "list workerd/bun crash dumps",
+            Description = "Scans the standard Windows Error Reporting locations for recent workerd/bun crash dumps. WER writes a .dmp on std::terminate if collection is enabled; if no files appear here, WER dump collection is disabled for the host identity (HKCU\\Software\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps).",
             Executable = "powershell.exe",
             Args = [
                 "-NoProfile", "-NonInteractive", "-Command",
@@ -488,32 +488,33 @@ public sealed class ExperimentRunner
             "Drop *.json files in this folder to define custom diagnostic experiments.\n" +
             "All string fields support ${TOKEN} expansion. Available tokens:\n" +
             "  ${WorkerdPath}    full path to the resolved workerd.exe\n" +
-            "  ${DenoPath}       full path to the resolved deno.exe\n" +
+            "  ${BunPath}        full path to the resolved bun.exe\n" +
             "  ${GatewayRoot}    path to OneTubeGateway/ next to the host (TS sources live here)\n" +
             "  ${ServerScript}   shortcut for ${GatewayRoot}/src/server.ts\n" +
             "  ${DataRoot}       OneTube data root\n" +
             "  ${DiagDir}        ${DataRoot}/onetube/diagnostics — writable scratch dir\n" +
-            "  ${DenoCache}      ${DataRoot}/onetube/deno-cache — DENO_DIR for deno experiments\n" +
+            "  ${BunCache}       ${DataRoot}/onetube/bun-cache — BUN_INSTALL_CACHE_DIR for bun experiments\n" +
             "  ${ProbeCapnp}     auto-materialized minimal capnp config (loopback, ephemeral port)\n" +
             "  ${ActiveCapnp}    most recent config.gen-N.capnp of the live firmware (or empty)\n" +
             "  ${RandomPort}/${RandomPort2}  free TCP ports picked at run time\n" +
             "Set \"daemon\": true on long-running experiments so Killed=true is treated as success.\n" +
             "Disk experiments override built-ins by \"id\".\n"),
-        ("deno-gateway-once.json",
+        ("bun-gateway-once.json",
             "{\n" +
-            "  \"id\": \"deno-gateway-once\",\n" +
-            "  \"name\": \"deno run gateway (one-shot)\",\n" +
-            "  \"description\": \"Spawns the full deno gateway with workerd backend on ephemeral ports. Lets you iterate on TS in OneTubeGateway/ without rebuilding the host.\",\n" +
-            "  \"executable\": \"${DenoPath}\",\n" +
+            "  \"id\": \"bun-gateway-once\",\n" +
+            "  \"name\": \"bun gateway (one-shot)\",\n" +
+            "  \"description\": \"Spawns the full gateway with workerd backend on ephemeral ports. Lets you iterate on TS in OneTubeGateway/ without rebuilding the host.\",\n" +
+            "  \"executable\": \"${BunPath}\",\n" +
             "  \"args\": [\n" +
-            "    \"run\", \"-A\", \"--no-prompt\",\n" +
             "    \"${ServerScript}\",\n" +
+            "    \"--backend\", \"workerd\",\n" +
             "    \"--workerd-bin\", \"${WorkerdPath}\",\n" +
-            "    \"--port=${RandomPort}\",\n" +
-            "    \"--workerd-base-port=${RandomPort2}\"\n" +
+            "    \"--port\", \"${RandomPort}\",\n" +
+            "    \"--workerd-base-port=${RandomPort2}\",\n" +
+            "    \"--deps-dir\", \"${DiagDir}/deps\"\n" +
             "  ],\n" +
             "  \"cwd\": \"${GatewayRoot}\",\n" +
-            "  \"env\": { \"DENO_DIR\": \"${DenoCache}\", \"DENO_NO_UPDATE_CHECK\": \"1\" },\n" +
+            "  \"env\": { \"BUN_INSTALL_CACHE_DIR\": \"${BunCache}\" },\n" +
             "  \"timeoutSec\": 12,\n" +
             "  \"daemon\": true\n" +
             "}\n"),
@@ -565,17 +566,17 @@ const config :Workerd.Config = (
 
 /// <summary>
 /// Snapshot of host paths/state passed to <see cref="ExperimentRunner"/>.
-/// Constructed by <see cref="DenoHostService"/> so the runner stays
+/// Constructed by <see cref="GatewayHostService"/> so the runner stays
 /// pure (no DI on host services, easy to unit test).
 /// </summary>
 public sealed record ExperimentContext(
     string? WorkerdPath,
-    string? DenoPath,
+    string? BunPath,
     string GatewayRoot,
     string DataRoot,
     string DiagnosticsDir,
     string ExperimentsDir,
-    string DenoCacheDir,
+    string BunCacheDir,
     string? ActiveCapnpPath,
     int RandomPort1,
     int RandomPort2);

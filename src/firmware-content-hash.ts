@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { dirname, join, normalize } from "node:path";
 import { init, parse } from "es-module-lexer";
 import { canonicalJson } from "./cli/envelope.ts";
@@ -100,7 +101,7 @@ export async function computeFirmwareContentFingerprint(
 
   const rawSources = new Map<string, string>();
   for (const file of moduleFiles) {
-    const bytes = await Deno.readFile(join(distDir, file));
+    const bytes = new Uint8Array(await readFile(join(distDir, file)));
     const source = new TextDecoder().decode(bytes);
     rawSources.set(file, source);
   }

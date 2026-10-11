@@ -6,7 +6,8 @@
  * removed `?key=` query form is treated like any other unauthenticated call.
  */
 
-import { assert, assertEquals } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals } from "./_assert.ts";
 import { Hono } from "hono";
 import { FunctionRegistry } from "../src/registry.ts";
 import {
@@ -36,7 +37,7 @@ function buildApp(internalKey?: string) {
   return app;
 }
 
-Deno.test("health: without INTERNAL_KEY responds with minimal status only", async () => {
+test("health: without INTERNAL_KEY responds with minimal status only", async () => {
   resetTubeEnv();
   const app = buildApp();
 
@@ -49,7 +50,7 @@ Deno.test("health: without INTERNAL_KEY responds with minimal status only", asyn
   assertEquals(m.status, 403);
 });
 
-Deno.test("health: with INTERNAL_KEY but no auth responds minimally; auth unlocks details", async () => {
+test("health: with INTERNAL_KEY but no auth responds minimally; auth unlocks details", async () => {
   resetTubeEnv();
   const app = buildApp(KEY);
 
@@ -70,7 +71,7 @@ Deno.test("health: with INTERNAL_KEY but no auth responds minimally; auth unlock
   assert("memory" in body);
 });
 
-Deno.test("health: rejects a wrong bearer", async () => {
+test("health: rejects a wrong bearer", async () => {
   resetTubeEnv();
   const app = buildApp(KEY);
   const res = await app.fetch(
@@ -82,7 +83,7 @@ Deno.test("health: rejects a wrong bearer", async () => {
   assertEquals(await res.json(), { status: "ok" });
 });
 
-Deno.test("metrics: with header bearer returns Prometheus text", async () => {
+test("metrics: with header bearer returns Prometheus text", async () => {
   resetTubeEnv();
   const app = buildApp(KEY);
   const res = await app.fetch(
@@ -100,7 +101,7 @@ Deno.test("metrics: with header bearer returns Prometheus text", async () => {
   assert(text.includes("onetube_requests_total"));
 });
 
-Deno.test("metrics: ?key= query auth is rejected (header-only)", async () => {
+test("metrics: ?key= query auth is rejected (header-only)", async () => {
   resetTubeEnv();
   const app = buildApp(KEY);
 
@@ -121,7 +122,7 @@ Deno.test("metrics: ?key= query auth is rejected (header-only)", async () => {
   assertEquals(await h.json(), { status: "ok" });
 });
 
-Deno.test("health: memory.limit_mb is null when constrainedMemory is unavailable", async () => {
+test("health: memory.limit_mb is null when constrainedMemory is unavailable", async () => {
   resetTubeEnv();
   _setConstrainedMemoryReaderForTests(() => null);
   try {
@@ -140,7 +141,7 @@ Deno.test("health: memory.limit_mb is null when constrainedMemory is unavailable
   }
 });
 
-Deno.test("health: memory.limit_mb + headroom_pct surfaced when cgroup cap reported", async () => {
+test("health: memory.limit_mb + headroom_pct surfaced when cgroup cap reported", async () => {
   resetTubeEnv();
   // Pretend the cgroup gave us a 512 MB cap.
   const fakeCapBytes = 512 * 1024 * 1024;
@@ -164,7 +165,7 @@ Deno.test("health: memory.limit_mb + headroom_pct surfaced when cgroup cap repor
   }
 });
 
-Deno.test("health: headroom_pct clamps to 0 when RSS exceeds the reported cap", async () => {
+test("health: headroom_pct clamps to 0 when RSS exceeds the reported cap", async () => {
   resetTubeEnv();
   // 1-byte cap → RSS will dwarf it → headroom must clamp at 0, not go negative.
   _setConstrainedMemoryReaderForTests(() => 1);
@@ -182,7 +183,7 @@ Deno.test("health: headroom_pct clamps to 0 when RSS exceeds the reported cap", 
   }
 });
 
-Deno.test("metrics: missing Authorization header returns 403", async () => {
+test("metrics: missing Authorization header returns 403", async () => {
   resetTubeEnv();
   const app = buildApp(KEY);
   const res = await app.fetch(new Request(`http://localhost/metrics`));

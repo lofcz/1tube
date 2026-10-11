@@ -3,8 +3,11 @@
  * concurrent first-requests dedupe on a single import.
  */
 
-import { assert, assertEquals, assertNotEquals } from "@std/assert";
-import { join } from "@std/path";
+import { test } from "bun:test";
+import { assert, assertEquals, assertNotEquals } from "./_assert.ts";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { FunctionRegistry } from "../src/registry.ts";
 import { discoverAndLoad } from "../src/discovery.ts";
 
@@ -15,10 +18,10 @@ async function makeFnDir(
   manifest?: Record<string, unknown>,
 ) {
   const dir = join(root, name);
-  await Deno.mkdir(dir, { recursive: true });
-  await Deno.writeTextFile(join(dir, "index.ts"), body);
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "index.ts"), body);
   if (manifest) {
-    await Deno.writeTextFile(
+    await writeFile(
       join(dir, "1tube.json"),
       JSON.stringify(manifest, null, 2),
     );
@@ -34,16 +37,14 @@ reg.register(() => new Response("hello-${tag}"), { public: true });
 `;
 
 function setupRegistry(): FunctionRegistry {
-  // Reset load counts and install a fresh registry on globalThis so the
-  // function modules can find it during dynamic import.
+  // Reset load counts. The registry reaches function modules through the
+  // per-function module graph `importFunction()` creates — nothing global.
   (globalThis as any).__loadCounts = {};
-  const reg = new FunctionRegistry();
-  (globalThis as any).__edgeFunctionRegistry = reg;
-  return reg;
+  return new FunctionRegistry();
 }
 
-Deno.test("lazy-load: discovery in lazy mode registers candidates without importing", async () => {
-  const tmp = await Deno.makeTempDir();
+test("lazy-load: discovery in lazy mode registers candidates without importing", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-lazy-"));
   try {
     await makeFnDir(tmp, "fn-a", HANDLER_BODY("a"));
     await makeFnDir(tmp, "fn-b", HANDLER_BODY("b"));
@@ -71,12 +72,12 @@ Deno.test("lazy-load: discovery in lazy mode registers candidates without import
       "fn-b module must not have been imported",
     );
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
-Deno.test("lazy-load: warm:true manifests still load eagerly", async () => {
-  const tmp = await Deno.makeTempDir();
+test("lazy-load: warm:true manifests still load eagerly", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-lazy-"));
   try {
     await makeFnDir(tmp, "warm-fn", HANDLER_BODY("warm"), { warm: true });
     await makeFnDir(tmp, "cold-fn", HANDLER_BODY("cold"));
@@ -94,14 +95,14 @@ Deno.test("lazy-load: warm:true manifests still load eagerly", async () => {
     assertEquals(counts["warm"], 1);
     assertEquals(counts["cold"], undefined);
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
-Deno.test("lazy-load: getOrLoad imports on first call, hit on second", async () => {
-  const tmp = await Deno.makeTempDir();
+test("lazy-load: getOrLoad imports on first call, hit on second", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-lazy-"));
   try {
-    // Use a unique name per test run so Deno's module cache doesn't return a
+    // Use a unique name per test run so the module cache doesn't return a
     // stale module from a previous test.
     const name = `lazy-once-${crypto.randomUUID().slice(0, 8)}`;
     await makeFnDir(tmp, name, HANDLER_BODY("once"));
@@ -120,12 +121,12 @@ Deno.test("lazy-load: getOrLoad imports on first call, hit on second", async () 
     const counts = (globalThis as any).__loadCounts as Record<string, number>;
     assertEquals(counts["once"], 1, "module top-level ran exactly once");
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
-Deno.test("lazy-load: concurrent first-dispatch dedupes on a single import", async () => {
-  const tmp = await Deno.makeTempDir();
+test("lazy-load: concurrent first-dispatch dedupes on a single import", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-lazy-"));
   try {
     const name = `lazy-dedupe-${crypto.randomUUID().slice(0, 8)}`;
     await makeFnDir(tmp, name, HANDLER_BODY("dedupe"));
@@ -154,18 +155,18 @@ Deno.test("lazy-load: concurrent first-dispatch dedupes on a single import", asy
       "module imported exactly once despite 5 racers",
     );
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
-Deno.test("lazy-load: getOrLoad on unknown name returns undefined", async () => {
+test("lazy-load: getOrLoad on unknown name returns undefined", async () => {
   const reg = setupRegistry();
   const r = await reg.getOrLoad("does-not-exist");
   assertEquals(r, undefined);
 });
 
-Deno.test("lazy-load: failed import drops the candidate", async () => {
-  const tmp = await Deno.makeTempDir();
+test("lazy-load: failed import drops the candidate", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-lazy-"));
   try {
     const name = `lazy-fail-${crypto.randomUUID().slice(0, 8)}`;
     await makeFnDir(
@@ -189,12 +190,12 @@ Deno.test("lazy-load: failed import drops the candidate", async () => {
     assert(threw, "failed import must surface the error");
     assertEquals(reg.has(name), false, "candidate dropped after failure");
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
-Deno.test("lazy-load: registry.has() covers candidates AND loaded handlers", async () => {
-  const tmp = await Deno.makeTempDir();
+test("lazy-load: registry.has() covers candidates AND loaded handlers", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-lazy-"));
   try {
     const eager = `eager-${crypto.randomUUID().slice(0, 8)}`;
     const lazy = `lazy-${crypto.randomUUID().slice(0, 8)}`;
@@ -208,12 +209,12 @@ Deno.test("lazy-load: registry.has() covers candidates AND loaded handlers", asy
     assert(reg.has(lazy), "lazy fn (candidate only) is .has()");
     assertEquals(reg.has("nope"), false);
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
-Deno.test("lazy-load: manifestFor() reads manifest of unloaded candidates", async () => {
-  const tmp = await Deno.makeTempDir();
+test("lazy-load: manifestFor() reads manifest of unloaded candidates", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-lazy-"));
   try {
     const name = `manifest-${crypto.randomUUID().slice(0, 8)}`;
     await makeFnDir(tmp, name, HANDLER_BODY(name), {
@@ -231,12 +232,12 @@ Deno.test("lazy-load: manifestFor() reads manifest of unloaded candidates", asyn
     // Sanity: handler still NOT loaded.
     assertEquals(reg.get(name), undefined);
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });
 
-Deno.test("lazy-load: eager (non-lazy) discovery is unchanged — handlers loaded immediately", async () => {
-  const tmp = await Deno.makeTempDir();
+test("lazy-load: eager (non-lazy) discovery is unchanged — handlers loaded immediately", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "1tube-lazy-"));
   try {
     const name = `eager-classic-${crypto.randomUUID().slice(0, 8)}`;
     await makeFnDir(tmp, name, HANDLER_BODY("classic"));
@@ -249,6 +250,6 @@ Deno.test("lazy-load: eager (non-lazy) discovery is unchanged — handlers loade
     assert(reg.get(name), "handler loaded eagerly");
     assertNotEquals((globalThis as any).__loadCounts["classic"], undefined);
   } finally {
-    await Deno.remove(tmp, { recursive: true });
+    await rm(tmp, { recursive: true, force: true });
   }
 });

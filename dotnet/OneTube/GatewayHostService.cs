@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -21,7 +23,7 @@ public sealed record GatewayBinaryVersion(
     string? Error);
 
 public sealed record GatewayBinaryDiagnostics(
-    GatewayBinaryVersion Deno,
+    GatewayBinaryVersion Bun,
     GatewayBinaryVersion Workerd);
 
 public sealed record WorkerdProbeResult(
@@ -39,12 +41,12 @@ public sealed record WorkerdProbeResult(
 
 /// <summary>
 /// Manages the lifecycle of one OneTube gateway slot. The gateway
-/// itself is always Deno (<c>src/server.ts</c>); when
+/// itself always runs on Bun (<c>bun src/server.ts</c>); when
 /// <see cref="OneTubeOptions.Backend"/> is
 /// <see cref="OneTubeBackend.Workerd"/> the gateway spawns workerd as
 /// its own subprocess, which we point at via <c>--workerd-bin</c>.
 ///
-/// One <see cref="DenoHostService"/> instance owns one Deno child
+/// One <see cref="GatewayHostService"/> instance owns one Bun child
 /// listening on one port — the slot's port. The single-host
 /// deployment registers exactly one of these as both an
 /// <see cref="IHostedService"/> (so it boots with the app) and an
@@ -57,30 +59,37 @@ public sealed record WorkerdProbeResult(
 /// Responsibilities:
 /// <list type="bullet">
 ///   <item><description>Validate both binary paths up front.</description></item>
-///   <item><description>Spawn deno with the full CLI surface from <see cref="OneTubeOptions"/> + slot.</description></item>
+///   <item><description>Install the bundled gateway's own npm dependencies (<c>bun install --frozen-lockfile --production</c> in <c>OneTubeGateway/</c>) once per gateway content.</description></item>
+///   <item><description>Spawn bun with the full CLI surface from <see cref="OneTubeOptions"/> + slot.</description></item>
 ///   <item><description>Tail stdout/stderr into the host logger (tagged with the slot label).</description></item>
 ///   <item><description>Periodically poll <c>/health</c>, then stop the 1tube slot on unrecoverable failure while leaving the host alive.</description></item>
 ///   <item><description>Kill the child cleanly on host shutdown / Ctrl+C / process-exit.</description></item>
 /// </list>
 ///
 /// State is per-instance — there is no static shared between two
-/// slots. The class name is historical (gateway used to be the only
-/// thing this service managed) but the surface fully covers both
-/// backends and both slots.
+/// slots (the one exception is the lock serializing the dependency
+/// install, since both slots run from the same <c>OneTubeGateway/</c>).
 /// </summary>
-public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
+public class GatewayHostService : IHostedService, IGatewayHost, IDisposable
 {
     private const int MaxBackoffMs = 30_000;
     private static readonly Regex AnsiEscapeRegex = new(@"\x1B\[[0-?]*[ -/]*[@-~]", RegexOptions.Compiled);
 
     /// <summary>
     /// Exit-code contract published by the gateway (see
-    /// <c>src/server.ts</c> — <c>EXIT_CODES</c>). The supervisor uses
-    /// these to decide whether a failure is permanent (the gateway
-    /// told us "my config is wrong, retrying won't help") or transient
-    /// (an actual crash worth restarting). We do <em>not</em> guess
-    /// based on timing — the gateway is the authority on what kind of
-    /// failure it just suffered.
+    /// <c>src/server.ts</c> — <c>EXIT_CODES</c> /
+    /// <c>PERMANENT_EXIT_CODES</c>, which points back here). The
+    /// supervisor uses these to decide whether a failure is permanent
+    /// (the gateway told us "my config is wrong, retrying won't help")
+    /// or transient (an actual crash worth restarting). We do
+    /// <em>not</em> guess based on timing — the gateway is the
+    /// authority on what kind of failure it just suffered.
+    /// <list type="bullet">
+    ///   <item><description><c>0</c> OK — clean shutdown.</description></item>
+    ///   <item><description><c>1</c> CRASH — generic runtime crash (transient).</description></item>
+    ///   <item><description><c>64</c> EX_USAGE — bad CLI args (permanent).</description></item>
+    ///   <item><description><c>78</c> EX_CONFIG — missing/invalid required env or manifest (permanent).</description></item>
+    /// </list>
     /// </summary>
     private const int ExitCodeUsageError = 64;   // EX_USAGE   — bad CLI args
     private const int ExitCodeConfigError = 78;  // EX_CONFIG  — missing/invalid required env or manifest
@@ -93,9 +102,34 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
     /// </summary>
     private const int StderrTailCapacity = 32;
 
+    /// <summary>
+    /// Upper bound for the one-time <c>bun install</c> of the bundled
+    /// gateway's own dependencies. A cold install is a few seconds;
+    /// the cap only exists so a wedged registry can't hang host startup
+    /// forever.
+    /// </summary>
+    private static readonly TimeSpan GatewayInstallTimeout = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Written into <c>OneTubeGateway/node_modules/</c> after a
+    /// successful install. Holds a fingerprint of <c>package.json</c> +
+    /// <c>bun.lock</c> + the host RID, so a redeployed gateway (new
+    /// lockfile) or a tree copied across platforms (esbuild ships a
+    /// per-platform binary) re-installs, and an unchanged one skips the
+    /// install entirely.
+    /// </summary>
+    private const string GatewayInstallStampFile = ".onetube-install-stamp";
+
+    /// <summary>
+    /// Active and candidate slots share one <c>OneTubeGateway/</c>
+    /// directory; serialize the install so two concurrent spawns can't
+    /// both write <c>node_modules</c>.
+    /// </summary>
+    private static readonly object GatewayInstallLock = new();
+
     private readonly OneTubeOptions _options;
     private readonly GatewaySlot _slot;
-    private readonly ILogger<DenoHostService> _logger;
+    private readonly ILogger<GatewayHostService> _logger;
 
     private Process? _process;
     private CancellationTokenSource? _cts;
@@ -136,7 +170,7 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
     /// crashes, and re-running the resolver on every restart adds
     /// pointless latency to the recovery path.
     /// </summary>
-    private string? _denoExe;
+    private string? _bunExe;
     private string? _workerdExe;
 
     public string Label => _slot.Label;
@@ -215,20 +249,20 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
     /// Constructor used by DI for the single-host (active) slot.
     /// Resolves the slot from <see cref="OneTubeOptions.Port"/> and
     /// labels it "active". The firmware supervisor uses the
-    /// <see cref="DenoHostService(OneTubeOptions, GatewaySlot, ILogger{DenoHostService}, Func{IReadOnlyDictionary{string, string}?}?)"/>
+    /// <see cref="GatewayHostService(OneTubeOptions, GatewaySlot, ILogger{GatewayHostService}, Func{IReadOnlyDictionary{string, string}?}?)"/>
     /// overload to create candidate slots on demand.
     /// </summary>
-    public DenoHostService(
+    public GatewayHostService(
         Microsoft.Extensions.Options.IOptions<OneTubeOptions> options,
-        ILogger<DenoHostService> logger)
+        ILogger<GatewayHostService> logger)
         : this(options.Value, new GatewaySlot("active", options.Value.Port), logger, secretsProvider: null)
     {
     }
 
-    public DenoHostService(
+    public GatewayHostService(
         OneTubeOptions options,
         GatewaySlot slot,
-        ILogger<DenoHostService> logger,
+        ILogger<GatewayHostService> logger,
         Func<IReadOnlyDictionary<string, string>?>? secretsProvider = null)
     {
         _options = options;
@@ -289,16 +323,16 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
 
     public async Task<GatewayBinaryDiagnostics> GetBinaryDiagnosticsAsync(CancellationToken cancellationToken = default)
     {
-        var denoPath = ResolveDenoBinary();
+        var bunPath = ResolveBunBinary();
         var workerdPath = ResolveWorkerdBinary();
         return new GatewayBinaryDiagnostics(
-            await ProbeBinaryVersionAsync("deno", denoPath, "--version", cancellationToken),
+            await ProbeBinaryVersionAsync("bun", bunPath, "--version", cancellationToken),
             await ProbeBinaryVersionAsync("workerd", workerdPath, "--version", cancellationToken));
     }
 
     public void InvalidateBinaryCache()
     {
-        _denoExe = null;
+        _bunExe = null;
         _workerdExe = null;
     }
 
@@ -316,12 +350,12 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
         Directory.CreateDirectory(experimentsDir);
         return new OneTube.Diagnostics.ExperimentContext(
             WorkerdPath: ResolveWorkerdBinary(),
-            DenoPath: ResolveDenoBinary(),
+            BunPath: ResolveBunBinary(),
             GatewayRoot: Path.Combine(AppContext.BaseDirectory, "OneTubeGateway"),
             DataRoot: dataRoot,
             DiagnosticsDir: diagDir,
             ExperimentsDir: experimentsDir,
-            DenoCacheDir: DenoCacheDir,
+            BunCacheDir: BunCacheDir,
             ActiveCapnpPath: activeCapnpPath,
             RandomPort1: PickEphemeralPort(),
             RandomPort2: PickEphemeralPort());
@@ -349,7 +383,7 @@ public sealed class DenoHostService : IHostedService, IGatewayHost, IDisposable
         var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(5);
 
         // Where to write probe artifacts: same writable area we use
-        // for the deno cache — guaranteed writable by the host
+        // for the bun cache — guaranteed writable by the host
         // identity, never under c:\windows\system32 or the IIS site
         // root.
         var probeDir = Path.Combine(ResolveRuntimeDataRoot(), "onetube", "diagnostics");
@@ -516,7 +550,18 @@ const config :Workerd.Config = (
         }
     }
 
-    private string DenoCacheDir => Path.Combine(ResolveRuntimeDataRoot(), "onetube", "deno-cache");
+    /// <summary>
+    /// Host-owned Bun install cache (<c>BUN_INSTALL_CACHE_DIR</c>).
+    /// Keeps package downloads off the service identity's home dir,
+    /// which on IIS / service accounts is often missing or read-only.
+    /// </summary>
+    private string BunCacheDir => Path.Combine(ResolveRuntimeDataRoot(), "onetube", "bun-cache");
+
+    /// <summary>
+    /// Host-owned runtime transpiler cache
+    /// (<c>BUN_RUNTIME_TRANSPILER_CACHE_PATH</c>), for the same reason.
+    /// </summary>
+    private string BunTranspilerCacheDir => Path.Combine(ResolveRuntimeDataRoot(), "onetube", "bun-transpiler-cache");
 
     private string ResolveRuntimeDataRoot()
     {
@@ -664,26 +709,35 @@ const config :Workerd.Config = (
 
     private bool ResolveBinariesIfNeeded()
     {
-        if (_denoExe is null && ResolveDenoBinary() is null) return false;
+        if (_bunExe is null && ResolveBunBinary() is null) return false;
 
         // Workerd is only required when actually running on workerd.
-        // Resolving (and validating) it lazily means a Deno-backed
+        // Resolving (and validating) it lazily means a Bun-backed
         // deploy doesn't need the binary on the host at all.
         if (_options.Backend == OneTubeBackend.Workerd && _workerdExe is null && ResolveWorkerdBinary() is null) return false;
 
         return true;
     }
 
-    private string? ResolveDenoBinary()
+    private string? ResolveBunBinary()
     {
-        if (_denoExe is not null) return _denoExe;
+        if (_bunExe is not null) return _bunExe;
 
-        _denoExe = BinaryResolver.Resolve(_options.DenoBinary, "deno", "Deno", _logger);
-        if (_denoExe is not null)
+        var configured = GatewayCommand.SelectBunBinary(_options, out var ignoredLegacy);
+        if (ignoredLegacy is not null)
         {
-            _logger.LogInformation("[1tube/{Slot}] Resolved deno binary: {Path}", _slot.Label, _denoExe);
+            _logger.LogWarning(
+                "[1tube/{Slot}] OneTubeOptions.DenoBinary ({Path}) is obsolete and ignored — the gateway runs on Bun now. " +
+                "Set OneTubeOptions.BunBinary (or put bun on PATH).",
+                _slot.Label, ignoredLegacy);
         }
-        return _denoExe;
+
+        _bunExe = BinaryResolver.Resolve(configured, "bun", "Bun", _logger);
+        if (_bunExe is not null)
+        {
+            _logger.LogInformation("[1tube/{Slot}] Resolved bun binary: {Path}", _slot.Label, _bunExe);
+        }
+        return _bunExe;
     }
 
     private string? ResolveWorkerdBinary()
@@ -789,6 +843,11 @@ const config :Workerd.Config = (
             return;
         }
 
+        if (!EnsureGatewayDependencies(gatewayRoot))
+        {
+            return;
+        }
+
         if (IsPortInUse(_slot.Port))
         {
             _logger.LogWarning("[1tube/{Slot}] Port {Port} in use, killing orphaned process", _slot.Label, _slot.Port);
@@ -808,13 +867,14 @@ const config :Workerd.Config = (
 
         var startInfo = new ProcessStartInfo
         {
-            FileName = _denoExe!,
-            // cwd = the OneTubeGateway directory we just resolved so
-            // Deno picks up the bundled deno.json (import map for
-            // jsr:/npm: specifiers in the gateway sources). The
-            // consumer's own deno.json (if any) is irrelevant here —
-            // gateway resolution and host resolution are separate
-            // concerns.
+            FileName = _bunExe!,
+            // cwd = the OneTubeGateway directory we just resolved. The
+            // gateway's own imports (hono, drizzle-orm, esbuild, …)
+            // resolve from OneTubeGateway/node_modules by walking up
+            // from src/ regardless of cwd; keeping cwd here just means
+            // nothing the gateway defaults relative to cwd lands in the
+            // host's arbitrary launch directory. Every host-configured
+            // path is passed absolute anyway.
             WorkingDirectory = gatewayRoot,
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -836,35 +896,17 @@ const config :Workerd.Config = (
         {
             startInfo.Environment[key] = value;
         }
-        var denoCacheDir = DenoCacheDir;
-        startInfo.Environment["DENO_DIR"] = denoCacheDir;
-        startInfo.Environment["DENO_NO_UPDATE_CHECK"] = "1";
-
-        // Deno 2.9 enables a 24h "minimum dependency age" by default,
-        // which makes a function that pins a freshly published npm
-        // version fail to resolve. NPM_CONFIG_MIN_RELEASE_AGE is the
-        // lowest explicit tier in Deno's precedence chain, so setting it
-        // to 0 cancels ONLY that built-in default — a project's .npmrc,
-        // deno.json `minimumDependencyAge`, or `--minimum-dependency-age`
-        // still wins, as does anything an operator passed via EnvVars
-        // (already layered into Environment above) or the parent process.
-        if (!startInfo.Environment.ContainsKey("NPM_CONFIG_MIN_RELEASE_AGE") &&
-            !startInfo.Environment.ContainsKey("npm_config_min_release_age"))
-        {
-            startInfo.Environment["NPM_CONFIG_MIN_RELEASE_AGE"] = "0";
-        }
+        ApplyBunCacheEnvironment(startInfo);
 
         try
         {
-            Directory.CreateDirectory(denoCacheDir);
-            // Deno writes the managed lockfile here on first resolve, but it
-            // won't create the parent directory — make sure it exists before
-            // the child starts (the gateway hasn't opened the log DB, which
-            // normally creates this dir, yet).
-            var lockDir = Path.GetDirectoryName(GatewayCommand.ResolveManagedLockPath(_options));
-            if (!string.IsNullOrEmpty(lockDir)) Directory.CreateDirectory(lockDir);
+            // The managed npm:/jsr: store for the functions' own
+            // dependencies. The gateway creates it on first install, but
+            // creating it up front surfaces a permission problem here,
+            // with a clear host-side stack, instead of mid-boot.
+            Directory.CreateDirectory(GatewayCommand.ResolveDepsDir(_options));
             _process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-            _process.Exited += OnDenoProcessExited;
+            _process.Exited += OnGatewayProcessExited;
             _process.OutputDataReceived += (_, e) =>
             {
                 if (e.Data is null) return;
@@ -884,14 +926,14 @@ const config :Workerd.Config = (
                 }
                 // Keep a bounded tail so a permanent-failure exit can
                 // re-print the gateway's own FATAL line(s) inline with
-                // our "stopped restarting" announcement.
-                if (!IsNoisyDenoProgressLine(line))
+                // our "stopped restarting" announcement. (No progress-
+                // line filter needed: unlike Deno's "Download …" spam,
+                // the gateway runs its `bun install`s with piped output
+                // and only logs a one-line summary.)
+                lock (_stderrTailLock)
                 {
-                    lock (_stderrTailLock)
-                    {
-                        _stderrTail.Enqueue(line);
-                        while (_stderrTail.Count > StderrTailCapacity) _stderrTail.Dequeue();
-                    }
+                    _stderrTail.Enqueue(line);
+                    while (_stderrTail.Count > StderrTailCapacity) _stderrTail.Dequeue();
                 }
             };
             _process.Start();
@@ -909,7 +951,7 @@ const config :Workerd.Config = (
                 "[1tube/{Slot}] gateway started (PID {Pid}, backend={Backend}) on {Host}:{Port}",
                 _slot.Label,
                 _process.Id,
-                _options.Backend == OneTubeBackend.Workerd ? "workerd" : "deno",
+                GatewayCommand.BackendName(_options.Backend),
                 _options.Host,
                 _slot.Port);
         }
@@ -928,12 +970,195 @@ const config :Workerd.Config = (
             || line.Contains("panic", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool IsNoisyDenoProgressLine(string line)
+    /// <summary>
+    /// Point Bun's install + transpiler caches at host-owned dirs under
+    /// the data root (the Deno-era equivalent was <c>DENO_DIR</c>). An
+    /// operator who wants them elsewhere sets the same variables via
+    /// <see cref="OneTubeOptions.EnvVars"/>, which wins.
+    /// </summary>
+    private void ApplyBunCacheEnvironment(ProcessStartInfo startInfo)
     {
-        var trimmed = line.TrimStart();
-        return trimmed.StartsWith("Download ", StringComparison.OrdinalIgnoreCase)
-            || trimmed.StartsWith("Check ", StringComparison.OrdinalIgnoreCase)
-            || trimmed.StartsWith("Initialize ", StringComparison.OrdinalIgnoreCase);
+        if (!_options.EnvVars.ContainsKey("BUN_INSTALL_CACHE_DIR"))
+        {
+            Directory.CreateDirectory(BunCacheDir);
+            startInfo.Environment["BUN_INSTALL_CACHE_DIR"] = BunCacheDir;
+        }
+        if (!_options.EnvVars.ContainsKey("BUN_RUNTIME_TRANSPILER_CACHE_PATH"))
+        {
+            Directory.CreateDirectory(BunTranspilerCacheDir);
+            startInfo.Environment["BUN_RUNTIME_TRANSPILER_CACHE_PATH"] = BunTranspilerCacheDir;
+        }
+    }
+
+    /// <summary>
+    /// Make sure the bundled gateway can resolve its own npm
+    /// dependencies (hono, drizzle-orm, esbuild, es-module-lexer,
+    /// @zip.js/zip.js). The NuGet package ships <c>package.json</c> +
+    /// <c>bun.lock</c> next to <c>src/</c> but no <c>node_modules</c>:
+    /// esbuild's binary is per-platform, so a prebuilt tree would only
+    /// work on the platform it was packed on. Instead we run
+    /// <c>bun install --frozen-lockfile --production</c> in
+    /// <c>OneTubeGateway/</c> once — the lockfile pins exact versions,
+    /// so every host gets the tree CI tested — and stamp the result so
+    /// later spawns (restarts, firmware candidates) skip it.
+    ///
+    /// <para>Air-gapped or read-only deployments can run the same
+    /// command in <c>OneTubeGateway/</c> at deploy time; when the
+    /// install fails but a <c>node_modules</c> already exists we warn
+    /// and use it as-is.</para>
+    ///
+    /// <para>Returns <c>false</c> (and stops the slot) only when there
+    /// is nothing to run with. Like any other stop, the next
+    /// <see cref="StartAsync"/> / <see cref="RecycleAsync"/> retries, so
+    /// a transient registry outage heals without a host restart.</para>
+    /// </summary>
+    private bool EnsureGatewayDependencies(string gatewayRoot)
+    {
+        var packageJson = Path.Combine(gatewayRoot, "package.json");
+        var lockfile = Path.Combine(gatewayRoot, "bun.lock");
+        var nodeModules = Path.Combine(gatewayRoot, "node_modules");
+        var stampPath = Path.Combine(nodeModules, GatewayInstallStampFile);
+
+        if (!File.Exists(packageJson))
+        {
+            StopOneTubeSlot(
+                $"gateway package.json not found at {packageJson}; OneTubeGateway/ must contain " +
+                "src/, drizzle/, package.json and bun.lock",
+                null);
+            return false;
+        }
+
+        lock (GatewayInstallLock)
+        {
+            string fingerprint;
+            try
+            {
+                fingerprint = ComputeInstallFingerprint(packageJson, lockfile);
+                if (File.Exists(stampPath) && File.ReadAllText(stampPath).Trim() == fingerprint)
+                {
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                StopOneTubeSlot($"failed to read gateway package manifest: {ex.Message}", null, ex);
+                return false;
+            }
+
+            var hasLockfile = File.Exists(lockfile);
+            if (!hasLockfile)
+            {
+                _logger.LogWarning(
+                    "[1tube/{Slot}] {Lockfile} is missing; installing gateway dependencies without a frozen lockfile",
+                    _slot.Label, lockfile);
+            }
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = _bunExe!,
+                WorkingDirectory = gatewayRoot,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+            };
+            startInfo.ArgumentList.Add("install");
+            if (hasLockfile) startInfo.ArgumentList.Add("--frozen-lockfile");
+            // --production: the shipped package.json is 1tube's own, so
+            // skip its devDependencies (typescript, drizzle-kit, …).
+            // --ignore-scripts: never run the package's own lifecycle
+            // scripts on a production host.
+            startInfo.ArgumentList.Add("--production");
+            startInfo.ArgumentList.Add("--ignore-scripts");
+            startInfo.ArgumentList.Add("--no-progress");
+            foreach (var (key, value) in _options.EnvVars)
+            {
+                // Lets operators point at a private registry/mirror
+                // (BUN_CONFIG_REGISTRY, NPM_CONFIG_REGISTRY, …).
+                startInfo.Environment[key] = value;
+            }
+            ApplyBunCacheEnvironment(startInfo);
+
+            _logger.LogInformation(
+                "[1tube/{Slot}] Installing gateway dependencies in {Dir} (bun {Args})",
+                _slot.Label, gatewayRoot, string.Join(' ', startInfo.ArgumentList));
+
+            var output = new System.Text.StringBuilder();
+            int? exitCode = null;
+            string? error = null;
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                using var proc = new Process { StartInfo = startInfo };
+                proc.OutputDataReceived += (_, e) => { if (e.Data is not null) lock (output) output.AppendLine(e.Data); };
+                proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (output) output.AppendLine(e.Data); };
+                proc.Start();
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                if (proc.WaitForExit(GatewayInstallTimeout))
+                {
+                    // Parameterless WaitForExit drains the async readers.
+                    proc.WaitForExit();
+                    exitCode = proc.ExitCode;
+                }
+                else
+                {
+                    try { proc.Kill(entireProcessTree: true); } catch { /* race */ }
+                    error = $"timed out after {GatewayInstallTimeout.TotalSeconds:0}s";
+                }
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+            }
+
+            string installLog;
+            lock (output) installLog = AnsiEscapeRegex.Replace(output.ToString(), "").Trim();
+
+            if (exitCode == 0)
+            {
+                try
+                {
+                    File.WriteAllText(stampPath, fingerprint);
+                }
+                catch (Exception ex)
+                {
+                    // Install worked; we'll just re-run it (cheap no-op)
+                    // next spawn.
+                    _logger.LogWarning(ex, "[1tube/{Slot}] Could not write {Stamp}", _slot.Label, stampPath);
+                }
+                _logger.LogInformation(
+                    "[1tube/{Slot}] Gateway dependencies installed in {Ms}ms",
+                    _slot.Label, sw.ElapsedMilliseconds);
+                return true;
+            }
+
+            var reason = error ?? $"bun install exited with code {exitCode}";
+            if (Directory.Exists(nodeModules))
+            {
+                _logger.LogWarning(
+                    "[1tube/{Slot}] Gateway dependency install failed ({Reason}); using the existing {Dir} as-is.{NewLine}{Output}",
+                    _slot.Label, reason, nodeModules, Environment.NewLine, installLog);
+                return true;
+            }
+
+            StopOneTubeSlot(
+                $"could not install gateway dependencies in {gatewayRoot} ({reason}). " +
+                "Make sure the host can reach the npm registry and OneTubeGateway/ is writable, " +
+                "or run `bun install --frozen-lockfile --production` there at deploy time." +
+                (installLog.Length > 0 ? Environment.NewLine + installLog : ""),
+                null);
+            return false;
+        }
+    }
+
+    private static string ComputeInstallFingerprint(string packageJson, string lockfile)
+    {
+        using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        sha.AppendData(File.ReadAllBytes(packageJson));
+        if (File.Exists(lockfile)) sha.AppendData(File.ReadAllBytes(lockfile));
+        sha.AppendData(System.Text.Encoding.UTF8.GetBytes(RuntimeInformation.RuntimeIdentifier));
+        return Convert.ToHexString(sha.GetHashAndReset());
     }
 
     private static string NormalizeGatewayLogLine(string line)
@@ -962,7 +1187,7 @@ const config :Workerd.Config = (
         }
     }
 
-    private void OnDenoProcessExited(object? sender, EventArgs e)
+    private void OnGatewayProcessExited(object? sender, EventArgs e)
     {
         // ExitCode is undefined if we triggered the exit ourselves
         // (KillProcess sets _process to null first). Read it once,
@@ -1165,5 +1390,34 @@ const config :Workerd.Config = (
             _process.Dispose();
             _process = null;
         }
+    }
+}
+
+/// <summary>
+/// Pre-Bun name of <see cref="GatewayHostService"/>, kept so existing
+/// <c>new DenoHostService(...)</c> call sites still compile. It is a
+/// plain subclass, not a DI alias: <c>AddOneTube</c> registers the
+/// active slot as <see cref="GatewayHostService"/> (and
+/// <see cref="IGatewayHost"/>) only, so code that resolved
+/// <c>DenoHostService</c> from the container must switch to
+/// <see cref="GatewayHostService"/>.
+/// </summary>
+[Obsolete("Renamed to GatewayHostService (the gateway runs on Bun now). AddOneTube registers the active slot as GatewayHostService / IGatewayHost; resolve that instead.")]
+public sealed class DenoHostService : GatewayHostService
+{
+    public DenoHostService(
+        Microsoft.Extensions.Options.IOptions<OneTubeOptions> options,
+        ILogger<DenoHostService> logger)
+        : base(options.Value, new GatewaySlot("active", options.Value.Port), logger, secretsProvider: null)
+    {
+    }
+
+    public DenoHostService(
+        OneTubeOptions options,
+        GatewaySlot slot,
+        ILogger<DenoHostService> logger,
+        Func<IReadOnlyDictionary<string, string>?>? secretsProvider = null)
+        : base(options, slot, logger, secretsProvider)
+    {
     }
 }

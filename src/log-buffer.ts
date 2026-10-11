@@ -2,7 +2,7 @@
  * Tiny, dependency-free buffered line writer.
  *
  * Why: per-request `console.log` is surprisingly expensive (~10–30µs each)
- * because every call goes through Deno's logger formatting, encodes a
+ * because every call goes through the runtime's console formatting, encodes a
  * separate UTF-8 buffer, and issues a `write(2)` to the host. Under load
  * that's 10–30% of a single-process gateway's CPU budget.
  *
@@ -19,6 +19,8 @@
  * (every write flushes immediately) — useful for `--dev` so log output is
  * always live in the terminal.
  */
+
+import { stderr as stderrSink, stdout as stdoutSink } from "./stdio.ts";
 
 const encoder = new TextEncoder();
 
@@ -53,7 +55,6 @@ class StreamBuffer {
     if (this.timer === undefined) {
       this.timer = setTimeout(() => this.flushNow(), this.cfg.flushIntervalMs);
       // Don't keep the event loop alive just for a pending log flush.
-      // Deno's setTimeout returns a number; unref via the symbol if available.
       const t = this.timer as unknown as { unref?: () => void };
       if (typeof t?.unref === "function") t.unref();
     }
@@ -97,9 +98,9 @@ class StreamBuffer {
 }
 
 const defaultCfg = (): LogBufferConfig => {
-  const dev = (Deno.env.get("1TUBE_DEV") || "") === "1";
-  const envInterval = Number(Deno.env.get("1TUBE_LOG_BUFFER_MS"));
-  const envThreshold = Number(Deno.env.get("1TUBE_LOG_BUFFER_LINES"));
+  const dev = (process.env["1TUBE_DEV"] || "") === "1";
+  const envInterval = Number(process.env["1TUBE_LOG_BUFFER_MS"]);
+  const envThreshold = Number(process.env["1TUBE_LOG_BUFFER_LINES"]);
   const flushIntervalMs = Number.isFinite(envInterval) && envInterval >= 0
     ? envInterval
     : (dev ? 0 : 50);
@@ -110,8 +111,8 @@ const defaultCfg = (): LogBufferConfig => {
 };
 
 let cfg: LogBufferConfig = defaultCfg();
-let stdoutBuf = new StreamBuffer(Deno.stdout, cfg);
-let stderrBuf = new StreamBuffer(Deno.stderr, cfg);
+let stdoutBuf = new StreamBuffer(stdoutSink, cfg);
+let stderrBuf = new StreamBuffer(stderrSink, cfg);
 
 export function logInfo(line: string): void {
   stdoutBuf.write(line);
@@ -139,15 +140,15 @@ export function _configureLogBufferForTests(
     flushThreshold: next.flushThreshold ?? 100,
     syncMode: next.syncMode,
   };
-  stdoutBuf = new StreamBuffer(next.stdout ?? Deno.stdout, cfg);
-  stderrBuf = new StreamBuffer(next.stderr ?? Deno.stderr, cfg);
+  stdoutBuf = new StreamBuffer(next.stdout ?? stdoutSink, cfg);
+  stderrBuf = new StreamBuffer(next.stderr ?? stderrSink, cfg);
 }
 
 /** Test-only: reset config back to env-derived defaults. */
 export function _resetLogBufferForTests(): void {
   cfg = defaultCfg();
-  stdoutBuf = new StreamBuffer(Deno.stdout, cfg);
-  stderrBuf = new StreamBuffer(Deno.stderr, cfg);
+  stdoutBuf = new StreamBuffer(stdoutSink, cfg);
+  stderrBuf = new StreamBuffer(stderrSink, cfg);
 }
 
 export function _logBufferStatsForTests(): {

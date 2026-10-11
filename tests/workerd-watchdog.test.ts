@@ -9,11 +9,12 @@
  *
  * `pidRss()` is exercised end-to-end against the test process's own
  * PID — every supported platform should return a sensible non-zero
- * RSS for a running Deno process, so this is the most direct
+ * RSS for a running Bun process, so this is the most direct
  * cross-platform smoke check we can afford in CI.
  */
 
-import { assert, assertEquals, assertGreater } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals, assertGreater } from "./_assert.ts";
 import {
   createWorkerdWatchdog,
   recommendedBudgetBytes,
@@ -30,7 +31,7 @@ import {
 // proc-stats parsers
 // ---------------------------------------------------------------------------
 
-Deno.test("parseLinuxStatus: extracts VmRSS in bytes", () => {
+test("parseLinuxStatus: extracts VmRSS in bytes", () => {
   // Real /proc/{pid}/status sample (truncated) — kernel 6.x format
   // mixes tabs/spaces; the regex must handle both.
   const status = `Name:\tworkerd
@@ -42,11 +43,11 @@ VmHWM:\t   23456 kB
   assertEquals(parseLinuxStatus(status), 12345 * 1024);
 });
 
-Deno.test("parseLinuxStatus: returns null when VmRSS is missing", () => {
+test("parseLinuxStatus: returns null when VmRSS is missing", () => {
   assertEquals(parseLinuxStatus("Name: workerd\nState: R\n"), null);
 });
 
-Deno.test("parsePsOutput: handles whitespace + leading-zero variants", () => {
+test("parsePsOutput: handles whitespace + leading-zero variants", () => {
   // `ps -o rss=` emits just the numeric value, possibly with leading
   // padding. Some busybox-like ps implementations tack on the column
   // header even with `=`; the parser must strip non-digits.
@@ -57,24 +58,24 @@ Deno.test("parsePsOutput: handles whitespace + leading-zero variants", () => {
   assertEquals(parsePsOutput(" RSS\n  100\n"), 100 * 1024);
 });
 
-Deno.test("parsePsOutput: empty output returns null", () => {
+test("parsePsOutput: empty output returns null", () => {
   assertEquals(parsePsOutput(""), null);
   assertEquals(parsePsOutput("\n   \n"), null);
 });
 
-Deno.test("parseTasklistCsv: parses standard en-US tasklist row", () => {
+test("parseTasklistCsv: parses standard en-US tasklist row", () => {
   const csv = `"workerd.exe","12345","Console","1","45,678 K"`;
   assertEquals(parseTasklistCsv(csv), 45678 * 1024);
 });
 
-Deno.test("parseTasklistCsv: handles non-en locale separators", () => {
+test("parseTasklistCsv: handles non-en locale separators", () => {
   // de-DE separates thousands with a dot; we strip everything
   // non-numeric, so it parses identically.
   const csv = `"workerd.exe","12345","Console","1","45.678 K"`;
   assertEquals(parseTasklistCsv(csv), 45678 * 1024);
 });
 
-Deno.test("parseTasklistCsv: 'no tasks' message returns null", () => {
+test("parseTasklistCsv: 'no tasks' message returns null", () => {
   assertEquals(
     parseTasklistCsv(
       "INFO: No tasks are running which match the specified criteria.",
@@ -83,8 +84,8 @@ Deno.test("parseTasklistCsv: 'no tasks' message returns null", () => {
   );
 });
 
-Deno.test("pidRss: returns a positive number for the current process", async () => {
-  const rss = await pidRss(Deno.pid);
+test("pidRss: returns a positive number for the current process", async () => {
+  const rss = await pidRss(process.pid);
   // Skip on platforms where the helper genuinely can't read RSS
   // (e.g. some sandboxed CI runners that lack /proc, ps, AND
   // tasklist). We log a clear marker so the skip is visible.
@@ -92,7 +93,7 @@ Deno.test("pidRss: returns a positive number for the current process", async () 
     console.log("[skipped: pidRss returned null on this platform]");
     return;
   }
-  // A Deno test process is at least a few MB; any value much
+  // A Bun test process is at least a few MB; any value much
   // smaller than that is almost certainly a parser bug. Use 1MB
   // as the floor.
   assertGreater(rss, 1 * 1024 * 1024, `expected RSS > 1MB; got ${rss}`);
@@ -142,7 +143,7 @@ function manualClock() {
   };
 }
 
-Deno.test("watchdog: under-budget RSS never triggers a recycle", async () => {
+test("watchdog: under-budget RSS never triggers a recycle", async () => {
   const backend = stubBackend();
   const clock = manualClock();
   const w = createWorkerdWatchdog({
@@ -163,7 +164,7 @@ Deno.test("watchdog: under-budget RSS never triggers a recycle", async () => {
   assertEquals(w.stats.samples, 10);
 });
 
-Deno.test("watchdog: requires N consecutive over-budget samples before recycling", async () => {
+test("watchdog: requires N consecutive over-budget samples before recycling", async () => {
   const backend = stubBackend();
   const clock = manualClock();
   const w = createWorkerdWatchdog({
@@ -193,7 +194,7 @@ Deno.test("watchdog: requires N consecutive over-budget samples before recycling
   assertEquals(w.stats.recycles, 1);
 });
 
-Deno.test("watchdog: a single under-budget sample resets the streak", async () => {
+test("watchdog: a single under-budget sample resets the streak", async () => {
   const backend = stubBackend();
   const clock = manualClock();
   let value = 150 * 1024 * 1024;
@@ -222,7 +223,7 @@ Deno.test("watchdog: a single under-budget sample resets the streak", async () =
   assertEquals(backend.reloadCalls, 0); // never crossed 3 consecutive
 });
 
-Deno.test("watchdog: cooldown suppresses checks immediately after recycle", async () => {
+test("watchdog: cooldown suppresses checks immediately after recycle", async () => {
   const backend = stubBackend();
   const clock = manualClock();
   const w = createWorkerdWatchdog({
@@ -255,7 +256,7 @@ Deno.test("watchdog: cooldown suppresses checks immediately after recycle", asyn
   assertEquals(backend.reloadCalls, 2);
 });
 
-Deno.test("watchdog: pid===null skips the sample without resetting cooldown", async () => {
+test("watchdog: pid===null skips the sample without resetting cooldown", async () => {
   const backend = stubBackend(null);
   const clock = manualClock();
   const w = createWorkerdWatchdog({
@@ -280,7 +281,7 @@ Deno.test("watchdog: pid===null skips the sample without resetting cooldown", as
   assertEquals(backend.reloadCalls, 1);
 });
 
-Deno.test("watchdog: getRss returning null counts as 'skip', not 'over'", async () => {
+test("watchdog: getRss returning null counts as 'skip', not 'over'", async () => {
   const backend = stubBackend();
   const clock = manualClock();
   let nulls = 0;
@@ -303,7 +304,7 @@ Deno.test("watchdog: getRss returning null counts as 'skip', not 'over'", async 
   assertEquals(w.stats.overBudgetStreak, 0);
 });
 
-Deno.test("watchdog: a failed reload still updates counters and respects cooldown", async () => {
+test("watchdog: a failed reload still updates counters and respects cooldown", async () => {
   const backend = stubBackend();
   (backend as { reloadShouldFail?: boolean }).reloadShouldFail = true;
   const clock = manualClock();
@@ -335,7 +336,7 @@ Deno.test("watchdog: a failed reload still updates counters and respects cooldow
 // recommendedBudgetBytes
 // ---------------------------------------------------------------------------
 
-Deno.test("recommendedBudgetBytes: returns null when no manifest declares memoryMB", () => {
+test("recommendedBudgetBytes: returns null when no manifest declares memoryMB", () => {
   const manifests = new Map<string, { memoryMB?: number }>([
     ["a", {}],
     ["b", { memoryMB: 0 }],
@@ -343,7 +344,7 @@ Deno.test("recommendedBudgetBytes: returns null when no manifest declares memory
   assertEquals(recommendedBudgetBytes(manifests), null);
 });
 
-Deno.test("recommendedBudgetBytes: sums declared memoryMB, applies safety + base", () => {
+test("recommendedBudgetBytes: sums declared memoryMB, applies safety + base", () => {
   const manifests = new Map<string, { memoryMB?: number }>([
     ["a", { memoryMB: 64 }],
     ["b", { memoryMB: 128 }],
@@ -353,7 +354,7 @@ Deno.test("recommendedBudgetBytes: sums declared memoryMB, applies safety + base
   assertEquals(recommendedBudgetBytes(manifests), 352 * 1024 * 1024);
 });
 
-Deno.test("recommendedBudgetBytes: honours overrides", () => {
+test("recommendedBudgetBytes: honours overrides", () => {
   const manifests = new Map<string, { memoryMB?: number }>([
     ["a", { memoryMB: 100 }],
   ]);

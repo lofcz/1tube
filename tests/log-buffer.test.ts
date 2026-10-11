@@ -5,7 +5,8 @@
  * pass-through, and that writes survive a closed/erroring stream.
  */
 
-import { assert, assertEquals } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals } from "./_assert.ts";
 import {
   _configureLogBufferForTests,
   _logBufferStatsForTests,
@@ -62,7 +63,7 @@ function makeBrokenSink(throwOnCallNum: number) {
   };
 }
 
-Deno.test("log-buffer: syncMode flushes every line immediately", () => {
+test("log-buffer: syncMode flushes every line immediately", () => {
   const out = makeSink();
   const err = makeSink();
   _configureLogBufferForTests({
@@ -84,7 +85,7 @@ Deno.test("log-buffer: syncMode flushes every line immediately", () => {
   _resetLogBufferForTests();
 });
 
-Deno.test("log-buffer: flushIntervalMs=0 also flushes immediately", () => {
+test("log-buffer: flushIntervalMs=0 also flushes immediately", () => {
   const out = makeSink();
   _configureLogBufferForTests({
     flushIntervalMs: 0,
@@ -99,7 +100,7 @@ Deno.test("log-buffer: flushIntervalMs=0 also flushes immediately", () => {
   _resetLogBufferForTests();
 });
 
-Deno.test("log-buffer: threshold flush — Nth line triggers a single batched write", () => {
+test("log-buffer: threshold flush — Nth line triggers a single batched write", () => {
   const out = makeSink();
   _configureLogBufferForTests({
     flushIntervalMs: 50,
@@ -123,7 +124,7 @@ Deno.test("log-buffer: threshold flush — Nth line triggers a single batched wr
   _resetLogBufferForTests();
 });
 
-Deno.test("log-buffer: interval flush — line appears after the timer fires", async () => {
+test("log-buffer: interval flush — line appears after the timer fires", async () => {
   const out = makeSink();
   _configureLogBufferForTests({
     flushIntervalMs: 30,
@@ -146,7 +147,7 @@ Deno.test("log-buffer: interval flush — line appears after the timer fires", a
   _resetLogBufferForTests();
 });
 
-Deno.test("log-buffer: explicit flush() drains both streams in one call each", () => {
+test("log-buffer: explicit flush() drains both streams in one call each", () => {
   const out = makeSink();
   const err = makeSink();
   _configureLogBufferForTests({
@@ -175,7 +176,7 @@ Deno.test("log-buffer: explicit flush() drains both streams in one call each", (
   _resetLogBufferForTests();
 });
 
-Deno.test("log-buffer: stdout and stderr buffer independently", () => {
+test("log-buffer: stdout and stderr buffer independently", () => {
   const out = makeSink();
   const err = makeSink();
   _configureLogBufferForTests({
@@ -204,7 +205,7 @@ Deno.test("log-buffer: stdout and stderr buffer independently", () => {
   _resetLogBufferForTests();
 });
 
-Deno.test("log-buffer: write errors are swallowed (no crash on closed pipe)", () => {
+test("log-buffer: write errors are swallowed (no crash on closed pipe)", () => {
   const broken = makeBrokenSink(1);
   _configureLogBufferForTests({
     syncMode: true,
@@ -223,7 +224,7 @@ Deno.test("log-buffer: write errors are swallowed (no crash on closed pipe)", ()
   _resetLogBufferForTests();
 });
 
-Deno.test("log-buffer: flush() on an empty buffer is a no-op", () => {
+test("log-buffer: flush() on an empty buffer is a no-op", () => {
   const out = makeSink();
   _configureLogBufferForTests({
     flushIntervalMs: 1000,
@@ -240,7 +241,7 @@ Deno.test("log-buffer: flush() on an empty buffer is a no-op", () => {
   _resetLogBufferForTests();
 });
 
-Deno.test("log-buffer: multiple writes between threshold/interval batch into one syscall", () => {
+test("log-buffer: multiple writes between threshold/interval batch into one syscall", () => {
   const out = makeSink();
   _configureLogBufferForTests({
     flushIntervalMs: 1000,

@@ -53,7 +53,7 @@ export const DEPLOYMENT_ID_HEADER = "x-deployment-id";
 /**
  * Node builtin module names. Imports of these (bare or `node:`-prefixed) are
  * marked external for the Vercel target so the real Node runtime provides them
- * instead of bundling Deno's polyfills. Subpath imports (e.g. `stream/web`,
+ * instead of bundling polyfills. Subpath imports (e.g. `stream/web`,
  * `fs/promises`) are matched by their head segment.
  */
 export const NODE_BUILTIN_MODULES: readonly string[] = [
@@ -186,7 +186,8 @@ function __1tubeCaptureServe(arg1, arg2) {
 }
 
 if (typeof globalThis.Deno === "undefined") {
-  // Pure Node (Vercel): install the full shim.
+  // Pure Node (Vercel) — or a Bun realm importing the bundle in 1tube's
+  // own tests: install the full shim.
   Object.defineProperty(globalThis, "Deno", {
     value: { env: __1tubeDenoEnv, serve: __1tubeCaptureServe },
     writable: true,
@@ -194,8 +195,9 @@ if (typeof globalThis.Deno === "undefined") {
     enumerable: false,
   });
 } else {
-  // Host Deno (1tube's own tests): override only serve so the handler is
-  // captured instead of binding a real port; leave the rest of Deno intact.
+  // A realm that already has \`Deno\` (a Deno host, or an earlier bundle's
+  // shim): override only serve so the handler is captured instead of
+  // binding a real port; leave the rest of Deno intact.
   try {
     globalThis.Deno.serve = __1tubeCaptureServe;
   } catch (_e) { /* serve not writable — capture unavailable in this realm */ }

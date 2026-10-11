@@ -22,7 +22,7 @@ The [`web/`](./web/README.md) folder is a Vite app whose `/chat` route POSTs to
 `chat/` through the gateway. Run them together:
 
 ```bash
-deno task play                     # terminal 1: gateway on :3199
+bun run play                       # terminal 1: gateway on :3199
 cd playground/web && bun run dev   # terminal 2: frontend on :5173
 ```
 
@@ -31,10 +31,10 @@ cd playground/web && bun run dev   # terminal 2: frontend on :5173
 From the repo root:
 
 ```bash
-deno task play
+bun run play
 ```
 
-The `play` task implies `--dev --hmr`. Without `--dev`, the gateway will refuse
+The `play` script implies `--dev --hmr`. Without `--dev`, the gateway will refuse
 to start since neither `JWT_SECRET` nor `SUPABASE_SERVICE_ROLE_KEY` is set in
 the environment (Phase 0 hardening).
 
@@ -57,7 +57,7 @@ the full field reference.
 The TS runtime ignores these fields, so adding manifests today is
 forward-compatible.
 
-That's `deno task dev` pointed at `./playground` on port `3199` (so it doesn't
+That's `bun src/cli.ts` pointed at `./playground` on port `3199` (so it doesn't
 clash with a real project running on the default `3100`). HMR is on — edits to
 any function reload only that function.
 
@@ -82,9 +82,9 @@ curl http://localhost:3199/functions/v1/whoami \
 
 ## Standalone mode
 
-Each function still works without 1tube — the shim falls back to `Deno.serve()`
-when `globalThis.__edgeFunctionRegistry` is absent. Useful for quick isolation
-tests:
+Each function still works without 1tube under plain Deno — the shim falls back
+to `Deno.serve()` when `globalThis.__edgeFunctionRegistry` is absent. Useful for
+quick isolation tests:
 
 ```bash
 deno run --allow-net --allow-env playground/hello/index.ts

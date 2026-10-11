@@ -4,7 +4,7 @@
  * Boots a real `1tube` gateway with `--backend workerd` against the
  * project's `playground/` functions, then hits the same surface a user
  * would (`/functions/v1/hello`, `/functions/v1/echo`) and asserts the
- * responses match what the Deno backend produces. This is the only
+ * responses match what the Bun backend produces. This is the only
  * test in the suite that depends on the workerd binary being on PATH;
  * it skips silently with a console note when it isn't, so unrelated CI
  * jobs that don't carry workerd still pass.
@@ -15,9 +15,12 @@
  * we give the boot up to 60s.
  */
 
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals } from "./_assert.ts";
+import { setDefaultTimeout, test } from "bun:test";
+import { copyFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
-import { fromFileUrl } from "jsr:@std/path@^1/from-file-url";
+import { fileURLToPath } from "node:url";
 import { probeVersion } from "../src/backends/workerd/process.ts";
 import { devGatewayEnv, signJwt } from "./_helpers.ts";
 
@@ -27,14 +30,22 @@ import { devGatewayEnv, signJwt } from "./_helpers.ts";
 const DEV_JWT_SECRET =
   "super-secret-jwt-token-with-at-least-32-characters-long";
 
-const PROJECT_ROOT = resolvePath(dirname(fromFileUrl(import.meta.url)), "..");
+// Each test boots a real gateway + workerd (bundling on a cold cache can take
+// a while, and the crash-recovery test waits up to 30s for the swap).
+setDefaultTimeout(180_000);
 
-const E2E_OPTS = { sanitizeOps: false, sanitizeResources: false } as const;
+const PROJECT_ROOT = resolvePath(dirname(fileURLToPath(import.meta.url)), "..");
+
+
+/** Bind a throwaway TCP listener so a port can be probed synchronously. */
+function listenTcp(port: number) {
+  return Bun.listen({ hostname: "127.0.0.1", port, socket: { data() {} } });
+}
 
 function freePort(): number {
-  const l = Deno.listen({ hostname: "127.0.0.1", port: 0 });
-  const port = (l.addr as Deno.NetAddr).port;
-  l.close();
+  const l = listenTcp(0);
+  const port = l.port;
+  l.stop(true);
   return port;
 }
 
@@ -42,12 +53,12 @@ function freeWorkerdBasePort(): number {
   const span = 64;
   for (let attempt = 0; attempt < 100; attempt++) {
     const base = 20_000 + Math.floor(Math.random() * 30_000);
-    const listeners: Deno.Listener[] = [];
+    const listeners: ReturnType<typeof listenTcp>[] = [];
     try {
       for (const slotOffset of [0, 500]) {
         for (let i = 0; i < span; i++) {
           listeners.push(
-            Deno.listen({ hostname: "127.0.0.1", port: base + slotOffset + i }),
+            listenTcp(base + slotOffset + i),
           );
         }
       }
@@ -57,7 +68,7 @@ function freeWorkerdBasePort(): number {
     } finally {
       for (const l of listeners) {
         try {
-          l.close();
+          l.stop(true);
         } catch { /* already closed */ }
       }
     }
@@ -87,7 +98,7 @@ async function waitForGateway(port: number, timeoutMs: number): Promise<void> {
 }
 
 async function workerdAvailable(): Promise<boolean> {
-  const candidate = Deno.env.get("1TUBE_WORKERD_BIN") ?? "workerd";
+  const candidate = process.env["1TUBE_WORKERD_BIN"] ?? "workerd";
   try {
     await probeVersion(candidate);
     return true;
@@ -96,9 +107,8 @@ async function workerdAvailable(): Promise<boolean> {
   }
 }
 
-Deno.test(
+test(
   "workerd-e2e: gateway proxies hello + echo through workerd",
-  E2E_OPTS,
   async () => {
     if (!(await workerdAvailable())) {
       console.log("[skipped: workerd binary not on PATH]");
@@ -114,14 +124,12 @@ Deno.test(
     // subprocess can boot without a real JWT_SECRET configured. We feed
     // `1TUBE_WORKERD_ONLY` via a thin wrapper: the orchestrator
     // currently exposes the `only` filter through code, not env, so we
-    // route through DENO_DIR-style flags by using a small inline driver
+    // route through env-style flags by using a small inline driver
     // script. Simplest approach: just let the backend bundle every
     // function in `playground/` — small enough that boot is fast.
-    const child = new Deno.Command(Deno.execPath(), {
-      args: [
-        "run",
-        "--quiet",
-        "--allow-all",
+    const child = Bun.spawn({
+      cmd: [
+        process.execPath,
         "src/server.ts",
         "--backend",
         "workerd",
@@ -137,7 +145,7 @@ Deno.test(
       ],
       cwd: PROJECT_ROOT,
       env: {
-        ...Deno.env.toObject(),
+        ...process.env,
         ...devGatewayEnv(),
         // Force eager + non-watch — HMR doesn't apply to workerd anyway
         // and we want a deterministic boot.
@@ -155,9 +163,9 @@ Deno.test(
         // but-empty vars on the floor.
         "WORKERD_E2E_FLAG": "",
       },
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
     // Tee stderr to test stdout so a failure shows the gateway log.
     // Stdout pump is best-effort; we don't assert on its content.
@@ -170,9 +178,7 @@ Deno.test(
           if (done) break;
           const chunk = dec.decode(value);
           // Prefix so the test log is easy to scan.
-          Deno.stderr.writeSync(
-            new TextEncoder().encode(chunk.replace(/^/gm, "   ⏵ ")),
-          );
+          process.stderr.write(chunk.replace(/^/gm, "   ⏵ "));
         }
       } catch { /* */ }
     })();
@@ -402,12 +408,12 @@ Deno.test(
     } finally {
       // Graceful shutdown — SIGTERM on Unix, SIGKILL elsewhere.
       try {
-        child.kill(Deno.build.os === "windows" ? "SIGKILL" : "SIGTERM");
+        child.kill(process.platform === "win32" ? "SIGKILL" : "SIGTERM");
       } catch { /* already gone */ }
       try {
         // Bound the wait so a hung child can't pin the test runner.
         await Promise.race([
-          child.status,
+          child.exited,
           new Promise((r) => setTimeout(r, 5_000)),
         ]);
       } catch { /* */ }
@@ -420,28 +426,27 @@ Deno.test(
   },
 );
 
-Deno.test(
+test(
   "workerd-e2e: shared module top-level state runs in gateway runtime",
-  E2E_OPTS,
   async () => {
     if (!(await workerdAvailable())) {
       console.log("[skipped: workerd binary not on PATH]");
       return;
     }
 
-    const tmp = await Deno.makeTempDir({ prefix: "1tube-workerd-shared-e2e-" });
+    const tmp = await mkdtemp(join(tmpdir(), "1tube-workerd-shared-e2e-"));
     const port = freePort();
     const workerdBasePort = freeWorkerdBasePort();
-    await Deno.mkdir(join(tmp, "_shared"), { recursive: true });
-    await Deno.mkdir(join(tmp, "needs-profile"), { recursive: true });
-    await Deno.writeTextFile(
+    await mkdir(join(tmp, "_shared"), { recursive: true });
+    await mkdir(join(tmp, "needs-profile"), { recursive: true });
+    await writeFile(
       join(tmp, "_shared", "handler.ts"),
       `export function serve(handler, opts = {}) {
   globalThis.__edgeFunctionRegistry.register(handler, { public: opts.public ?? false });
 }
 `,
     );
-    await Deno.writeTextFile(
+    await writeFile(
       join(tmp, "_shared", "profile-cache.ts"),
       `const bootId = crypto.randomUUID();
 let calls = 0;
@@ -454,7 +459,7 @@ export function invalidateProfile() {
 }
 `,
     );
-    await Deno.writeTextFile(
+    await writeFile(
       join(tmp, "needs-profile", "index.ts"),
       `import { serve } from "../_shared/handler.ts";
 import { getCachedProfile } from "../_shared/profile-cache.ts";
@@ -462,11 +467,9 @@ serve(async () => Response.json(await getCachedProfile("u1")), { public: true })
 `,
     );
 
-    const child = new Deno.Command(Deno.execPath(), {
-      args: [
-        "run",
-        "--quiet",
-        "--allow-all",
+    const child = Bun.spawn({
+      cmd: [
+        process.execPath,
         "src/server.ts",
         "--backend",
         "workerd",
@@ -482,14 +485,14 @@ serve(async () => Response.json(await getCachedProfile("u1")), { public: true })
       ],
       cwd: PROJECT_ROOT,
       env: {
-        ...Deno.env.toObject(),
+        ...process.env,
         ...devGatewayEnv(),
         "1TUBE_HMR": "0",
         "1TUBE_LAZY": "0",
       },
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
     const teePump = (async () => {
       const reader = child.stderr.getReader();
@@ -498,9 +501,7 @@ serve(async () => Response.json(await getCachedProfile("u1")), { public: true })
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
-          Deno.stderr.writeSync(
-            new TextEncoder().encode(dec.decode(value).replace(/^/gm, "   ⏵ ")),
-          );
+          process.stderr.write(dec.decode(value).replace(/^/gm, "   ⏵ "));
         }
       } catch { /* */ }
     })();
@@ -539,11 +540,11 @@ serve(async () => Response.json(await getCachedProfile("u1")), { public: true })
       assertEquals(secondBody.calls, 2);
     } finally {
       try {
-        child.kill(Deno.build.os === "windows" ? "SIGKILL" : "SIGTERM");
+        child.kill(process.platform === "win32" ? "SIGKILL" : "SIGTERM");
       } catch { /* */ }
       try {
         await Promise.race([
-          child.status,
+          child.exited,
           new Promise((r) => setTimeout(r, 2_000)),
         ]);
       } catch { /* */ }
@@ -552,7 +553,7 @@ serve(async () => Response.json(await getCachedProfile("u1")), { public: true })
       } catch { /* */ }
       await teePump.catch(() => {});
       await stdoutPump.catch(() => {});
-      await Deno.remove(tmp, { recursive: true }).catch(() => {});
+      await rm(tmp, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
@@ -574,9 +575,8 @@ serve(async () => Response.json(await getCachedProfile("u1")), { public: true })
  * sleeps. On a warm bundle cache the swap typically completes in
  * 200–800ms (incremental rebundle of just `hello`).
  */
-Deno.test(
+test(
   "workerd-e2e: HMR rebundles + swaps without dropping requests",
-  E2E_OPTS,
   async () => {
     if (!(await workerdAvailable())) {
       console.log("[skipped: workerd binary not on PATH]");
@@ -588,28 +588,26 @@ Deno.test(
     // Build a minimal playground copy with just `hello` and the
     // shared handler — keeps the workerd boot under 5s on warm caches
     // by avoiding the full bundle sweep we do in the main e2e test.
-    const tmp = await Deno.makeTempDir({ prefix: "1tube-hmr-e2e-" });
+    const tmp = await mkdtemp(join(tmpdir(), "1tube-hmr-e2e-"));
     const srcPlayground = join(PROJECT_ROOT, "playground");
-    await Deno.mkdir(join(tmp, "hello"), { recursive: true });
-    await Deno.mkdir(join(tmp, "_shared"), { recursive: true });
-    await Deno.copyFile(
+    await mkdir(join(tmp, "hello"), { recursive: true });
+    await mkdir(join(tmp, "_shared"), { recursive: true });
+    await copyFile(
       join(srcPlayground, "hello", "index.ts"),
       join(tmp, "hello", "index.ts"),
     );
-    await Deno.copyFile(
+    await copyFile(
       join(srcPlayground, "hello", "1tube.json"),
       join(tmp, "hello", "1tube.json"),
     );
-    await Deno.copyFile(
+    await copyFile(
       join(srcPlayground, "_shared", "handler.ts"),
       join(tmp, "_shared", "handler.ts"),
     );
 
-    const child = new Deno.Command(Deno.execPath(), {
-      args: [
-        "run",
-        "--quiet",
-        "--allow-all",
+    const child = Bun.spawn({
+      cmd: [
+        process.execPath,
         "src/server.ts",
         "--backend",
         "workerd",
@@ -626,13 +624,13 @@ Deno.test(
       ],
       cwd: PROJECT_ROOT,
       env: {
-        ...Deno.env.toObject(),
+        ...process.env,
         ...devGatewayEnv(),
         "1TUBE_LAZY": "0",
       },
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
     const teePump = (async () => {
       const reader = child.stderr.getReader();
@@ -641,9 +639,7 @@ Deno.test(
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
-          Deno.stderr.writeSync(
-            new TextEncoder().encode(dec.decode(value).replace(/^/gm, "   ⏵ ")),
-          );
+          process.stderr.write(dec.decode(value).replace(/^/gm, "   ⏵ "));
         }
       } catch { /* */ }
     })();
@@ -679,7 +675,7 @@ serve(
   { public: true },
 );
 `;
-      await Deno.writeTextFile(join(tmp, "hello", "index.ts"), newSource);
+      await writeFile(join(tmp, "hello", "index.ts"), newSource);
 
       // Poll for the swap. 30s budget covers cold-disk + esbuild's
       // first incremental run on a fresh tmpdir cache.
@@ -711,11 +707,11 @@ serve(
       assertEquals(observedAfter!.message, "hello, M4-RELOADED");
     } finally {
       try {
-        child.kill(Deno.build.os === "windows" ? "SIGKILL" : "SIGTERM");
+        child.kill(process.platform === "win32" ? "SIGKILL" : "SIGTERM");
       } catch { /* */ }
       try {
         await Promise.race([
-          child.status,
+          child.exited,
           new Promise((r) => setTimeout(r, 5_000)),
         ]);
       } catch { /* */ }
@@ -724,7 +720,7 @@ serve(
       } catch { /* */ }
       await teePump.catch(() => {});
       await stdoutPump.catch(() => {});
-      await Deno.remove(tmp, { recursive: true }).catch(() => {});
+      await rm(tmp, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
@@ -741,17 +737,16 @@ serve(
  *      `INTERNAL_KEY` so we can authenticate /health and read the
  *      live workerd PID + generation.
  *   2. Verify /hello responds before the kill.
- *   3. Kill the workerd process via OS-native signal (`Deno.kill` on
- *      Unix, `taskkill /F /PID` on Windows since Deno can't signal
- *      arbitrary PIDs there).
+ *   3. Kill the workerd process via OS-native signal (`process.kill`
+ *      on Unix, `taskkill /F /PID` on Windows, where the workerd
+ *      grandchild can't be signalled reliably from here).
  *   4. Poll /health until `workerd.generation` increments AND
  *      `workerd.pid` is non-null — that's the swap completing.
  *   5. Verify /hello responds again to prove the new workerd is
  *      actually serving and the gateway re-bridged its routes.
  */
-Deno.test(
+test(
   "workerd-e2e: gateway auto-recovers when workerd is killed externally",
-  E2E_OPTS,
   async () => {
     if (!(await workerdAvailable())) {
       console.log("[skipped: workerd binary not on PATH]");
@@ -763,11 +758,9 @@ Deno.test(
     const playgroundDir = join(PROJECT_ROOT, "playground");
     const internalKey = "test-internal-key-deadbeef";
 
-    const child = new Deno.Command(Deno.execPath(), {
-      args: [
-        "run",
-        "--quiet",
-        "--allow-all",
+    const child = Bun.spawn({
+      cmd: [
+        process.execPath,
         "src/server.ts",
         "--backend",
         "workerd",
@@ -783,7 +776,7 @@ Deno.test(
       ],
       cwd: PROJECT_ROOT,
       env: {
-        ...Deno.env.toObject(),
+        ...process.env,
         ...devGatewayEnv(),
         "1TUBE_HMR": "0",
         "1TUBE_LAZY": "0",
@@ -791,9 +784,9 @@ Deno.test(
         // Restrict to a single function to keep the boot fast.
         "1TUBE_WORKERD_ONLY": "hello",
       },
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
     const teePump = (async () => {
       const reader = child.stderr.getReader();
@@ -802,9 +795,7 @@ Deno.test(
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
-          Deno.stderr.writeSync(
-            new TextEncoder().encode(dec.decode(value).replace(/^/gm, "   ⏵ ")),
-          );
+          process.stderr.write(dec.decode(value).replace(/^/gm, "   ⏵ "));
         }
       } catch { /* */ }
     })();
@@ -849,21 +840,20 @@ Deno.test(
       assertEquals(helloBefore.status, 200);
       await helloBefore.body?.cancel();
 
-      // Kill workerd. On Windows, Deno only allows signalling its own
-      // direct children; the workerd subprocess is a grandchild so we
-      // shell out to taskkill.
-      if (Deno.build.os === "windows") {
-        const kill = new Deno.Command("taskkill", {
-          args: ["/F", "/PID", String(pidBefore)],
-          stdout: "null",
-          stderr: "null",
+      // Kill workerd. On Windows the workerd subprocess is a grandchild
+      // with no POSIX signals, so we shell out to taskkill.
+      if (process.platform === "win32") {
+        const kill = Bun.spawn({
+          cmd: ["taskkill", "/F", "/PID", String(pidBefore)],
+          stdout: "ignore",
+          stderr: "ignore",
         });
-        const out = await kill.output();
-        assert(out.success, `taskkill failed for pid ${pidBefore}`);
+        const code = await kill.exited;
+        assert(code === 0, `taskkill failed for pid ${pidBefore}`);
       } else {
         // Unix: SIGKILL bypasses any graceful-shutdown logic so the
         // backend definitively observes an unexpected exit.
-        Deno.kill(pidBefore, "SIGKILL");
+        process.kill(pidBefore!, "SIGKILL");
       }
 
       // Poll /health until generation increments AND pid is live again.
@@ -967,11 +957,11 @@ Deno.test(
       );
     } finally {
       try {
-        child.kill(Deno.build.os === "windows" ? "SIGKILL" : "SIGTERM");
+        child.kill(process.platform === "win32" ? "SIGKILL" : "SIGTERM");
       } catch { /* */ }
       try {
         await Promise.race([
-          child.status,
+          child.exited,
           new Promise((r) => setTimeout(r, 5_000)),
         ]);
       } catch { /* */ }

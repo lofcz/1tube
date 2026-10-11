@@ -9,10 +9,11 @@
  * we don't need the metrics map fresh, only the extras formatting.
  */
 
-import { assert, assertEquals, assertStringIncludes } from "@std/assert";
+import { test } from "bun:test";
+import { assert, assertEquals, assertStringIncludes } from "./_assert.ts";
 import { getPrometheusMetrics } from "../src/gateway/logging.ts";
 
-Deno.test("getPrometheusMetrics: workerd block omitted when extras absent", () => {
+test("getPrometheusMetrics: workerd block omitted when extras absent", () => {
   const out = getPrometheusMetrics();
   // Sanity: the static gauges still emit even without extras.
   assertStringIncludes(out, "onetube_uptime_seconds");
@@ -22,7 +23,7 @@ Deno.test("getPrometheusMetrics: workerd block omitted when extras absent", () =
   assertEquals(out.includes("onetube_function_breaker_open"), false);
 });
 
-Deno.test("getPrometheusMetrics: workerd block emits all configured gauges", () => {
+test("getPrometheusMetrics: workerd block emits all configured gauges", () => {
   const out = getPrometheusMetrics({
     workerd: {
       pid: 4242,
@@ -61,7 +62,7 @@ Deno.test("getPrometheusMetrics: workerd block emits all configured gauges", () 
   );
 });
 
-Deno.test("getPrometheusMetrics: workerd block omits null-valued gauges", () => {
+test("getPrometheusMetrics: workerd block omits null-valued gauges", () => {
   // pid: null is the "between processes" state (mid-recycle, post-
   // crash before reload). We still emit `up=0` and `pid=0` so dashboards
   // can detect the gap, but don't emit RSS/budget/last_reload when we
@@ -87,7 +88,7 @@ Deno.test("getPrometheusMetrics: workerd block omits null-valued gauges", () => 
   assertEquals(out.includes("onetube_workerd_bundle_bytes"), false);
 });
 
-Deno.test("getPrometheusMetrics: breaker view emits all three gauges per function", () => {
+test("getPrometheusMetrics: breaker view emits all three gauges per function", () => {
   const out = getPrometheusMetrics({
     breakers: {
       hello: { breakerOpen: false, recycleRecommended: false, errorRate: 0 },
@@ -114,7 +115,7 @@ Deno.test("getPrometheusMetrics: breaker view emits all three gauges per functio
   );
 });
 
-Deno.test("getPrometheusMetrics: label values escape backslash, quote, newline", () => {
+test("getPrometheusMetrics: label values escape backslash, quote, newline", () => {
   // Defence-in-depth: function names are sanitised at registration
   // time, but a future bug could let a non-clean name reach this
   // path. The label-quoting helper must be airtight so a name like
@@ -137,7 +138,7 @@ Deno.test("getPrometheusMetrics: label values escape backslash, quote, newline",
   );
 });
 
-Deno.test("getPrometheusMetrics: trailing newline is preserved (Prometheus requires it)", () => {
+test("getPrometheusMetrics: trailing newline is preserved (Prometheus requires it)", () => {
   const out = getPrometheusMetrics();
   assert(
     out.endsWith("\n"),

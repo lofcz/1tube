@@ -16,11 +16,24 @@
  * mirror of the C# side: same canonical-JSON, same HMAC, same
  * manifest-then-bundle hash walk. If the two implementations ever
  * disagree, this file is the canary — easier to reproduce a
- * mismatch in Deno than in priprava.
+ * mismatch in Bun than in priprava.
  */
 
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals } from "./_assert.ts";
+import { setDefaultTimeout, test } from "bun:test";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { build } from "../src/cli/build.ts";
 import {
   ENVELOPE_SCHEMA,
@@ -31,12 +44,11 @@ import {
 import { packageDist, readPayload, runPackage } from "../src/cli/package.ts";
 import { parsePrebuiltManifest } from "../src/backends/workerd/prebuilt.ts";
 
-const PROJECT_ROOT = resolvePath(
-  new URL("..", import.meta.url).pathname.replace(/^\/(\w:)/, "$1"),
-);
+// Real esbuild runs over the playground; cold dependency installs are slow.
+setDefaultTimeout(120_000);
+
+const PROJECT_ROOT = resolvePath(fileURLToPath(new URL("..", import.meta.url)));
 const PLAYGROUND = join(PROJECT_ROOT, "playground");
-const DENO_JSON = join(PROJECT_ROOT, "deno.json");
-const TEST_OPTS = { sanitizeResources: false, sanitizeOps: false } as const;
 
 // 32-byte deterministic key — fine for tests, irrelevant to prod
 // since the secret never leaves a CI runner. We use a fixed value
@@ -51,11 +63,10 @@ function hexKey(bytes: Uint8Array): string {
 }
 
 async function buildFixture(label: string): Promise<string> {
-  const out = await Deno.makeTempDir({ prefix: `1tube-pkg-build-${label}-` });
+  const out = await mkdtemp(join(tmpdir(), `1tube-pkg-build-${label}-`));
   await build({
     functionsDir: PLAYGROUND,
     outDir: out,
-    configPath: DENO_JSON,
     only: ["hello", "echo"],
     sourcemap: false,
   });
@@ -63,28 +74,24 @@ async function buildFixture(label: string): Promise<string> {
 }
 
 async function copyDir(src: string, dest: string): Promise<void> {
-  await Deno.mkdir(dest, { recursive: true });
-  for await (const entry of Deno.readDir(src)) {
+  await mkdir(dest, { recursive: true });
+  for (const entry of await readdir(src, { withFileTypes: true })) {
     const from = join(src, entry.name);
     const to = join(dest, entry.name);
-    if (entry.isDirectory) {
+    if (entry.isDirectory()) {
       await copyDir(from, to);
-    } else if (entry.isFile) {
-      await Deno.copyFile(from, to);
+    } else if (entry.isFile()) {
+      await copyFile(from, to);
     }
   }
 }
 
 async function buildSharedFixture(label: string): Promise<string> {
-  const root = await Deno.makeTempDir({
-    prefix: `1tube-pkg-shared-src-${label}-`,
-  });
-  const out = await Deno.makeTempDir({
-    prefix: `1tube-pkg-shared-build-${label}-`,
-  });
-  await Deno.mkdir(join(root, "_shared"), { recursive: true });
-  await Deno.mkdir(join(root, "needs-profile"), { recursive: true });
-  await Deno.writeTextFile(
+  const root = await mkdtemp(join(tmpdir(), `1tube-pkg-shared-src-${label}-`));
+  const out = await mkdtemp(join(tmpdir(), `1tube-pkg-shared-build-${label}-`));
+  await mkdir(join(root, "_shared"), { recursive: true });
+  await mkdir(join(root, "needs-profile"), { recursive: true });
+  await writeFile(
     join(root, "_shared", "profile-cache.ts"),
     `const bootId = crypto.randomUUID();
 export async function getCachedProfile(userId: string) {
@@ -93,7 +100,7 @@ export async function getCachedProfile(userId: string) {
 export function invalidateProfile(_userId: string) {}
 `,
   );
-  await Deno.writeTextFile(
+  await writeFile(
     join(root, "_shared", "handler.ts"),
     `export function serve(handler: (req: Request) => Response | Promise<Response>) {
   (globalThis as { __edgeFunctionRegistry: { register: (h: unknown, m: unknown) => void } })
@@ -101,7 +108,7 @@ export function invalidateProfile(_userId: string) {}
 }
 `,
   );
-  await Deno.writeTextFile(
+  await writeFile(
     join(root, "needs-profile", "index.ts"),
     `import { serve } from "../_shared/handler.ts";
 import { getCachedProfile } from "../_shared/profile-cache.ts";
@@ -114,7 +121,7 @@ serve(async () => Response.json(await getCachedProfile("u1")));
     only: ["needs-profile"],
     sourcemap: false,
   });
-  await Deno.remove(root, { recursive: true }).catch(() => {});
+  await rm(root, { recursive: true, force: true }).catch(() => {});
   return out;
 }
 
@@ -122,15 +129,11 @@ async function buildMutableFixture(
   label: string,
   responseText: string,
 ): Promise<{ root: string; dist: string }> {
-  const root = await Deno.makeTempDir({
-    prefix: `1tube-pkg-mutable-src-${label}-`,
-  });
-  const dist = await Deno.makeTempDir({
-    prefix: `1tube-pkg-mutable-build-${label}-`,
-  });
-  await Deno.mkdir(join(root, "_shared"), { recursive: true });
-  await Deno.mkdir(join(root, "hello"), { recursive: true });
-  await Deno.writeTextFile(
+  const root = await mkdtemp(join(tmpdir(), `1tube-pkg-mutable-src-${label}-`));
+  const dist = await mkdtemp(join(tmpdir(), `1tube-pkg-mutable-build-${label}-`));
+  await mkdir(join(root, "_shared"), { recursive: true });
+  await mkdir(join(root, "hello"), { recursive: true });
+  await writeFile(
     join(root, "_shared", "handler.ts"),
     `export function serve(handler: (req: Request) => Response | Promise<Response>) {
   (globalThis as { __edgeFunctionRegistry: { register: (h: unknown, m: unknown) => void } })
@@ -138,7 +141,7 @@ async function buildMutableFixture(
 }
 `,
   );
-  await Deno.writeTextFile(
+  await writeFile(
     join(root, "hello", "index.ts"),
     `import { serve } from "../_shared/handler.ts";
 serve(() => new Response(${JSON.stringify(responseText)}));
@@ -262,12 +265,11 @@ async function verifyPayload(
   return { stage: "ok", envelope };
 }
 
-Deno.test(
+test(
   "package round-trip: signature + manifest + bundles all verify",
-  TEST_OPTS,
   async () => {
     const dist = await buildFixture("rt");
-    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-out-"));
     const payload = join(out, "fw.1tube");
 
     const result = await packageDist({
@@ -307,12 +309,11 @@ Deno.test(
   },
 );
 
-Deno.test(
+test(
   "package contentSha256 is stable across package metadata changes",
-  TEST_OPTS,
   async () => {
     const dist = await buildFixture("stable-content");
-    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-content-stable-" });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-content-stable-"));
 
     const first = await packageDist({
       distDir: dist,
@@ -335,13 +336,12 @@ Deno.test(
   },
 );
 
-Deno.test(
+test(
   "package contentSha256 changes when function runtime content changes",
-  TEST_OPTS,
   async () => {
     const first = await buildMutableFixture("content-a", "hello v1");
     const second = await buildMutableFixture("content-b", "hello v2");
-    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-content-change-" });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-content-change-"));
 
     try {
       const firstPkg = await packageDist({
@@ -361,24 +361,21 @@ Deno.test(
         firstPkg.envelope.contentSha256 !== secondPkg.envelope.contentSha256,
       );
     } finally {
-      await Deno.remove(first.root, { recursive: true }).catch(() => {});
-      await Deno.remove(second.root, { recursive: true }).catch(() => {});
+      await rm(first.root, { recursive: true, force: true }).catch(() => {});
+      await rm(second.root, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "package contentSha256 ignores chunk filename-only changes",
-  TEST_OPTS,
   async () => {
     const originalDist = await buildFixture("chunk-rename-original");
-    const renamedDist = await Deno.makeTempDir({
-      prefix: "1tube-pkg-chunk-rename-",
-    });
+    const renamedDist = await mkdtemp(join(tmpdir(), "1tube-pkg-chunk-rename-"));
     await copyDir(originalDist, renamedDist);
 
     const manifestPath = join(renamedDist, "manifest.json");
-    const manifest = JSON.parse(await Deno.readTextFile(manifestPath));
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
     assert(
       manifest.chunks.length > 0,
       "fixture should emit at least one shared chunk",
@@ -388,17 +385,17 @@ Deno.test(
     const oldBase = oldChunk.split("/").pop()!;
     const newChunk = "chunks/renamed-runtime-chunk.js";
     const newBase = newChunk.split("/").pop()!;
-    await Deno.rename(join(renamedDist, oldChunk), join(renamedDist, newChunk));
+    await rename(join(renamedDist, oldChunk), join(renamedDist, newChunk));
 
     manifest.builtAt = "2030-01-01T00:00:00.000Z";
     manifest.chunks[0].file = newChunk;
     for (const chunk of manifest.chunks) {
       if (chunk.file === oldChunk) chunk.file = newChunk;
       const chunkPath = join(renamedDist, chunk.file);
-      const chunkSource = await Deno.readTextFile(chunkPath);
+      const chunkSource = await readFile(chunkPath, "utf8");
       const rewritten = chunkSource.replaceAll(oldBase, newBase);
       if (rewritten !== chunkSource) {
-        await Deno.writeTextFile(chunkPath, rewritten);
+        await writeFile(chunkPath, rewritten);
         chunk.sha256 = await sha256Hex(new TextEncoder().encode(rewritten));
         chunk.bytes = new TextEncoder().encode(rewritten).byteLength;
       }
@@ -408,22 +405,20 @@ Deno.test(
         file === oldChunk ? newChunk : file
       );
       const bundlePath = join(renamedDist, fn.bundleFile);
-      const bundle = await Deno.readTextFile(bundlePath);
+      const bundle = await readFile(bundlePath, "utf8");
       const rewritten = bundle.replaceAll(oldBase, newBase);
       if (rewritten !== bundle) {
-        await Deno.writeTextFile(bundlePath, rewritten);
+        await writeFile(bundlePath, rewritten);
         fn.bundleSha256 = await sha256Hex(new TextEncoder().encode(rewritten));
         fn.bundleBytes = new TextEncoder().encode(rewritten).byteLength;
       }
     }
-    await Deno.writeTextFile(
+    await writeFile(
       manifestPath,
       JSON.stringify(manifest, null, 2) + "\n",
     );
 
-    const out = await Deno.makeTempDir({
-      prefix: "1tube-pkg-chunk-rename-out-",
-    });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-chunk-rename-out-"));
     const first = await packageDist({
       distDir: originalDist,
       outFile: join(out, "first.1tube"),
@@ -440,11 +435,10 @@ Deno.test(
   },
 );
 
-Deno.test(
+test(
   "package CLI can build and write firmware in one command",
-  TEST_OPTS,
   async () => {
-    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-one-shot-" });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-one-shot-"));
     const payload = join(out, "fw.1tube");
     try {
       const code = await runPackage([
@@ -454,8 +448,7 @@ Deno.test(
         "hello",
         "--sourcemap",
         "none",
-        "--config",
-        DENO_JSON,
+        "--no-config",
         "--out",
         payload,
         "--sign-key",
@@ -469,17 +462,16 @@ Deno.test(
         assertEquals(verified.envelope.functionCount, 1);
       }
     } finally {
-      await Deno.remove(out, { recursive: true }).catch(() => {});
+      await rm(out, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "package round-trip: shared module bundles are included and verified",
-  TEST_OPTS,
   async () => {
     const dist = await buildSharedFixture("rt");
-    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-out-"));
     const payload = join(out, "fw.1tube");
 
     const result = await packageDist({
@@ -498,17 +490,16 @@ Deno.test(
       entries.has(`dist/${shared.bundleFile}`),
       `missing entry dist/${shared.bundleFile}`,
     );
-    await Deno.remove(dist, { recursive: true }).catch(() => {});
-    await Deno.remove(out, { recursive: true }).catch(() => {});
+    await rm(dist, { recursive: true, force: true }).catch(() => {});
+    await rm(out, { recursive: true, force: true }).catch(() => {});
   },
 );
 
-Deno.test(
+test(
   "package: wrong key fails signature verification",
-  TEST_OPTS,
   async () => {
     const dist = await buildFixture("wrong-key");
-    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-out-"));
     const payload = join(out, "fw.1tube");
 
     await packageDist({ distDir: dist, outFile: payload, key: KEY });
@@ -518,12 +509,11 @@ Deno.test(
   },
 );
 
-Deno.test(
+test(
   "package: tampered envelope (flip one bit in version) fails signature",
-  TEST_OPTS,
   async () => {
     const dist = await buildFixture("tamper-env");
-    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-out-"));
     const payload = join(out, "fw.1tube");
 
     await packageDist({ distDir: dist, outFile: payload, key: KEY });
@@ -549,12 +539,11 @@ Deno.test(
   },
 );
 
-Deno.test(
+test(
   "package: tampered manifest fails the manifest-hash check",
-  TEST_OPTS,
   async () => {
     const dist = await buildFixture("tamper-manifest");
-    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-out-"));
     const payload = join(out, "fw.1tube");
 
     await packageDist({ distDir: dist, outFile: payload, key: KEY });
@@ -575,12 +564,11 @@ Deno.test(
   },
 );
 
-Deno.test(
+test(
   "package: tampered bundle fails the per-bundle hash check",
-  TEST_OPTS,
   async () => {
     const dist = await buildFixture("tamper-bundle");
-    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-out-"));
     const payload = join(out, "fw.1tube");
 
     const { manifest } = await packageDist({
@@ -601,12 +589,11 @@ Deno.test(
   },
 );
 
-Deno.test(
+test(
   "package: layout matches the .1tube spec (envelope.json + dist/...)",
-  TEST_OPTS,
   async () => {
     const dist = await buildFixture("layout");
-    const out = await Deno.makeTempDir({ prefix: "1tube-pkg-out-" });
+    const out = await mkdtemp(join(tmpdir(), "1tube-pkg-out-"));
     const payload = join(out, "fw.1tube");
 
     await packageDist({ distDir: dist, outFile: payload, key: KEY });
@@ -632,7 +619,7 @@ Deno.test(
   },
 );
 
-Deno.test("envelope: parseEnvelope rejects bad schema / algo", () => {
+test("envelope: parseEnvelope rejects bad schema / algo", () => {
   let threw = false;
   try {
     parseEnvelope({
@@ -681,7 +668,7 @@ async function rewritePayload(
   entries: Map<string, Uint8Array>,
 ): Promise<void> {
   const { BlobWriter, Uint8ArrayReader, ZipWriter } = await import(
-    "@zip-js/zip-js"
+    "@zip.js/zip.js"
   );
   const blobWriter = new BlobWriter("application/zip");
   const zip = new ZipWriter(blobWriter, { level: 6 });
@@ -690,5 +677,5 @@ async function rewritePayload(
   }
   await zip.close();
   const blob = await blobWriter.getData();
-  await Deno.writeFile(payloadPath, new Uint8Array(await blob.arrayBuffer()));
+  await writeFile(payloadPath, new Uint8Array(await blob.arrayBuffer()));
 }

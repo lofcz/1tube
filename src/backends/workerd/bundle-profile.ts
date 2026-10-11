@@ -59,9 +59,10 @@ const __1tubeInvocationCtx = new __1tubeAsyncLocalStorage();
 const __1tubeLogMarker = "__1TUBE_LOG__";
 const __1tubeRawConsoleLog = console.log.bind(console);
 // Like the Deno shim below: only take over console under real workerd.
-// When a bundle is imported into a host Deno realm (1tube's own tests)
-// the test runner's console must stay untouched.
-const __1tubeConsoleCaptureActive = typeof Deno === "undefined";
+// When a bundle is imported into a host Bun/Deno realm (1tube's own
+// tests) the test runner's console must stay untouched.
+const __1tubeHostRealm = typeof Bun !== "undefined" || typeof Deno !== "undefined";
+const __1tubeConsoleCaptureActive = !__1tubeHostRealm;
 
 function __1tubeFormatArg(a) {
   if (typeof a === "string") return a;
@@ -138,18 +139,17 @@ const __1tubeDenoEnv = {
 // instance. Each bundle has its own module-scope \`__1tubeCapturedHandler\`,
 // so the registry's \`register()\` must close over THIS bundle's locals —
 // even if a previous import (e.g. when several bundles are imported into
-// the same Deno realm during tests) already installed its own.
+// the same host realm during tests) already installed its own.
 globalThis.__edgeFunctionRegistry = __1tubeRegistry;
 
-// Install the \`Deno\` shim only when there is no host Deno — i.e. we're
-// running under real workerd. Under host Deno (e.g. when 1tube's own
-// test suite imports a bundle to verify the bundler) we deliberately
-// leave the host's \`Deno\` global untouched: replacing it would break
-// the test runner's own use of Deno.makeTempDir / Deno.readDir / etc.
-// The runtime contract for the env shim is exercised by the workerd
-// end-to-end test, which runs inside an actual workerd process where
-// \`typeof Deno === "undefined"\`.
-if (typeof Deno === "undefined") {
+// Install the \`Deno\` shim only under real workerd. When 1tube's own
+// test suite imports a bundle into the host Bun realm to verify the
+// bundler, we deliberately leave the host's globals untouched: a \`Deno\`
+// global would leak into every later test in the same process (and
+// flip "am I on Deno?" checks in libraries). The runtime contract for
+// the env shim is exercised by the workerd end-to-end test, which runs
+// inside an actual workerd process.
+if (!__1tubeHostRealm) {
   Object.defineProperty(globalThis, "Deno", {
     value: {
       env: __1tubeDenoEnv,

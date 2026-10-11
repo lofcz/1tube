@@ -2,8 +2,11 @@
  * Dotenv parse / apply / path-resolution for HMR secret reloads.
  */
 
-import { assert, assertEquals } from "@std/assert";
-import { join } from "@std/path";
+import { test } from "bun:test";
+import { assert, assertEquals } from "./_assert.ts";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   applyEnvFiles,
   isEnvFileEvent,
@@ -15,9 +18,9 @@ import {
   createEnvHotReloader,
   type EnvHotReloader,
 } from "../src/backends/env-hot-reloader.ts";
-import type { FsEventStream } from "../src/backends/deno/hot-reloader.ts";
+import type { FsEventStream } from "../src/fs-watch.ts";
 
-Deno.test("parseEnvFile: basic keys, quotes, comments, export", () => {
+test("parseEnvFile: basic keys, quotes, comments, export", () => {
   const m = parseEnvFile(`
 # comment
 FOO=bar
@@ -40,7 +43,7 @@ BAD NAME=nope
   assertEquals(m.has("BAD NAME"), false);
 });
 
-Deno.test("applyEnvFiles: adds, updates, removes owned keys", () => {
+test("applyEnvFiles: adds, updates, removes owned keys", () => {
   resetEnvFileOwnership();
   const store = new Map<string, string>([["KEEP", "os"]]);
   const env = {
@@ -53,10 +56,10 @@ Deno.test("applyEnvFiles: adds, updates, removes owned keys", () => {
     },
   };
 
-  const dir = Deno.makeTempDirSync({ prefix: "1tube-env-" });
+  const dir = mkdtempSync(join(tmpdir(), "1tube-env-"));
   const path = join(dir, ".env");
   try {
-    Deno.writeTextFileSync(path, "A=1\nB=2\nKEEP=override\n");
+    writeFileSync(path, "A=1\nB=2\nKEEP=override\n");
     const d1 = applyEnvFiles([path], env);
     assertEquals(d1.changed, true);
     assertEquals(d1.added, ["A", "B"]);
@@ -64,7 +67,7 @@ Deno.test("applyEnvFiles: adds, updates, removes owned keys", () => {
     assertEquals(store.get("A"), "1");
     assertEquals(store.get("KEEP"), "override");
 
-    Deno.writeTextFileSync(path, "A=1\nC=3\n");
+    writeFileSync(path, "A=1\nC=3\n");
     const d2 = applyEnvFiles([path], env);
     assertEquals(d2.updated, []);
     assertEquals(d2.added, ["C"]);
@@ -80,15 +83,15 @@ Deno.test("applyEnvFiles: adds, updates, removes owned keys", () => {
   } finally {
     resetEnvFileOwnership();
     try {
-      Deno.removeSync(dir, { recursive: true });
+      rmSync(dir, { recursive: true, force: true });
     } catch { /* */ }
   }
 });
 
-Deno.test("resolveWatchedEnvFiles: 1TUBE_ENV_FILES wins over convention", () => {
-  const dir = Deno.makeTempDirSync({ prefix: "1tube-env-resolve-" });
+test("resolveWatchedEnvFiles: 1TUBE_ENV_FILES wins over convention", () => {
+  const dir = mkdtempSync(join(tmpdir(), "1tube-env-resolve-"));
   try {
-    Deno.writeTextFileSync(join(dir, ".env"), "X=1\n");
+    writeFileSync(join(dir, ".env"), "X=1\n");
     const explicit = resolveWatchedEnvFiles({
       cwd: dir,
       envFilesEnv: join(dir, "custom.env"),
@@ -102,12 +105,12 @@ Deno.test("resolveWatchedEnvFiles: 1TUBE_ENV_FILES wins over convention", () => 
     assertEquals(convention, [join(dir, ".env")]);
   } finally {
     try {
-      Deno.removeSync(dir, { recursive: true });
+      rmSync(dir, { recursive: true, force: true });
     } catch { /* */ }
   }
 });
 
-Deno.test("isEnvFileEvent: matches target path and sibling dir events", () => {
+test("isEnvFileEvent: matches target path and sibling dir events", () => {
   const envFile = join("/proj", ".env");
   assert(isEnvFileEvent([envFile], [envFile]));
   assert(isEnvFileEvent([join("/proj", ".env.tmp")], [envFile]));
@@ -174,11 +177,11 @@ function makePushableWatcher(): {
   };
 }
 
-Deno.test("env hot reloader: applies diff and fires onChanged", async () => {
+test("env hot reloader: applies diff and fires onChanged", async () => {
   resetEnvFileOwnership();
-  const dir = Deno.makeTempDirSync({ prefix: "1tube-env-hmr-" });
+  const dir = mkdtempSync(join(tmpdir(), "1tube-env-hmr-"));
   const envPath = join(dir, ".env");
-  Deno.writeTextFileSync(envPath, "SECRET=old\n");
+  writeFileSync(envPath, "SECRET=old\n");
 
   const store = new Map<string, string>();
   const env = {
@@ -213,7 +216,7 @@ Deno.test("env hot reloader: applies diff and fires onChanged", async () => {
     // Seed apply put SECRET=old into store + ownership.
     assertEquals(store.get("SECRET"), "old");
 
-    Deno.writeTextFileSync(envPath, "SECRET=new\n");
+    writeFileSync(envPath, "SECRET=new\n");
     fake.push([envPath]);
     // Wait until the consume loop has scheduled the leading-edge timer.
     for (let i = 0; i < 20 && clock.pending === 0; i++) {
@@ -229,7 +232,7 @@ Deno.test("env hot reloader: applies diff and fires onChanged", async () => {
     fake.close();
     resetEnvFileOwnership();
     try {
-      Deno.removeSync(dir, { recursive: true });
+      rmSync(dir, { recursive: true, force: true });
     } catch { /* */ }
   }
 });

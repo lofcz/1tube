@@ -16,23 +16,35 @@
  * and reserve the spawned-subprocess path for #1-#3.
  */
 
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals } from "./_assert.ts";
+import { setDefaultTimeout, test } from "bun:test";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
-import { fromFileUrl } from "jsr:@std/path@^1/from-file-url";
+import { fileURLToPath } from "node:url";
 import { build } from "../src/cli/build.ts";
 import { createWorkerdBackend } from "../src/backends/workerd/backend.ts";
 import { probeVersion } from "../src/backends/workerd/process.ts";
 import { devGatewayEnv } from "./_helpers.ts";
 
-const PROJECT_ROOT = resolvePath(dirname(fromFileUrl(import.meta.url)), "..");
+// Builds an artifact and boots a real gateway + workerd per test.
+setDefaultTimeout(120_000);
+
+const PROJECT_ROOT = resolvePath(dirname(fileURLToPath(import.meta.url)), "..");
 const PLAYGROUND = join(PROJECT_ROOT, "playground");
+// The gateway always hands the backend `<cwd>/deno.json` (see server.ts); the
+// repo has none, which simply means bundles get no import map.
 const DENO_JSON = join(PROJECT_ROOT, "deno.json");
-const E2E_OPTS = { sanitizeOps: false, sanitizeResources: false } as const;
+
+/** Bind a throwaway TCP listener so a port can be probed synchronously. */
+function listenTcp(port: number) {
+  return Bun.listen({ hostname: "127.0.0.1", port, socket: { data() {} } });
+}
 
 function freePort(): number {
-  const l = Deno.listen({ hostname: "127.0.0.1", port: 0 });
-  const port = (l.addr as Deno.NetAddr).port;
-  l.close();
+  const l = listenTcp(0);
+  const port = l.port;
+  l.stop(true);
   return port;
 }
 
@@ -40,18 +52,18 @@ function freeWorkerdBasePort(): number {
   const span = 16;
   for (let attempt = 0; attempt < 100; attempt++) {
     const base = 20_000 + Math.floor(Math.random() * 20_000);
-    const listeners: Deno.Listener[] = [];
+    const listeners: ReturnType<typeof listenTcp>[] = [];
     try {
       for (let offset = 0; offset < span; offset++) {
         listeners.push(
-          Deno.listen({ hostname: "127.0.0.1", port: base + offset }),
+          listenTcp(base + offset),
         );
       }
       return base;
     } catch {
       // try another range
     } finally {
-      for (const l of listeners) l.close();
+      for (const l of listeners) l.stop(true);
     }
   }
   throw new Error("could not reserve a free workerd base port range");
@@ -78,16 +90,15 @@ async function waitForGateway(port: number, timeoutMs: number): Promise<void> {
 
 async function workerdAvailable(): Promise<boolean> {
   try {
-    await probeVersion(Deno.env.get("1TUBE_WORKERD_BIN") ?? "workerd");
+    await probeVersion(process.env["1TUBE_WORKERD_BIN"] ?? "workerd");
     return true;
   } catch {
     return false;
   }
 }
 
-Deno.test(
+test(
   "prebuilt artifact serves through gateway without esbuild on the boot path",
-  E2E_OPTS,
   async () => {
     if (!(await workerdAvailable())) {
       console.log("[skipped: workerd binary not on PATH]");
@@ -95,22 +106,19 @@ Deno.test(
     }
 
     // Build a tiny artifact (just hello + echo so the test stays fast).
-    const dist = await Deno.makeTempDir({ prefix: "1tube-prebuilt-e2e-" });
+    const dist = await mkdtemp(join(tmpdir(), "1tube-prebuilt-e2e-"));
     await build({
       functionsDir: PLAYGROUND,
       outDir: dist,
-      configPath: DENO_JSON,
       only: ["hello", "echo"],
       sourcemap: false,
     });
 
     const port = freePort();
     const workerdBasePort = freeWorkerdBasePort();
-    const child = new Deno.Command(Deno.execPath(), {
-      args: [
-        "run",
-        "--quiet",
-        "--allow-all",
+    const child = Bun.spawn({
+      cmd: [
+        process.execPath,
         "src/cli.ts",
         "--backend",
         "workerd",
@@ -126,16 +134,16 @@ Deno.test(
       ],
       cwd: PROJECT_ROOT,
       env: {
-        ...Deno.env.toObject(),
+        ...process.env,
         ...devGatewayEnv(),
         // HMR must no-op against a sealed artifact; test that the
         // gateway warns and continues rather than booting a watcher.
         "1TUBE_HMR": "1",
         "1TUBE_LAZY": "0",
       },
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
     let bootLog = "";
     const teePump = (async () => {
@@ -147,9 +155,7 @@ Deno.test(
           if (done) break;
           const chunk = dec.decode(value);
           bootLog += chunk;
-          Deno.stderr.writeSync(
-            new TextEncoder().encode(chunk.replace(/^/gm, "   ⏵ ")),
-          );
+          process.stderr.write(chunk.replace(/^/gm, "   ⏵ "));
         }
       } catch { /* */ }
     })();
@@ -210,39 +216,34 @@ Deno.test(
       try {
         child.kill("SIGTERM");
       } catch { /* */ }
-      await child.status;
+      await child.exited;
       await Promise.all([teePump, stdoutPump]).catch(() => {});
-      await Deno.remove(dist, { recursive: true }).catch(() => {});
+      await rm(dist, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "prebuilt shared chunks serve two functions through workerd",
-  E2E_OPTS,
   async () => {
     if (!(await workerdAvailable())) {
       console.log("[skipped: workerd binary not on PATH]");
       return;
     }
 
-    const root = await Deno.makeTempDir({
-      prefix: "1tube-prebuilt-chunk-src-",
-    });
-    const dist = await Deno.makeTempDir({
-      prefix: "1tube-prebuilt-chunk-dist-",
-    });
-    await Deno.mkdir(join(root, "_shared"), { recursive: true });
-    await Deno.mkdir(join(root, "alpha"), { recursive: true });
-    await Deno.mkdir(join(root, "beta"), { recursive: true });
-    await Deno.writeTextFile(
+    const root = await mkdtemp(join(tmpdir(), "1tube-prebuilt-chunk-src-"));
+    const dist = await mkdtemp(join(tmpdir(), "1tube-prebuilt-chunk-dist-"));
+    await mkdir(join(root, "_shared"), { recursive: true });
+    await mkdir(join(root, "alpha"), { recursive: true });
+    await mkdir(join(root, "beta"), { recursive: true });
+    await writeFile(
       join(root, "_shared", "handler.ts"),
       `export function serve(handler, opts = {}) {
   globalThis.__edgeFunctionRegistry.register(handler, { public: opts.public ?? true });
 }
 `,
     );
-    await Deno.writeTextFile(
+    await writeFile(
       join(root, "_shared", "large-dep.ts"),
       `export const payload = ${
         JSON.stringify("chunked-dependency-" + "x".repeat(4096))
@@ -253,7 +254,7 @@ export function answer(name) {
 `,
     );
     for (const name of ["alpha", "beta"]) {
-      await Deno.writeTextFile(
+      await writeFile(
         join(root, name, "index.ts"),
         `import { serve } from "../_shared/handler.ts";
 import { answer } from "../_shared/large-dep.ts";
@@ -271,17 +272,15 @@ serve(() => Response.json({ value: answer(${
       sourcemap: false,
     });
     const manifest = JSON.parse(
-      await Deno.readTextFile(join(dist, "manifest.json")),
+      await readFile(join(dist, "manifest.json"), "utf8"),
     );
     assert(manifest.chunks.length > 0, "expected build to emit shared chunks");
 
     const port = freePort();
     const workerdBasePort = freeWorkerdBasePort();
-    const child = new Deno.Command(Deno.execPath(), {
-      args: [
-        "run",
-        "--quiet",
-        "--allow-all",
+    const child = Bun.spawn({
+      cmd: [
+        process.execPath,
         "src/cli.ts",
         "--backend",
         "workerd",
@@ -297,13 +296,13 @@ serve(() => Response.json({ value: answer(${
       ],
       cwd: PROJECT_ROOT,
       env: {
-        ...Deno.env.toObject(),
+        ...process.env,
         ...devGatewayEnv(),
         "1TUBE_LAZY": "0",
       },
-      stdout: "piped",
-      stderr: "piped",
-    }).spawn();
+      stdout: "pipe",
+      stderr: "pipe",
+    });
 
     const pump = async (stream: ReadableStream<Uint8Array>) => {
       const reader = stream.getReader();
@@ -334,29 +333,27 @@ serve(() => Response.json({ value: answer(${
       } catch {
         // already exited
       }
-      await child.status;
+      await child.exited;
       await Promise.all([stdoutPump, stderrPump]).catch(() => {});
-      await Deno.remove(root, { recursive: true }).catch(() => {});
-      await Deno.remove(dist, { recursive: true }).catch(() => {});
+      await rm(root, { recursive: true, force: true }).catch(() => {});
+      await rm(dist, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test(
+test(
   "prebuilt boot fails fast when a bundle has been tampered with",
-  E2E_OPTS,
   async () => {
     if (!(await workerdAvailable())) {
       console.log("[skipped: workerd binary not on PATH]");
       return;
     }
 
-    const dist = await Deno.makeTempDir({ prefix: "1tube-prebuilt-tamper-" });
+    const dist = await mkdtemp(join(tmpdir(), "1tube-prebuilt-tamper-"));
     try {
       await build({
         functionsDir: PLAYGROUND,
         outDir: dist,
-        configPath: DENO_JSON,
         only: ["hello"],
         sourcemap: false,
       });
@@ -364,8 +361,8 @@ Deno.test(
       // Corrupt the bundle bytes without updating the manifest's
       // sha-256 — boot must reject this.
       const bundlePath = join(dist, "functions", "hello.js");
-      const original = await Deno.readTextFile(bundlePath);
-      await Deno.writeTextFile(bundlePath, original + "\n// tampered\n");
+      const original = await readFile(bundlePath, "utf8");
+      await writeFile(bundlePath, original + "\n// tampered\n");
 
       const backend = createWorkerdBackend({
         functionsDir: PLAYGROUND,
@@ -387,12 +384,12 @@ Deno.test(
       // start() should also clean up — calling stop() must be safe.
       await backend.stop().catch(() => {});
     } finally {
-      await Deno.remove(dist, { recursive: true }).catch(() => {});
+      await rm(dist, { recursive: true, force: true }).catch(() => {});
     }
   },
 );
 
-Deno.test("prebuilt mode rejects public reload() calls", async () => {
+test("prebuilt mode rejects public reload() calls", async () => {
   // Pure unit: reload() rejects from the immutable prebuilt-mode guard before
   // reading the artifact or requiring workerd/esbuild.
   const backend = createWorkerdBackend({

@@ -6,7 +6,7 @@ internal sealed class OneTubeConsoleLoggerProvider : ILoggerProvider
 {
     private static readonly HashSet<string> Categories = new(StringComparer.Ordinal)
     {
-        typeof(DenoHostService).FullName!,
+        typeof(GatewayHostService).FullName!,
         "OneTube.Proxy",
     };
 

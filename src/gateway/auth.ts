@@ -44,7 +44,7 @@ let _verifyCacheHits = 0;
 let _verifyCacheMisses = 0;
 
 function getSecret(): string {
-  const current = Deno.env.get("JWT_SECRET") || "";
+  const current = process.env["JWT_SECRET"] || "";
   if (current !== _cachedSecret) {
     _cachedSecret = current;
     _cachedKey = null;
@@ -202,7 +202,7 @@ export async function probeRequest(req: Request): Promise<RequestAuthProbe> {
   const token = parseBearer(req.headers.get("Authorization"));
   if (!token) return { status: "missing" };
 
-  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+  const serviceKey = process.env["SUPABASE_SERVICE_ROLE_KEY"] || "";
   if (serviceKey && token === serviceKey) {
     return { status: "ok", auth: serviceRoleAuth(token) };
   }

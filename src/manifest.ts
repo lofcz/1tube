@@ -3,7 +3,7 @@
  *
  * The manifest declares the security/runtime contract for a function:
  *   - `permissions.{net,env,read,write}` — allowlists. `env` is enforceable
- *     today via a per-function Proxy on `Deno.env` (opt-in with
+ *     today via each function's scoped `Deno.env` / `process.env` (opt-in with
  *     `1TUBE_ENFORCE_MANIFEST=1`). The other three are recorded as advisory
  *     metadata — the in-process TS gateway has no way to enforce them inside
  *     a single V8 isolate; treat them as documentation for now.
@@ -23,8 +23,7 @@
  * out of rotation.
  */
 
-// node:path so this loads from node_modules in any host Deno project
-// without depending on a shared import-map entry.
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 // `RateLimitBy` is defined on the self-contained `edge` surface so the
@@ -209,9 +208,9 @@ export async function loadManifest(
   const path = join(functionsDir, name, MANIFEST_FILENAME);
   let raw: string;
   try {
-    raw = await Deno.readTextFile(path);
+    raw = await readFile(path, "utf8");
   } catch (err) {
-    if (err instanceof Deno.errors.NotFound) {
+    if ((err as { code?: string })?.code === "ENOENT") {
       return defaultManifest();
     }
     console.warn(`[1tube] Could not read ${path}: ${err}`);

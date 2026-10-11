@@ -1,5 +1,6 @@
+#!/usr/bin/env bun
 /**
- * Workerd-vs-Deno backend benchmark.
+ * Workerd-vs-Bun backend benchmark.
  *
  * Boots a `1tube` gateway with each backend (one at a time, sequentially)
  * and hammers `/functions/v1/hello` (GET, cheap) and `/functions/v1/echo`
@@ -9,9 +10,9 @@
  * their workload.
  *
  * Usage:
- *   deno run --allow-all scripts/bench.ts                   # default 5000 reqs, 64 concurrency
- *   deno run --allow-all scripts/bench.ts -n 20000 -c 128   # heavier sweep
- *   deno run --allow-all scripts/bench.ts --backend workerd # single backend
+ *   bun scripts/bench.ts                   # default 5000 reqs, 64 concurrency
+ *   bun scripts/bench.ts -n 20000 -c 128   # heavier sweep
+ *   bun scripts/bench.ts --backend workerd # single backend
  *
  * Notes on methodology:
  *   - Each backend gets a fresh gateway (workerd backend pre-bundles on
@@ -22,27 +23,29 @@
  *     shared counter — closed-loop, not Poisson — which is the simplest
  *     way to get stable RPS for a single-host comparison.
  *   - This script intentionally does NOT call out to wrk/oha/k6 because
- *     adding a binary dep would defeat the "deno run and go" UX. For
+ *     adding a binary dep would defeat the "bun run and go" UX. For
  *     formal benchmarking against external clients, use those tools.
  */
 
-import { dirname, join, resolve as resolvePath } from "node:path";
-import { fromFileUrl } from "jsr:@std/path@^1/from-file-url";
+import { createServer } from "node:net";
+import { join, resolve as resolvePath } from "node:path";
 
-const SCRIPT_DIR = resolvePath(dirname(fromFileUrl(import.meta.url)), "..");
+const SCRIPT_DIR = resolvePath(import.meta.dir, "..");
+
+type Backend = "bun" | "workerd";
 
 interface BenchOpts {
   total: number;
   concurrency: number;
-  backends: ("deno" | "workerd")[];
+  backends: Backend[];
   warmup: number;
 }
 
 function parseArgs(): BenchOpts {
-  const args = Deno.args;
+  const args = process.argv.slice(2);
   let total = 5000;
   let concurrency = 64;
-  let backends: ("deno" | "workerd")[] = ["deno", "workerd"];
+  let backends: Backend[] = ["bun", "workerd"];
   let warmup = 200;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -53,10 +56,12 @@ function parseArgs(): BenchOpts {
     } else if (a === "--warmup" && args[i + 1]) {
       warmup = parseInt(args[++i], 10);
     } else if (a === "--backend" && args[i + 1]) {
-      const v = args[++i];
-      if (v !== "deno" && v !== "workerd") {
-        console.error(`--backend must be 'deno' or 'workerd'`);
-        Deno.exit(2);
+      // `deno` is accepted as a legacy alias, as in the gateway itself.
+      const raw = args[++i];
+      const v = raw === "deno" ? "bun" : raw;
+      if (v !== "bun" && v !== "workerd") {
+        console.error(`--backend must be 'bun' or 'workerd'`);
+        process.exit(2);
       }
       backends = [v];
     }
@@ -64,11 +69,15 @@ function parseArgs(): BenchOpts {
   return { total, concurrency, backends, warmup };
 }
 
-async function freePort(): Promise<number> {
-  const l = Deno.listen({ hostname: "127.0.0.1", port: 0 });
-  const port = (l.addr as Deno.NetAddr).port;
-  l.close();
-  return port;
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const port = (srv.address() as { port: number }).port;
+      srv.close(() => resolve(port));
+    });
+  });
 }
 
 async function waitForGateway(port: number, timeoutMs: number): Promise<void> {
@@ -120,7 +129,7 @@ async function runOne(
       const t0 = performance.now();
       try {
         const res = await fetch(url, init);
-        // Drain so the connection can be reused (Deno's fetch reuses
+        // Drain so the connection can be reused (fetch reuses
         // the underlying connection only when the body is consumed).
         await res.arrayBuffer();
         if (res.status >= 400 || res.status === 0) {
@@ -165,14 +174,11 @@ function fmtMs(ms: number): string {
 }
 
 async function spawnGateway(
-  backend: "deno" | "workerd",
+  backend: Backend,
   port: number,
-): Promise<{ child: Deno.ChildProcess; teardown: () => Promise<void> }> {
+): Promise<{ child: Bun.Subprocess; teardown: () => Promise<void> }> {
   const playgroundDir = join(SCRIPT_DIR, "playground");
   const args = [
-    "run",
-    "--quiet",
-    "--allow-all",
     "src/server.ts",
     "--backend",
     backend,
@@ -184,11 +190,10 @@ async function spawnGateway(
     "127.0.0.1",
     "--dev",
   ];
-  const child = new Deno.Command(Deno.execPath(), {
-    args,
+  const child = Bun.spawn([process.execPath, ...args], {
     cwd: SCRIPT_DIR,
     env: {
-      ...Deno.env.toObject(),
+      ...process.env,
       "1TUBE_HMR": "0",
       "1TUBE_LAZY": "0",
       // The gateway's default rate limit (120 rpm = 2 rps) is meant
@@ -204,9 +209,10 @@ async function spawnGateway(
       // boot table to keep the report uncluttered. Boot logs still
       // reach stderr for debugging if needed.
     },
-    stdout: "piped",
-    stderr: "piped",
-  }).spawn();
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
 
   // Drain stdout/stderr so the child doesn't block on backpressure.
   // Stderr is the gateway's banner + warnings (we want to see them
@@ -257,11 +263,11 @@ async function spawnGateway(
 
   const teardown = async () => {
     try {
-      child.kill(Deno.build.os === "windows" ? "SIGKILL" : "SIGTERM");
+      child.kill(process.platform === "win32" ? "SIGKILL" : "SIGTERM");
     } catch { /* */ }
     try {
       await Promise.race([
-        child.status,
+        child.exited,
         new Promise((r) => setTimeout(r, 5_000)),
       ]);
     } catch { /* */ }
@@ -313,7 +319,7 @@ const ROUTES: RouteSpec[] = [
 ];
 
 async function benchBackend(
-  backend: "deno" | "workerd",
+  backend: Backend,
   opts: BenchOpts,
 ): Promise<void> {
   const port = await freePort();

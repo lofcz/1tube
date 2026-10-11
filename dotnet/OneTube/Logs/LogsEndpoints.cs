@@ -10,7 +10,7 @@ namespace OneTube.Logs;
 ///
 /// <para>Mirrors the gateway's own <c>/1tube/api/logs/*</c> surface but
 /// is served by the .NET host directly from the SQLite file — no hop
-/// through the Deno process. Like the secrets endpoints, no auth
+/// through the gateway process. Like the secrets endpoints, no auth
 /// policy is baked in: the returned <see cref="RouteGroupBuilder"/>
 /// lets the consumer attach whatever filter fits (logs routinely
 /// contain user data, so treat them as admin-only).</para>

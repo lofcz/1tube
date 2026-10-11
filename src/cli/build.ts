@@ -24,14 +24,22 @@
  * `--port`, `--bind-address`, and `--workerd-env` are runtime concerns —
  * baking them at build time would force a rebuild for a port change.
  *
- * Build is offline-friendly (modulo whatever specifiers esbuild's Deno
- * loader needs to resolve). It does not start workerd; it does not need
+ * Build is offline-friendly (modulo npm:/jsr:/https: dependencies not yet
+ * in the managed `.1tube/deps` store / remote cache). It does not start workerd; it does not need
  * workerd on PATH at build time. Operators can build on CI with no
  * runtime, ship `dist/` + `workerd` to a sealed prod box, and `1tube
  * serve --prebuilt dist/` will not touch the network.
  */
 
-import { ensureDir } from "jsr:@std/fs@^1/ensure-dir";
+import {
+  copyFile,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import {
   dirname,
   isAbsolute,
@@ -57,13 +65,14 @@ import {
   type PrebuiltSharedModuleEntry,
 } from "../backends/workerd/prebuilt.ts";
 import { VERSION } from "../version.ts";
+import { resolveDenoConfigPath } from "./deno-config.ts";
 
 export { PREBUILT_SCHEMA, type PrebuiltManifest };
 
 export interface BuildOptions {
   functionsDir: string;
   outDir: string;
-  /** Path to host project's deno.json (for esbuild's Deno loader import map). */
+  /** Path to host project's deno.json (its import map applies to the bundle). */
   configPath?: string;
   /** Restrict the build to a subset of function names. */
   only?: readonly string[];
@@ -142,9 +151,13 @@ export type BuildProgress =
     originalBytes: number;
   };
 
+async function ensureDir(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true });
+}
+
 /**
  * SHA-256 a `Uint8Array` to a lowercase hex string. Web-Crypto-only —
- * keeps this command zero-dep and works under Deno + workerd alike.
+ * keeps this command zero-dep and works under Bun + workerd alike.
  */
 async function sha256Hex(bytes: Uint8Array): Promise<string> {
   const buf = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
@@ -165,17 +178,17 @@ async function copySourceSnapshot(
   const outRoot = join(outDir, "sources", name);
   const files: string[] = [];
   async function walk(dir: string): Promise<void> {
-    for await (const entry of Deno.readDir(dir)) {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
       if (entry.name === "node_modules" || entry.name === ".git") continue;
       const abs = join(dir, entry.name);
-      if (entry.isDirectory) {
+      if (entry.isDirectory()) {
         await walk(abs);
-      } else if (entry.isFile) {
+      } else if (entry.isFile()) {
         const rel = relative(sourceRoot, abs).replaceAll("\\", "/");
         files.push(rel);
         const dest = join(outRoot, rel);
         await ensureDir(dirname(dest));
-        await Deno.copyFile(abs, dest);
+        await copyFile(abs, dest);
       }
     }
   }
@@ -184,11 +197,7 @@ async function copySourceSnapshot(
 }
 
 async function removeDirIfExists(path: string): Promise<void> {
-  try {
-    await Deno.remove(path, { recursive: true });
-  } catch (err) {
-    if (!(err instanceof Deno.errors.NotFound)) throw err;
-  }
+  await rm(path, { recursive: true, force: true });
 }
 
 /**
@@ -204,7 +213,7 @@ async function removeDirIfExists(path: string): Promise<void> {
  */
 async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
   const startedAt = performance.now();
-  const cwd = Deno.cwd();
+  const cwd = process.cwd();
   const functionsDir = isAbsolute(opts.functionsDir)
     ? opts.functionsDir
     : resolvePath(cwd, opts.functionsDir);
@@ -276,7 +285,7 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
       minify: opts.minify ?? false,
       ...(opts.esbuildTarget ? { esbuildTarget: opts.esbuildTarget } : {}),
     });
-    const bytes = await Deno.readFile(shared.bundlePath);
+    const bytes = await readFile(shared.bundlePath);
     const baseName = shared.bundlePath.split(/[\\/]/).pop()!;
     sharedMinification.preBytes += shared.originalByteLength;
     sharedMinification.postBytes += shared.byteLength;
@@ -299,7 +308,7 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
 
   const chunkEntries: PrebuiltChunkEntry[] = await Promise.all(
     chunked.chunks.map(async (chunk, idx) => {
-      const bytes = await Deno.readFile(chunk.path);
+      const bytes = await readFile(chunk.path);
       opts.onProgress?.({
         phase: "hash-chunk",
         current: idx + 1,
@@ -321,7 +330,7 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
   // serve time without needing esbuild present.
   const entries: PrebuiltFunctionEntry[] = await Promise.all(
     bundleResults.map(async (r, idx) => {
-      const bytes = await Deno.readFile(r.bundlePath);
+      const bytes = await readFile(r.bundlePath);
       const sha = await sha256Hex(bytes);
       const manifest = await loadManifest(functionsDir, r.name);
       const sourceFiles = await copySourceSnapshot(
@@ -374,7 +383,7 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
     functions: entries,
   };
 
-  await Deno.writeTextFile(
+  await writeFile(
     join(outDir, "manifest.json"),
     JSON.stringify(manifest, null, 2) + "\n",
   );
@@ -382,7 +391,7 @@ async function buildOnce(opts: BuildOptions): Promise<BuildResult> {
   // Drop a README + .gitignore so an operator stumbling into the dir
   // immediately knows it's generated and so accidental `git add dist`
   // becomes a no-op when the parent project's .gitignore is missing.
-  await Deno.writeTextFile(
+  await writeFile(
     join(outDir, "README.txt"),
     `This directory is produced by \`1tube build\`. Every file is regenerated
 on each build; do not edit by hand. Serve it with:
@@ -396,9 +405,9 @@ Schema: ${PREBUILT_SCHEMA}.  Built by: ${manifest.builtBy} at ${manifest.builtAt
   // mtimes on every build.
   const gitignorePath = join(outDir, ".gitignore");
   try {
-    await Deno.stat(gitignorePath);
+    await stat(gitignorePath);
   } catch {
-    await Deno.writeTextFile(
+    await writeFile(
       gitignorePath,
       "# 1tube build artifact — typically regenerated, not committed.\n*\n!.gitignore\n!README.txt\n",
     );
@@ -424,7 +433,7 @@ export async function build(opts: BuildOptions): Promise<BuildResult> {
 
 /**
  * CLI entry point. Returns a process exit code instead of calling
- * `Deno.exit` directly so the caller (server.ts) can decide on its
+ * `process.exit` directly so the caller (server.ts) can decide on its
  * own exit semantics — important for the test harness which imports
  * this and asserts on the return value.
  *
@@ -470,7 +479,7 @@ export async function runBuild(args: string[]): Promise<number> {
   }
   args = rest;
 
-  let functionsDir = Deno.env.get("FUNCTIONS_PATH") || "./supabase/functions";
+  let functionsDir = process.env.FUNCTIONS_PATH || "./supabase/functions";
   let outDir = "./dist";
   let only: string[] | undefined;
   let sourcemap: boolean | "linked" | "inline" = "linked";
@@ -480,7 +489,7 @@ export async function runBuild(args: string[]): Promise<number> {
   let compatDate: string | undefined;
   const compatFlags: string[] = [];
   let envAllowlist: string[] | undefined;
-  const sharedModules: string[] = (Deno.env.get("1TUBE_WORKERD_SHARED") ?? "")
+  const sharedModules: string[] = (process.env["1TUBE_WORKERD_SHARED"] ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter((s) => s.length > 0);
@@ -551,72 +560,26 @@ export async function runBuild(args: string[]): Promise<number> {
     }
   }
 
-  // Resolve the Deno config path. Three modes, in priority order:
+  // Resolve the deno.json import map. Three modes, in priority order:
   //   1. --config <path>          → explicit, must exist (we hard-fail if not)
   //   2. --no-config              → explicit "build with no import map"
-  //   3. <auto-detect at cwd>     → use cwd/deno.json or cwd/deno.jsonc if
-  //                                 either is present, otherwise omit.
+  //   3. <auto-detect>            → cwd/deno.json[c], then
+  //                                 <functions-dir>/deno.json[c] (Supabase
+  //                                 layout), otherwise omit.
   // Auto-detect is the important case: hosts like sciobot-next are Vite/Bun
-  // projects with no deno.json at all, and the bundler tolerates a missing
+  // projects with no root deno.json, and the bundler tolerates a missing
   // import map. Forcing one would break those hosts; we'd rather degrade
   // gracefully and just resolve specifiers without an import map.
-  let configPath: string | undefined;
-  if (configPathArg !== undefined) {
-    if (configPathArg === "") {
-      configPath = undefined;
-    } else {
-      const abs = isAbsolute(configPathArg)
-        ? configPathArg
-        : resolvePath(Deno.cwd(), configPathArg);
-      try {
-        const stat = await Deno.stat(abs);
-        if (!stat.isFile) throw new Error("not a regular file");
-        configPath = abs;
-      } catch (err) {
-        console.error(
-          `[1tube build] --config path not readable: ${abs} (${
-            (err as Error).message
-          })`,
-        );
-        return 2;
-      }
-    }
-  } else {
-    // Probe in order of specificity:
-    //   1. cwd/deno.json[c]            — host project root (Deno-native repos)
-    //   2. functionsDir/deno.json[c]   — Supabase layout, which colocates the
-    //                                    deno.json inside supabase/functions/
-    //                                    so the import map applies to all fns.
-    // The functions-dir fallback is what makes this work for sciobot-next
-    // (a Vite/Bun project where the only deno.json lives next to the
-    // edge functions, not at repo root).
-    const fnDirAbs = isAbsolute(functionsDir)
-      ? functionsDir
-      : resolvePath(Deno.cwd(), functionsDir);
-    const candidates = [
-      `${Deno.cwd()}/deno.json`,
-      `${Deno.cwd()}/deno.jsonc`,
-      `${fnDirAbs}/deno.json`,
-      `${fnDirAbs}/deno.jsonc`,
-    ];
-    for (const abs of candidates) {
-      try {
-        const stat = await Deno.stat(abs);
-        if (stat.isFile) {
-          configPath = abs;
-          break;
-        }
-      } catch { /* not found, try next */ }
-    }
-    if (configPath) {
-      console.log(`[1tube build] using deno config: ${configPath}`);
-    } else {
-      console.log(
-        `[1tube build] no deno.json / deno.jsonc at ${Deno.cwd()} or ${fnDirAbs} — bundling without an import map. ` +
-          `Pass --config <path> if you want one.`,
-      );
-    }
+  const configResult = await resolveDenoConfigPath({
+    functionsDir,
+    configArg: configPathArg,
+    onMessage: (m) => console.log(`[1tube build] ${m}`),
+  });
+  if (configResult.error) {
+    console.error(`[1tube build] ${configResult.error}`);
+    return 2;
   }
+  const configPath = configResult.configPath;
 
   console.log(
     `[1tube build] bundling functions from ${functionsDir} → ${outDir}`,

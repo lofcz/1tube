@@ -9,4 +9,4 @@
 
 import { run } from "./launch.ts";
 
-await run(Deno.args);
+await run(process.argv.slice(2));
