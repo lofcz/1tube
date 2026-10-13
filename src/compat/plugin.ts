@@ -252,8 +252,9 @@ function replaceAtImportSites(
     const to = imp.n !== undefined ? replacements.get(imp.n) : undefined;
     if (to === undefined) continue;
     // Static imports span the bare text; dynamic ones the quoted literal.
+    // Either way the specifier is escaped: Windows paths carry backslashes.
     const quoted = imp.d > -1;
-    out += code.slice(last, imp.s) + (quoted ? JSON.stringify(to) : to);
+    out += code.slice(last, imp.s) + (quoted ? JSON.stringify(to) : escapeInQuotes(to));
     last = imp.e;
   }
   return out + code.slice(last);
@@ -266,9 +267,14 @@ function replaceByPattern(code: string, replacements: ReadonlyMap<string, string
       `(\\bfrom\\s*|\\bimport\\s*\\(?\\s*)(["'])${escapeRegExp(from)}\\2`,
       "g",
     );
-    code = code.replace(re, (_m, lead, q) => `${lead}${q}${to}${q}`);
+    code = code.replace(re, (_m, lead, q) => `${lead}${q}${escapeInQuotes(to)}${q}`);
   }
   return code;
+}
+
+/** `s` escaped for use between existing quotes of a string literal. */
+function escapeInQuotes(s: string): string {
+  return JSON.stringify(s).slice(1, -1).replaceAll("'", "\\'");
 }
 
 /**

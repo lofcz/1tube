@@ -18,6 +18,7 @@ import { afterEach, describe, setDefaultTimeout, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { assert, assertEquals, assertRejects, assertStringIncludes } from "./_assert.ts";
 import { FunctionRegistry } from "../src/registry.ts";
 import { FunctionSupervisor } from "../src/supervisor.ts";
@@ -462,6 +463,24 @@ import other from "not-mapped";
     );
     // Syntax errors are left for Bun to report against the original.
     assertEquals(rewriteImports(`import { from "@lib"`, file), `import { from "@lib"`);
+  });
+
+  test("rewritten specifiers are escaped (backslashes in Windows paths)", async () => {
+    // Nothing is read from disk: only the rewritten text is checked.
+    const functions = join(tmpdir(), "1tube-escape", "functions");
+    // A backslash path segment: a separator on Windows, a literal on POSIX.
+    // Inserted unescaped, its `\v` would parse as a vertical tab.
+    const target = join(functions, "a\\vb", "lib.ts");
+    configureCompat({
+      importMap: { imports: { "@win": pathToFileURL(target).href }, base: join(functions, "deno.json") },
+    });
+    const out = rewriteImports(
+      `import { a } from "@win";\nimport b from '@win';\nconst c = await import("@win");\n`,
+      join(functions, "fn", "index.ts"),
+    );
+    const specifiers = new Bun.Transpiler({ loader: "ts" }).scanImports(out).map((i) => i.path);
+    assert(specifiers.length > 0);
+    for (const s of specifiers) assertEquals(s, target);
   });
 
   test("functions resolve deno.json aliases: files, prefixes, scopes, npm: and https: targets", async () => {
