@@ -48,6 +48,7 @@ import {
   SHARED_RUNTIME_URL_ENV,
   type SharedRuntimeModule,
 } from "../backends/workerd/shared-runtime.ts";
+import { cjsDynamicImportPlugin } from "./cjs-dynamic-import.ts";
 import type { BundleProfile } from "./profile.ts";
 
 export type { BundleProfile };
@@ -627,6 +628,10 @@ export async function bundleAllChunked(
   const env = compatEnvironmentFor(opts.configPath);
   await prepareInputs(env, opts.inputs);
   const plugins = [
+    // Splitting turns `import()` of a CommonJS module into a default-only
+    // chunk. Runs first so it sees the dynamic import before the probing
+    // resolvers below claim it; its own probe still goes through all of them.
+    cjsDynamicImportPlugin(),
     // Backend resolver plugins (e.g. node-builtin externalisation) must run
     // before the compat plugin gets a chance to resolve those specifiers.
     ...(profile.resolverPlugins ?? []),
