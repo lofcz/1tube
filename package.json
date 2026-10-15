@@ -70,6 +70,7 @@
   },
   "dependencies": {
     "@zip.js/zip.js": "^2.8.0",
+    "cjs-module-lexer": "^2.2.1",
     "drizzle-orm": "1.0.0-rc.4",
     "es-module-lexer": "^2",
     "esbuild": "^0.28.1",
