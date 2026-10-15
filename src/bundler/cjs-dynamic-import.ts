@@ -22,14 +22,6 @@ import { init as initEsmLexer, parse as parseEsm } from "es-module-lexer";
 import type * as esbuild from "esbuild";
 
 const NAMESPACE = "1tube-cjs-dynamic";
-const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
-const RESERVED = new Set([
-  "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default",
-  "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for", "function",
-  "if", "implements", "import", "in", "instanceof", "interface", "let", "new", "null",
-  "package", "private", "protected", "public", "return", "static", "super", "switch", "this",
-  "throw", "true", "try", "typeof", "var", "void", "while", "with", "yield",
-]);
 
 type ProbeData = { cjsDynamicProbe?: boolean; probe?: boolean; builtinProbe?: boolean };
 
@@ -57,7 +49,8 @@ async function commonJsExportNames(
   seen.add(path);
   await initCjsLexer();
   const { exports, reexports } = parseCjs(await readFile(path, "utf8"));
-  for (const name of exports) names.add(name);
+  // A string export name must be well-formed Unicode, or the build fails.
+  for (const name of exports) if (name.isWellFormed()) names.add(name);
   for (const specifier of reexports) {
     const target = await build.resolve(specifier, {
       kind: "require-call",
@@ -73,21 +66,24 @@ async function commonJsExportNames(
   return names;
 }
 
+/**
+ * Every name is exported as a string module export name (`export { x as "y" }`),
+ * so esbuild's parser decides how to print it instead of us classifying
+ * identifiers and reserved words. Locals are generated, so they never clash.
+ */
 function wrapperSource(path: string, names: Iterable<string>): string {
   const lines = [
     `const __cjs = require(${JSON.stringify(path)});`,
     "export default __cjs;",
   ];
+  const specifiers: string[] = [];
   let index = 0;
   for (const name of names) {
-    if (IDENTIFIER.test(name) && !RESERVED.has(name)) {
-      lines.push(`export const ${name} = __cjs[${JSON.stringify(name)}];`);
-    } else {
-      const local = `__cjs_${index++}`;
-      lines.push(`const ${local} = __cjs[${JSON.stringify(name)}];`);
-      lines.push(`export { ${local} as ${JSON.stringify(name)} };`);
-    }
+    const local = `__cjs_${index++}`;
+    lines.push(`const ${local} = __cjs[${JSON.stringify(name)}];`);
+    specifiers.push(`${local} as ${JSON.stringify(name)}`);
   }
+  if (specifiers.length > 0) lines.push(`export { ${specifiers.join(", ")} };`);
   return lines.join("\n") + "\n";
 }
 

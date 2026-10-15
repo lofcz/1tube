@@ -44,6 +44,8 @@ test("bundler: dynamic import() of CommonJS keeps named exports in chunked bundl
       "class Thing { constructor() { this.ok = true; } }",
       "module.exports.Thing = Thing;",
       'module.exports["dash-name"] = "dash";',
+      'module.exports.class = "reserved";',
+      'module.exports.příliš = "unicode";',
       "module.exports.static = 1;",
     ].join("\n"),
   });
@@ -72,6 +74,8 @@ test("bundler: dynamic import() of CommonJS keeps named exports in chunked bundl
   return {
     thing: new fixture.Thing().ok,
     dash: fixture["dash-name"],
+    reserved: fixture.class,
+    unicode: fixture["příliš"],
     defaultIsExports: fixture.default.Thing === fixture.Thing,
     fromImpl: reexport.fromImpl,
     esModuleDefault: esModule.default.default,
@@ -109,6 +113,8 @@ test("bundler: dynamic import() of CommonJS keeps named exports in chunked bundl
   assertEquals(probe, {
     thing: true,
     dash: "dash",
+    reserved: "reserved",
+    unicode: "unicode",
     defaultIsExports: true,
     fromImpl: "impl",
     // Like Node: `default` is module.exports even when `__esModule` is set.
