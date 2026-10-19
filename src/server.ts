@@ -1928,7 +1928,7 @@ app.all(routeDispatchPattern(), async (c) => {
       method: c.req.raw.method,
       headers: proxyHeaders,
       body: wrappedBody,
-      signal: abort.signal,
+      signal: AbortSignal.any([c.req.raw.signal, abort.signal]),
       // @ts-ignore -- duplex is required for streaming request bodies
       duplex: "half",
     });
@@ -1963,7 +1963,7 @@ app.all(routeDispatchPattern(), async (c) => {
         proxyReq,
         name,
         auth,
-        abort.signal,
+        proxyReq.signal,
       );
     } catch (err) {
       errored = true;
@@ -2158,7 +2158,7 @@ app.all(routeDispatchPattern(), async (c) => {
     method: c.req.raw.method,
     headers: c.req.raw.headers,
     body: wrappedBody,
-    signal: abort.signal,
+    signal: AbortSignal.any([c.req.raw.signal, abort.signal]),
     // @ts-ignore -- duplex is required for streaming request bodies
     duplex: "half",
   });
@@ -2191,7 +2191,7 @@ app.all(routeDispatchPattern(), async (c) => {
     response = await handle.dispatch(
       rewrittenReq,
       auth,
-      abort.signal,
+      rewrittenReq.signal,
       invocationIdOf(c),
     );
   } catch (err) {
