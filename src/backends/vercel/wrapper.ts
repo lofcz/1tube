@@ -54,7 +54,7 @@ export const DEPLOYMENT_ID_HEADER = "x-deployment-id";
  * Node builtin module names. Imports of these (bare or `node:`-prefixed) are
  * marked external for the Vercel target so the real Node runtime provides them
  * instead of bundling polyfills. Subpath imports (e.g. `stream/web`,
- * `fs/promises`) are matched by their head segment.
+ * `fs/promises`) must be recognized builtins as well as match a head below.
  */
 export const NODE_BUILTIN_MODULES: readonly string[] = [
   "assert",

@@ -18,6 +18,7 @@
  */
 
 import * as esbuild from "esbuild";
+import { isBuiltin } from "node:module";
 import type { BundleProfile } from "../../bundler/profile.ts";
 import {
   NODE_BUILTIN_MODULES,
@@ -31,7 +32,8 @@ const NODE_BUILTIN_SET = new Set<string>(NODE_BUILTIN_MODULES);
 function isNodeBuiltinBare(spec: string): boolean {
   const slash = spec.indexOf("/");
   const head = slash === -1 ? spec : spec.slice(0, slash);
-  return NODE_BUILTIN_SET.has(head);
+  // A builtin prefix does not make an npm subpath a builtin (e.g. process/).
+  return NODE_BUILTIN_SET.has(head) && isBuiltin(spec);
 }
 
 /**
