@@ -1966,6 +1966,12 @@ app.all(routeDispatchPattern(), async (c) => {
         proxyReq.signal,
       );
     } catch (err) {
+      // A disconnected caller cancelled this invocation, not the function.
+      // Do not feed it into the breaker window or dilute genuine failures.
+      if (c.req.raw.signal.aborted && !abort.signal.aborted &&
+        err instanceof DOMException && err.name === "AbortError") {
+        return new Response(null, { status: 499 });
+      }
       errored = true;
       const reasonMsg = (abort.signal.reason as Error | undefined)?.message ??
         "";
@@ -2195,6 +2201,12 @@ app.all(routeDispatchPattern(), async (c) => {
       invocationIdOf(c),
     );
   } catch (err) {
+    // React Query and other clients cancel obsolete reads during live refresh.
+    // A caller cancellation must never trip the function's circuit breaker.
+    if (c.req.raw.signal.aborted && !abort.signal.aborted &&
+      err instanceof DOMException && err.name === "AbortError") {
+      return new Response(null, { status: 499 });
+    }
     errored = true;
     const reasonMsg = (abort.signal.reason as Error | undefined)?.message ?? "";
     if (

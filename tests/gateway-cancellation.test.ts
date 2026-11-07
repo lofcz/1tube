@@ -20,6 +20,7 @@ for (const cause of ["disconnect", "timeout"] as const) {
     await mkdir(join(functions, "wait"), { recursive: true });
     await writeFile(join(functions, "wait", "index.ts"), `
       (globalThis as any).__edgeFunctionRegistry.register(async (req: Request) => {
+        if (new URL(req.url).searchParams.has("fail")) return new Response("failed", { status: 500 });
         if (req.method === "GET") return new Response("ready");
         await req.text();
         return new Promise<Response>((resolve) => {
@@ -37,7 +38,7 @@ for (const cause of ["disconnect", "timeout"] as const) {
       "--dev", "--functions", functions, "--host", "127.0.0.1", "--port", String(port),
       "--timeout", cause === "timeout" ? "500" : "30000"], {
       cwd: root,
-      env: { ...process.env, ...devGatewayEnv({ "1TUBE_DISABLE_RATE_LIMIT": "1", "1TUBE_INVOCATION_LOGS": "0" }) },
+      env: { ...process.env, ...devGatewayEnv({ "1TUBE_DISABLE_RATE_LIMIT": "1", "1TUBE_INVOCATION_LOGS": "0", INTERNAL_KEY: "cancellation-test" }) },
       stdout: "pipe", stderr: "pipe",
     });
     const logs = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -63,6 +64,15 @@ for (const cause of ["disconnect", "timeout"] as const) {
       await until(() => events.has("aborted"));
       if (cause === "timeout") expect((await result)?.status).toBe(504);
       else expect(await result).toBeNull();
+      const stats = async () => (await (await fetch(`http://127.0.0.1:${port}/health`, {
+        headers: { Authorization: "Bearer cancellation-test" },
+      })).json()).supervisor.wait;
+      // Wait for dispatch cleanup; caller cancellation must not poison the
+      // breaker, while gateway deadlines and real 5xx responses still count.
+      await Bun.sleep(100);
+      expect((await stats()).errors).toBe(cause === "timeout" ? 1 : 0);
+      expect((await fetch(`${url}?fail=1`)).status).toBe(500);
+      expect((await stats()).errors).toBe(cause === "timeout" ? 2 : 1);
     } finally {
       controller.abort();
       child.kill("SIGKILL");
