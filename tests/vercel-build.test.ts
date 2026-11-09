@@ -663,6 +663,51 @@ function mockNodeRes() {
   return { res, headers, chunks };
 }
 
+test("Vercel request URL uses the routed Host, never a forwarded host or absolute target", async () => {
+  const root = await tmpOutDir("request-url");
+  const restore = snapshotRuntimeGlobals();
+  try {
+    await mkdir(join(root, "functions", "url"), { recursive: true });
+    await writeFile(join(root, "functions", "url", "index.ts"),
+      `Deno.serve(req => Response.json({ url: req.url, host: req.headers.get("x-forwarded-host") }));`);
+    const built = await buildVercel({ functionsDir: join(root, "functions"), outDir: join(root, "out") });
+    const fn = built.functions[0];
+    const { default: handler } = await import(pathToFileURL(join(fn.funcDir, fn.handler)).href);
+    for (const path of ["/news?x=1", "https://attacker.invalid/news?x=1"]) {
+      const { res, chunks } = mockNodeRes();
+      await handler({ method: "GET", url: path, headers: {
+        host: "preview.example:8443", "x-forwarded-host": "169.254.169.254",
+        "x-forwarded-proto": "https",
+      } }, res);
+      assertEquals(res.statusCode, 200);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      assertEquals(body.url, "https://preview.example:8443/news?x=1");
+      assertEquals(body.host, "preview.example:8443");
+    }
+    const local = mockNodeRes();
+    await handler({ method: "GET", url: "//attacker.invalid/path", headers: {
+      host: "localhost:8080", "x-forwarded-proto": "http",
+    } }, local.res);
+    assertEquals(JSON.parse(Buffer.concat(local.chunks).toString()).url,
+      "http://localhost:8080//attacker.invalid/path");
+    for (const headers of [
+      { "x-forwarded-host": "attacker.invalid" },
+      { host: "site.example@attacker.invalid" },
+      { host: "site.example,attacker.invalid" },
+      { host: "site.example/path" },
+      { host: "site.example", "x-forwarded-proto": "file" },
+      { host: "site.example", "x-forwarded-proto": "https,http" },
+    ]) {
+      const bad = mockNodeRes();
+      await handler({ method: "GET", url: "/news", headers }, bad.res);
+      assertEquals(bad.res.statusCode, 400);
+    }
+  } finally {
+    restore();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test(
   "Vercel handler echoes VERCEL_DEPLOYMENT_ID as x-deployment-id unless the function set one",
   async () => {

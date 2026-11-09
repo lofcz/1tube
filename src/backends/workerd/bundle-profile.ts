@@ -194,6 +194,22 @@ function __1tubeBuildAuth(request) {
 export default {
   async fetch(request, env, _ctx) {
     __1tubeWorkerEnv = env || {};
+    // Only the gateway can reach this socket; it overwrites this envelope.
+    // Preserve the body stream, method and signal while restoring the same
+    // request URL that a function receives on the Bun backend.
+    const gatewayUrl = request.headers.get("X-1tube-Request-Url");
+    if (gatewayUrl) {
+      const headers = new Headers(request.headers);
+      headers.delete("X-1tube-Request-Url");
+      headers.set("host", new URL(gatewayUrl).host);
+      request = new Request(gatewayUrl, {
+        method: request.method,
+        headers,
+        body: request.body,
+        signal: request.signal,
+        duplex: "half",
+      });
+    }
     if (typeof __1tubeCapturedHandler !== "function") {
       return new Response(
         JSON.stringify({ error: "function did not register a handler" }),

@@ -167,6 +167,36 @@ test(
   BUNDLE_TIMEOUT_MS,
 );
 
+test("workerd-bundler: restores the gateway URL without consuming the request body", async () => {
+  const outDir = await makeOutDir("request-url");
+  try {
+    const entrypoint = join(outDir, "probe.ts");
+    await writeFile(entrypoint, `
+      globalThis.__edgeFunctionRegistry.register(async req => Response.json({
+        url: req.url, method: req.method, body: await req.text(),
+        host: req.headers.get("host"), envelope: req.headers.get("x-1tube-request-url"),
+      }), { public: true });
+    `);
+    const result = await sharedBundler(outDir).bundle({ name: "probe", entrypoint });
+    const handler = await importBundle(result.bundlePath);
+    const req = new Request("http://127.0.0.1:23456/probe?x=1", {
+      method: "POST", body: "streamed payload",
+      headers: {
+        "x-1tube-request-url": "https://school.example:8443/probe?x=1",
+        "x-forwarded-host": "attacker.invalid",
+        "x-forwarded-proto": "http",
+      },
+    });
+    const response = await handler.fetch(req, {});
+    assertEquals(await response.json(), {
+      url: "https://school.example:8443/probe?x=1", method: "POST", body: "streamed payload",
+      host: "school.example:8443", envelope: null,
+    });
+  } finally {
+    await rm(outDir, { recursive: true, force: true });
+  }
+}, BUNDLE_TIMEOUT_MS);
+
 test(
   "workerd-bundler: authenticated handler sees the auth headers",
   async () => {

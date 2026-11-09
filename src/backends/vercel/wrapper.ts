@@ -264,11 +264,23 @@ function __1tubeHeadersFromNode(req) {
 
 function __1tubeToWebRequest(req) {
   const headers = __1tubeHeadersFromNode(req);
-  const xfproto = headers.get("x-forwarded-proto");
-  const proto = (xfproto ? xfproto.split(",")[0] : "https").trim() || "https";
-  const host = headers.get("x-forwarded-host") || headers.get("host") || "localhost";
-  const path = req.url || "/";
-  const url = /^https?:\\/\\//.test(path) ? path : (proto + "://" + host + path);
+  // Vercel owns Host and the forwarded protocol. A conflicting forwarded
+  // host (or absolute-form request target) must not replace the routed host.
+  const proto = headers.get("x-forwarded-proto") || "https";
+  const host = headers.get("host");
+  if (!host || /[\\s,/@\\\\?#%]/.test(host) || (proto !== "http" && proto !== "https")) {
+    throw new TypeError("Invalid request authority");
+  }
+  const origin = new URL(proto + "://" + host).origin;
+  let path = req.url || "/";
+  if (/^https?:\\/\\//.test(path)) {
+    const absolute = new URL(path);
+    path = absolute.pathname + absolute.search;
+  }
+  if (!path.startsWith("/")) throw new TypeError("Invalid request target");
+  const url = new URL(origin + path);
+  headers.set("x-forwarded-host", url.host);
+  headers.set("x-forwarded-proto", url.protocol.slice(0, -1));
   const method = (req.method || "GET").toUpperCase();
   const init = { method, headers };
   if (method !== "GET" && method !== "HEAD") {
@@ -334,7 +346,15 @@ export default async function handler(req, res) {
       res.end(JSON.stringify({ error: "function did not register a handler" }));
       return;
     }
-    const request = __1tubeToWebRequest(req);
+    let request;
+    try {
+      request = __1tubeToWebRequest(req);
+    } catch {
+      res.statusCode = 400;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ error: "Invalid request URL" }));
+      return;
+    }
     const response = await __1tubeCapturedHandler(request);
     await __1tubeWriteWebResponse(res, response);
   } catch (err) {

@@ -807,7 +807,7 @@ export function buildMaxHeapExtraArgs(maxHeapMB: number | undefined): string[] {
  * prevents the runtime's HTTP client from interposing a cache layer (this is
  * a hot proxy path; any caching belongs in user-space or the gateway).
  */
-async function forwardToWorkerd(
+export async function forwardToWorkerd(
   req: Request,
   origin: string,
   auth: AuthContext | null,
@@ -840,6 +840,10 @@ async function forwardToWorkerd(
     }
     headers.set(k, v);
   }
+
+  // The private socket changes the transport URL. Overwrite any client value
+  // so the wrapper can restore the gateway URL without trusting proxy headers.
+  headers.set("X-1tube-Request-Url", req.url);
 
   if (auth) {
     headers.set("X-1tube-Auth-User", auth.userId);

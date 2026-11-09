@@ -18,12 +18,41 @@ import {
   buildInspectorExtraArgs,
   buildMaxHeapExtraArgs,
   formatPortConflictError,
+  forwardToWorkerd,
   intersectEnvForFunction,
   probeSocketsFree,
   resolveEnvAllowlist,
 } from "../src/backends/workerd/backend.ts";
 import { FunctionRegistry } from "../src/registry.ts";
 import { defaultManifest } from "../src/manifest.ts";
+
+test("workerd forwarding overwrites the internal request URL envelope", async () => {
+  const server = Bun.serve({
+    hostname: "127.0.0.1", port: 0,
+    async fetch(req) {
+      return Response.json({
+        envelope: req.headers.get("x-1tube-request-url"),
+        path: new URL(req.url).pathname + new URL(req.url).search,
+        body: await req.text(),
+      });
+    },
+  });
+  try {
+    const req = new Request("https://school.example:8443/probe?x=1", {
+      method: "POST", body: "streamed payload",
+      headers: {
+        "x-1tube-request-url": "https://attacker.invalid/forged",
+        "x-forwarded-host": "attacker.invalid",
+      },
+    });
+    const response = await forwardToWorkerd(req, server.url.origin, null);
+    assertEquals(await response.json(), {
+      envelope: req.url, path: "/probe?x=1", body: "streamed payload",
+    });
+  } finally {
+    server.stop(true);
+  }
+});
 
 /**
  * Tiny in-memory env source so tests don't have to mutate the process
