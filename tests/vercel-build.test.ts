@@ -19,7 +19,7 @@ import {
   assertThrows,
 } from "./_assert.ts";
 import { setDefaultTimeout, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -983,3 +983,96 @@ test("build rejects an unknown --target", async () => {
   const code = await runBuild(["--target", "bogus"]);
   assertEquals(code, 2);
 });
+
+test.skipIf(process.platform === "win32")(
+  "buildVercel stages correctly when the temp directory sits behind a symlink (macOS /var -> /private/var)",
+  async () => {
+    // macOS `os.tmpdir()` is under /var/folders, and /var links to
+    // /private/var. Reproduce that anywhere with a symlinked TMPDIR.
+    const real = await mkdtemp(join(await realpath(tmpdir()), "1tube-vercel-realtmp-"));
+    const link = `${real}-link`;
+    await symlink(real, link, "dir");
+    const previousTmp = process.env.TMPDIR;
+    process.env.TMPDIR = link;
+    try {
+      const result = await buildVercel({
+        functionsDir: PLAYGROUND,
+        outDir: join(link, "out"),
+        only: ["hello", "echo"],
+        sourcemap: false,
+      });
+      assertEquals(result.functions.map((fn) => fn.name).sort(), ["echo", "hello"]);
+      for (const fn of result.functions) {
+        assert(await exists(join(fn.funcDir, ".vc-config.json")), `${fn.name}: .vc-config.json`);
+        assert(await exists(join(fn.funcDir, fn.handler)), `${fn.name}: handler`);
+        for (const file of fn.moduleFiles) {
+          assert(!file.startsWith(".."), `${fn.name}: module file escapes the function dir: ${file}`);
+        }
+      }
+    } finally {
+      if (previousTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmp;
+      await rm(link, { force: true }).catch(() => {});
+      await rm(real, { recursive: true, force: true }).catch(() => {});
+    }
+  },
+);
+
+test(
+  "EdgeRuntime.waitUntil leaves promises the platform accepted to the platform",
+  async () => {
+    const root = await tmpOutDir("waituntil");
+    const restore = snapshotRuntimeGlobals();
+    const contextKey = Symbol.for("@vercel/request-context");
+    const g = globalThis as Record<symbol, unknown>;
+    const hadContext = contextKey in g;
+    const previousContext = g[contextKey];
+    // `undefined` = no platform waitUntil, as when the bundle runs locally.
+    let platform: { waitUntil(p: Promise<unknown>): void } | undefined;
+    g[contextKey] = { get: () => platform };
+    try {
+      await mkdir(join(root, "functions", "bg"), { recursive: true });
+      await writeFile(join(root, "functions", "bg", "index.ts"), `
+        Deno.serve((req) => {
+          const url = new URL(req.url);
+          if (url.searchParams.has("never")) EdgeRuntime.waitUntil(new Promise(() => {}));
+          if (url.searchParams.has("late")) {
+            EdgeRuntime.waitUntil(new Promise((r) => setTimeout(r, 50)).then(() => { globalThis.__bgDone = true; }));
+          }
+          return new Response("ok");
+        });`);
+      const built = await buildVercel({ functionsDir: join(root, "functions"), outDir: join(root, "out") });
+      const fn = built.functions[0];
+      const { default: handler } = await import(pathToFileURL(join(fn.funcDir, fn.handler)).href);
+      const call = async (path: string) => {
+        const { res } = mockNodeRes();
+        await handler({ method: "GET", url: path, headers: { host: "localhost" } }, res);
+        return res.statusCode;
+      };
+      const within = <T>(ms: number, p: Promise<T>) =>
+        Promise.race([p, new Promise<"timed out">((r) => setTimeout(() => r("timed out"), ms))]);
+
+      // A warm instance: the platform takes background work that outlives the request.
+      const taken: Promise<unknown>[] = [];
+      platform = { waitUntil: (p) => void taken.push(p) };
+      assertEquals(await call("/?never"), 200);
+      assertEquals(taken.length, 1);
+
+      // A later request with no platform waitUntil drains only its own work,
+      // not the earlier promise the platform already owns.
+      platform = undefined;
+      assertEquals(await within(2000, call("/")), 200);
+
+      // Without a platform, background work is still awaited before the handler resolves.
+      (globalThis as { __bgDone?: boolean }).__bgDone = false;
+      assertEquals(await within(2000, call("/?late")), 200);
+      assertEquals((globalThis as { __bgDone?: boolean }).__bgDone, true);
+    } finally {
+      delete (globalThis as { __bgDone?: boolean }).__bgDone;
+      if (hadContext) g[contextKey] = previousContext;
+      else delete g[contextKey];
+      restore();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

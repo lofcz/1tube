@@ -232,8 +232,10 @@ if (!globalThis.EdgeRuntime || typeof globalThis.EdgeRuntime.waitUntil !== "func
     : {};
   edgeRuntime.waitUntil = (promise) => {
     const p = Promise.resolve(promise);
-    __1tubePending.push(p.catch(() => {}));
-    __1tubePlatformWaitUntil(p);
+    // Keep a local copy only when no platform waitUntil took it: the handler
+    // drains this list only in that case, so anything the platform accepted
+    // would otherwise stay referenced for the life of a warm instance.
+    if (!__1tubePlatformWaitUntil(p)) __1tubePending.push(p.catch(() => {}));
     return p;
   };
   try {

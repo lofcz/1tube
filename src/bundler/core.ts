@@ -30,7 +30,7 @@
 
 import { existsSync } from "node:fs";
 import { isBuiltin } from "node:module";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as esbuild from "esbuild";
@@ -620,6 +620,12 @@ export async function bundleAllChunked(
   },
 ): Promise<ChunkedBundleAllResult> {
   await mkdir(opts.outDir, { recursive: true });
+  // esbuild resolves `absWorkingDir` to its real path but keeps `outdir` as
+  // given, so when the output directory sits behind a symlink (macOS
+  // `os.tmpdir()` is under /var -> /private/var) every metafile output key
+  // comes back as `../../…/var/…` instead of `functions/x.js`. Hand esbuild
+  // the resolved directory so the keys stay relative to it.
+  const esbuildOutDir = await realpath(opts.outDir);
   const start = performance.now();
   const profile = opts.profile;
   const sourcemap = opts.sourcemap ?? "linked";
@@ -653,7 +659,7 @@ export async function bundleAllChunked(
   try {
     result = await esbuild.build({
       entryPoints,
-      outdir: opts.outDir,
+      outdir: esbuildOutDir,
       plugins,
       bundle: true,
       splitting: true,
@@ -668,7 +674,7 @@ export async function bundleAllChunked(
       sourcemap,
       minify: opts.minify ?? false,
       treeShaking: true,
-      absWorkingDir: opts.outDir,
+      absWorkingDir: esbuildOutDir,
       logLevel: "silent",
       mainFields: [...profile.mainFields],
       entryNames: "functions/[name]",
