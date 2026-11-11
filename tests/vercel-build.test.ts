@@ -19,7 +19,7 @@ import {
   assertThrows,
 } from "./_assert.ts";
 import { setDefaultTimeout, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -983,3 +983,37 @@ test("build rejects an unknown --target", async () => {
   const code = await runBuild(["--target", "bogus"]);
   assertEquals(code, 2);
 });
+
+test.skipIf(process.platform === "win32")(
+  "buildVercel stages correctly when the temp directory sits behind a symlink (macOS /var -> /private/var)",
+  async () => {
+    // macOS `os.tmpdir()` is under /var/folders, and /var links to
+    // /private/var. Reproduce that anywhere with a symlinked TMPDIR.
+    const real = await mkdtemp(join(await realpath(tmpdir()), "1tube-vercel-realtmp-"));
+    const link = `${real}-link`;
+    await symlink(real, link, "dir");
+    const previousTmp = process.env.TMPDIR;
+    process.env.TMPDIR = link;
+    try {
+      const result = await buildVercel({
+        functionsDir: PLAYGROUND,
+        outDir: join(link, "out"),
+        only: ["hello", "echo"],
+        sourcemap: false,
+      });
+      assertEquals(result.functions.map((fn) => fn.name).sort(), ["echo", "hello"]);
+      for (const fn of result.functions) {
+        assert(await exists(join(fn.funcDir, ".vc-config.json")), `${fn.name}: .vc-config.json`);
+        assert(await exists(join(fn.funcDir, fn.handler)), `${fn.name}: handler`);
+        for (const file of fn.moduleFiles) {
+          assert(!file.startsWith(".."), `${fn.name}: module file escapes the function dir: ${file}`);
+        }
+      }
+    } finally {
+      if (previousTmp === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmp;
+      await rm(link, { force: true }).catch(() => {});
+      await rm(real, { recursive: true, force: true }).catch(() => {});
+    }
+  },
+);
