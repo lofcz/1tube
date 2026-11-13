@@ -524,10 +524,146 @@ export interface ServeConfig<TContext = unknown> {
   /**
    * Per-function rate-limit declaration. Overrides any `1tube.json` `rpm`.
    * Use `false` to exempt the function from rate limiting (e.g. a signed
-   * server-to-server webhook). Honoured by the 1tube gateway; standalone
-   * runtimes that front their own limiter ignore it.
+   * server-to-server webhook). Honoured by the 1tube gateway. Standalone
+   * runtimes (Vercel, plain Deno) have no gateway: they must enforce it
+   * themselves with {@link createRateLimitGuard} and a shared
+   * {@link RateLimitStore}, otherwise the declaration does nothing.
    */
   rateLimit?: RateLimitOption;
+}
+
+/** Outcome of one {@link RateLimitStore.consume} call. */
+export interface RateLimitDecision {
+  allowed: boolean;
+  /** Requests left in the current window after this one (0 when denied). */
+  remaining: number;
+  /** Epoch milliseconds when the current window ends. */
+  resetAt: number;
+}
+
+/**
+ * Counter store behind {@link createRateLimitGuard}. Fixed windows: the store
+ * counts calls per `(key, window)` and denies once `limit` is reached, without
+ * incrementing past it. It must be shared by every instance that serves the
+ * function (a database, Redis, …); a per-process store only limits one
+ * instance, which on serverless platforms with many instances limits nothing.
+ */
+export interface RateLimitStore {
+  consume(key: string, limit: number, windowMs: number): Promise<RateLimitDecision>;
+}
+
+/**
+ * In-process fixed-window store. Correct for a single long-lived process
+ * (local development, tests, a single-instance server). Not for serverless
+ * production: each instance would count separately.
+ */
+export function createMemoryRateLimitStore(options: {
+  maxKeys?: number;
+  now?: () => number;
+} = {}): RateLimitStore {
+  const maxKeys = options.maxKeys ?? 10_000;
+  const now = options.now ?? Date.now;
+  const windows = new Map<string, { start: number; count: number }>();
+  return {
+    consume(key, limit, windowMs) {
+      const at = now();
+      const start = at - (at % windowMs);
+      let entry = windows.get(key);
+      if (!entry || entry.start !== start) {
+        if (!entry && windows.size >= maxKeys) {
+          windows.delete(windows.keys().next().value!);
+        }
+        entry = { start, count: 0 };
+        windows.set(key, entry);
+      }
+      const resetAt = start + windowMs;
+      if (entry.count >= limit) {
+        return Promise.resolve({ allowed: false, remaining: 0, resetAt });
+      }
+      entry.count++;
+      return Promise.resolve({
+        allowed: true,
+        remaining: limit - entry.count,
+        resetAt,
+      });
+    },
+  };
+}
+
+/** What a standalone runtime knows about one request when checking limits. */
+export interface RateLimitCheck {
+  /** Function name; part of every bucket key. */
+  functionName: string;
+  /** The function's `serve({ rateLimit })` declaration. */
+  rateLimit: RateLimitOption | undefined;
+  /** Authenticated user id, if any. Used by the "identity" strategy. */
+  identity?: string | null;
+  /** Trusted client IP (never a raw, spoofable X-Forwarded-For hop). */
+  ip?: string | null;
+  /** Skip limiting entirely, e.g. for trusted service-role callers. */
+  exempt?: boolean;
+}
+
+export interface RateLimitGuardOptions {
+  store: RateLimitStore;
+  /**
+   * Requests per minute for functions without an explicit numeric limit
+   * (`rateLimit` omitted or `true`). Unset = such functions are not limited,
+   * which is the safe default when the gateway default was never enforced in
+   * that environment.
+   */
+  defaultRpm?: number;
+  /**
+   * Maps the raw bucket key (`fn:ip:<addr>`, `fn:user:<id>`, `fn:global`)
+   * to the stored key, e.g. a keyed hash so stores never hold raw IPs.
+   */
+  hashKey?: (key: string) => string | Promise<string>;
+  /**
+   * Store failures fail open (the request proceeds) and are reported here.
+   * Defaults to `console.error`.
+   */
+  onStoreError?: (error: unknown, functionName: string) => void;
+}
+
+/**
+ * Enforces `serve({ rateLimit })` in runtimes without the 1tube gateway.
+ * Same declaration semantics and 429 response as the gateway limiter, but
+ * fixed one-minute windows in a shared {@link RateLimitStore} instead of an
+ * in-process token bucket. Returns the 429 response to send, or `null`.
+ */
+export function createRateLimitGuard(
+  options: RateLimitGuardOptions,
+): (check: RateLimitCheck) => Promise<Response | null> {
+  const report = options.onStoreError ??
+    ((error: unknown, fn: string) =>
+      console.error(`[1tube] rate limit store failed for ${fn}; allowing request`, error));
+  return async (check) => {
+    if (check.exempt) return null;
+    const { rpm: declared, rateLimitBy } = normalizeRateLimit(check.rateLimit);
+    const rpm = declared ?? options.defaultRpm;
+    if (rpm === undefined || rpm <= 0) return null;
+    const by: RateLimitBy = rateLimitBy ?? "identity";
+    let subject: string;
+    if (by === "global") subject = "global";
+    else if (by === "identity" && check.identity) subject = `user:${check.identity}`;
+    else if (check.ip) subject = `ip:${check.ip}`;
+    // No trusted IP: one shared "unknown" bucket would let a single caller
+    // lock out everyone else in that state, so such requests pass.
+    else return null;
+    const raw = `${check.functionName}:${subject}`;
+    let decision: RateLimitDecision;
+    try {
+      const key = options.hashKey ? await options.hashKey(raw) : raw;
+      decision = await options.store.consume(key, rpm, 60_000);
+    } catch (error) {
+      report(error, check.functionName);
+      return null;
+    }
+    if (decision.allowed) return null;
+    return tooManyRequests({
+      retryAfterSeconds: Math.max(1, Math.ceil((decision.resetAt - Date.now()) / 1000)),
+    });
+  };
 }
 
 export interface MatchedRoute {
